@@ -1,15 +1,27 @@
 const express = require("express");
+const { Pool } = require("pg");
 
 const app = express();
 app.use(express.json());
-
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes("railway") ? { rejectUnauthorized: false } : undefined
+});
 const PORT = process.env.PORT || 3000;
 
 // 测试接口
 app.get("/", (req, res) => {
   res.send("VLTGO Support API is running 🚀");
 });
-
+app.get("/health", async (req, res) => {
+  try {
+    const r = await pool.query("SELECT NOW() as now");
+    res.json({ ok: true, db: true, now: r.rows[0].now });
+  } catch (err) {
+    console.error("DB health check failed:", err);
+    res.status(500).json({ ok: false, db: false, error: String(err.message || err) });
+  }
+});
 // WhatsApp webhook 验证
 app.get("/webhook", (req, res) => {
   const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "test_token";
