@@ -1,0 +1,12 @@
+{
+  "name": "vltgo-support-system",
+  "version": "1.0.0",
+  "description": "Minimal WhatsApp Support API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
