@@ -1,60 +1,88 @@
+/**
+ * server.js (with fingerprint logs)
+ * - GET  /webhook  : Meta webhook verification
+ * - POST /webhook  : Receive webhook events
+ * - GET  /         : Health check
+ *
+ * Tips:
+ * 1) Start (Windows PowerShell):
+ *    $env:PORT=3000
+ *    $env:WEBHOOK_VERIFY_TOKEN="12345"
+ *    node .\server.js
+ *
+ * 2) Local test:
+ *    curl.exe -i "http://localhost:3000/webhook?hub.mode=subscribe&hub.verify_token=12345&hub.challenge=hello"
+ */
+
 const express = require("express");
 const crypto = require("crypto");
 
 const app = express();
 
-// 如果你要校验 Meta webhook 签名（推荐），需要保留 raw body
+// Keep raw body for signature verification (optional)
 app.use(
   express.json({
     verify: (req, res, buf) => {
-      req.rawBody = buf; // for signature verification
+      req.rawBody = buf;
     },
   })
 );
 
-// 环境变量（云平台一定要用 PORT）
+// Env vars
 const PORT = process.env.PORT || 8080;
-const VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN || "12345"; // 你之前用的 12345
-const APP_SECRET = process.env.META_APP_SECRET || ""; // 可选：Meta App Secret，用于签名校验
+const VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN || "12345";
+const APP_SECRET = process.env.META_APP_SECRET || ""; // optional: Meta App Secret
 
-// 主页测试
+// ✅ Fingerprint logs (VERY IMPORTANT for debugging)
+console.log("✅ LOADED FILE:", __filename);
+console.log("✅ NODE VERSION:", process.version);
+console.log("✅ PORT:", PORT);
+console.log("✅ VERIFY_TOKEN NOW:", VERIFY_TOKEN ? "[SET]" : "[EMPTY]");
+console.log("✅ APP_SECRET:", APP_SECRET ? "[SET]" : "[EMPTY]");
+
+// Health check
 app.get("/", (req, res) => {
   res.status(200).send("OK");
 });
 
-// 1) Meta Webhook 验证：GET /webhook
+// GET /webhook for Meta verification
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
-  console.log("➡️ GET /webhook verify:", { mode, token });
+  // ✅ request log (so you can see whether Meta/NGROK hit you)
+  console.log("➡️ GET /webhook", { mode, token, challenge });
 
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
     console.log("✅ Webhook verified");
     return res.status(200).send(challenge);
   } else {
-    console.log("❌ Webhook verify failed");
+    console.log("❌ Webhook verify failed. expected token:", VERIFY_TOKEN);
     return res.sendStatus(403);
   }
 });
 
-// （可选）2) 校验签名：X-Hub-Signature-256
+// Optional signature verification
 function verifySignature(req) {
-  if (!APP_SECRET) return true; // 没配置就跳过
+  if (!APP_SECRET) return true; // if not configured, skip
+
   const signature = req.headers["x-hub-signature-256"];
-  if (!signature) return false;
+  if (!signature || !req.rawBody) return false;
 
   const expected =
     "sha256=" +
     crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
 
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch (e) {
+    return false;
+  }
 }
 
-// 3) 接收消息：POST /webhook
+// POST /webhook for receiving events
 app.post("/webhook", (req, res) => {
-  // 先快速回 200，避免 Meta 重试（但我们也打印日志）
   if (!verifySignature(req)) {
     console.log("❌ Invalid signature");
     return res.sendStatus(403);
@@ -66,7 +94,7 @@ app.post("/webhook", (req, res) => {
   return res.sendStatus(200);
 });
 
-// 关键：云平台必须监听 0.0.0.0
+// Listen on all interfaces (important for cloud; harmless locally)
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ Server running on port ${PORT}`);
 });
