@@ -1,1 +1,72 @@
-const express = require("express"); const { Pool } = require("pg"); const app = express(); app.use(express.json()); const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, }); const PORT = process.env.PORT || 3000; app.get("/", (req, res) => { res.send("VLTGO Support API is running"); }); app.get("/health", async (req, res) => { try { const r = await pool.query("SELECT NOW() as now"); res.json({ ok: true, db: true, now: r.rows[0].now }); } catch (err) { res.status(500).json({ ok: false, db: false, error: String(err.message || err) }); } }); app.post("/admin/init-db", async (req, res) => { try { await pool.query("CREATE TABLE IF NOT EXISTS contacts (id SERIAL PRIMARY KEY, wa_id TEXT UNIQUE NOT NULL, display_name TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());"); await pool.query("CREATE TABLE IF NOT EXISTS conversations (id SERIAL PRIMARY KEY, contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE, status TEXT NOT NULL DEFAULT 'OPEN', last_message_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), unread_count INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(contact_id));"); await pool.query("CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, direction TEXT NOT NULL CHECK (direction IN ('inbound','outbound')), msg_type TEXT NOT NULL DEFAULT 'text', text TEXT, media_url TEXT, wa_message_id TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), raw_payload JSONB);"); await pool.query("CREATE INDEX IF NOT EXISTS idx_contacts_wa_id ON contacts(wa_id);"); await pool.query("CREATE INDEX IF NOT EXISTS idx_conversations_contact_id ON conversations(contact_id);"); await pool.query("CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);"); await pool.query("CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);"); await pool.query("CREATE INDEX IF NOT EXISTS idx_conversations_last_message_at ON conversations(last_message_at);"); res.json({ ok: true }); } catch (err) { res.status(500).json({ ok: false, error: String(err.message || err) }); } }); app.get("/webhook", (req, res) => { const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "test_token"; const mode = req.query["hub.mode"]; const token = req.query["hub.verify_token"]; const challenge = req.query["hub.challenge"]; if (mode === "subscribe" && token === VERIFY_TOKEN) { return res.status(200).send(challenge); } return res.sendStatus(403); }); app.post("/webhook", async (req, res) => { try { const body = req.body; const entry = body && body.entry && body.entry[0]; const change = entry && entry.changes && entry.changes[0]; const value = change && change.value; if (!value || value.messaging_product !== "whatsapp") { return res.sendStatus(200); } const msgs = value.messages; if (!msgs || msgs.length === 0) { return res.sendStatus(200); } const msg = msgs[0]; const wa_id = msg.from; const wa_message_id = msg.id; const display_name = (value.contacts && value.contacts[0] && value.contacts[0].profile && value.contacts[0].profile.name) || null; let msg_type = msg.type || "text"; let text = null; if (msg_type === "text") { text = (msg.text && msg.text.body) || null; } else { text = "[" + msg_type + " received]"; } const contactResult = await pool.query( "INSERT INTO contacts (wa_id, display_name) VALUES ($1, $2) ON CONFLICT (wa_id) DO UPDATE SET display_name = COALESCE(EXCLUDED.display_name, contacts.display_name) RETURNING id;", [wa_id, display_name] ); const contact_id = contactResult.rows[0].id; const convResult = await pool.query( "INSERT INTO conversations (contact_id, status, last_message_at, unread_count) VALUES ($1, 'OPEN', NOW(), 1) ON CONFLICT (contact_id) DO UPDATE SET last_message_at = NOW(), unread_count = conversations.unread_count + 1 RETURNING id;", [contact_id] ); const conversation_id = convResult.rows[0].id; await pool.query( "INSERT INTO messages (conversation_id, direction, msg_type, text, wa_message_id, raw_payload) VALUES ($1, 'inbound', $2, $3, $4, $5);", [conversation_id, msg_type, text, wa_message_id, body] ); return res.sendStatus(200); } catch (err) { return res.sendStatus(200); } }); app.get("/api/conversations", async (req, res) => { try { const limit = Math.min(parseInt(req.query.limit || "50", 10), 200); const offset = Math.max(parseInt(req.query.offset || "0", 10), 0); const q = (req.query.q || "").trim(); let sql = "SELECT c.id as conversation_id, c.status, c.last_message_at, c.unread_count, ct.wa_id, ct.display_name, ct.created_at as contact_created_at FROM conversations c JOIN contacts ct ON ct.id = c.contact_id "; const params = []; if (q) { params.push("%" + q + "%"); params.push("%" + q + "%"); sql += "WHERE (ct.wa_id ILIKE $" + (params.length - 1) + " OR ct.display_name ILIKE $" + params.length + ") "; } params.push(limit); params.push(offset); sql += "ORDER BY c.last_message_at DESC NULLS LAST "; sql += "LIMIT $" + (params.length - 1) + " OFFSET $" + params.length + ";"; const r = await pool.query(sql, params); res.json({ ok: true, data: r.rows }); } catch (err) { res.status(500).json({ ok: false, error: String(err.message || err) }); } }); app.get("/api/conversations/:id/messages", async (req, res) => { try { const conversationId = parseInt(req.params.id, 10); const limit = Math.min(parseInt(req.query.limit || "50", 10), 200); const before = req.query.before ? new Date(req.query.before) : null; if (!conversationId) { return res.status(400).json({ ok: false, error: "invalid conversation id" }); } let sql = "SELECT id, direction, msg_type, text, media_url, wa_message_id, created_at FROM messages WHERE conversation_id = $1 "; const params = [conversationId]; if (before && !isNaN(before.getTime())) { params.push(before.toISOString()); sql += "AND created_at < $" + params.length + " "; } params.push(limit); sql += "ORDER BY created_at DESC LIMIT $" + params.length + ";"; const r = await pool.query(sql, params); res.json({ ok: true, data: r.rows.reverse() }); } catch (err) { res.status(500).json({ ok: false, error: String(err.message || err) }); } }); app.post("/api/conversations/:id/mark-read", async (req, res) => { try { const conversationId = parseInt(req.params.id, 10); if (!conversationId) { return res.status(400).json({ ok: false, error: "invalid conversation id" }); } await pool.query("UPDATE conversations SET unread_count = 0 WHERE id = $1;", [conversationId]); res.json({ ok: true }); } catch (err) { res.status(500).json({ ok: false, error: String(err.message || err) }); } }); app.listen(PORT, () => { console.log("Server running on port " + PORT); });
+const express = require("express");
+const crypto = require("crypto");
+
+const app = express();
+
+// 如果你要校验 Meta webhook 签名（推荐），需要保留 raw body
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf; // for signature verification
+    },
+  })
+);
+
+// 环境变量（云平台一定要用 PORT）
+const PORT = process.env.PORT || 8080;
+const VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN || "12345"; // 你之前用的 12345
+const APP_SECRET = process.env.META_APP_SECRET || ""; // 可选：Meta App Secret，用于签名校验
+
+// 主页测试
+app.get("/", (req, res) => {
+  res.status(200).send("OK");
+});
+
+// 1) Meta Webhook 验证：GET /webhook
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  console.log("➡️ GET /webhook verify:", { mode, token });
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("✅ Webhook verified");
+    return res.status(200).send(challenge);
+  } else {
+    console.log("❌ Webhook verify failed");
+    return res.sendStatus(403);
+  }
+});
+
+// （可选）2) 校验签名：X-Hub-Signature-256
+function verifySignature(req) {
+  if (!APP_SECRET) return true; // 没配置就跳过
+  const signature = req.headers["x-hub-signature-256"];
+  if (!signature) return false;
+
+  const expected =
+    "sha256=" +
+    crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
+
+  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+}
+
+// 3) 接收消息：POST /webhook
+app.post("/webhook", (req, res) => {
+  // 先快速回 200，避免 Meta 重试（但我们也打印日志）
+  if (!verifySignature(req)) {
+    console.log("❌ Invalid signature");
+    return res.sendStatus(403);
+  }
+
+  console.log("🔥 POST /webhook HIT");
+  console.log(JSON.stringify(req.body, null, 2));
+
+  return res.sendStatus(200);
+});
+
+// 关键：云平台必须监听 0.0.0.0
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ Server running on port ${PORT}`);
+});
