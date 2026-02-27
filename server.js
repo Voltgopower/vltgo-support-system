@@ -1,14 +1,20 @@
 /**
- * WhatsApp Webhook Server (Stable + File Logging + Tags + Per-User Logs)
- * GET  /            -> Health check
- * GET  /webhook     -> Meta verification
- * POST /webhook     -> Receive webhook events and save to local files (jsonl)
+ * WhatsApp Webhook Server
+ * - Webhook receive + log jsonl (incoming)
+ * - Send message + log jsonl (outgoing)
+ * - UI: customers list + chat bubble view
+ * - Filters: unread only / last 24h / tag filter
+ * - Unread tracking via logs/state/<wa_id>.json (no jsonl rewrites)
  *
  * .env required:
  *   VERIFY_TOKEN=voltgo_webhook_verify
- *   PORT=8080
+ *   WA_TOKEN=xxxxxxxxxxxxxxxx
+ *   PHONE_NUMBER_ID=xxxxxxxxxxxxxxxx
+ *   UI_USER=xxxxx
+ *   UI_PASS=xxxxx
  * optional:
- *   APP_SECRET=xxxxx  // enable webhook signature verification
+ *   PORT=8080
+ *   APP_SECRET=xxxxx
  */
 
 require("dotenv").config();
@@ -20,9 +26,27 @@ const path = require("path");
 
 const app = express();
 
-// IMPORTANT: must be before routes (parse JSON + keep raw body for signature check)
+/** Save raw body for signature verification */
+function rawBodySaver(req, res, buf) {
+  req.rawBody = buf;
+}
+
+// IMPORTANT: JSON must be before routes (keep raw body for signature check)
 app.use(express.json({ verify: rawBodySaver }));
-// ========= Basic Auth (protect UI + send) =========
+// IMPORTANT: enable form POST
+app.use(express.urlencoded({ extended: false }));
+
+// ========= ENV =========
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
+const PORT = process.env.PORT || 8080;
+const APP_SECRET = process.env.APP_SECRET || null; // optional
+
+if (!VERIFY_TOKEN) {
+  console.error("Missing .env variable: VERIFY_TOKEN");
+  process.exit(1);
+}
+
+// ========= Basic Auth (protect UI + send + APIs) =========
 const UI_USER = process.env.UI_USER;
 const UI_PASS = process.env.UI_PASS;
 
@@ -35,12 +59,11 @@ function basicAuth(req, res, next) {
   // allow webhook endpoints without auth (Meta calls)
   if (req.path === "/webhook") return next();
 
-  // protect these routes (UI + read APIs + send)
+  // protect these routes
   const protectedPrefixes = ["/ui", "/customers", "/send"];
   if (!protectedPrefixes.some((p) => req.path.startsWith(p))) return next();
 
   if (!UI_USER || !UI_PASS) {
-    // If not configured, block to avoid accidental public exposure
     return res.status(500).send("UI auth not configured on server");
   }
 
@@ -58,22 +81,19 @@ function basicAuth(req, res, next) {
   if (user !== UI_USER || pass !== UI_PASS) return unauthorized(res);
   return next();
 }
-
 app.use(basicAuth);
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
-const PORT = process.env.PORT || 8080;
-const APP_SECRET = process.env.APP_SECRET || null; // optional
 
-if (!VERIFY_TOKEN) {
-  console.error("Missing .env variable: VERIFY_TOKEN");
-  process.exit(1);
-}
+// ========= Log directories =========
+const baseLogsDir = path.join(__dirname, "logs");
+const byUserDir = path.join(baseLogsDir, "by-user");
+const byDateDir = path.join(baseLogsDir, "by-date");
+const stateDir = path.join(baseLogsDir, "state");
 
-/** Save raw body for signature verification (optional) */
-function rawBodySaver(req, res, buf) {
-  req.rawBody = buf;
-}
+ensureDir(byUserDir);
+ensureDir(byDateDir);
+ensureDir(stateDir);
 
+// ========= Helpers =========
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
@@ -85,15 +105,14 @@ function appendJsonl(filePath, obj) {
   });
 }
 
-function todayFileName() {
+function todayFileName(prefix = "messages") {
   const d = new Date();
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
-  return `messages-${yyyy}-${mm}-${dd}.jsonl`;
+  return `${prefix}-${yyyy}-${mm}-${dd}.jsonl`;
 }
 
-// Keep filenames safe on Windows/macOS/Linux
 function safeFileName(name) {
   return String(name || "")
     .replace(/[\\\/:*?"<>|]/g, "_")
@@ -102,7 +121,7 @@ function safeFileName(name) {
 
 /** Optional: verify Meta webhook signature */
 function isValidSignature(req) {
-  if (!APP_SECRET) return true; // not enabled
+  if (!APP_SECRET) return true;
   const sig = req.get("x-hub-signature-256");
   if (!sig || !sig.startsWith("sha256=")) return false;
 
@@ -119,22 +138,17 @@ function isValidSignature(req) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// Very simple keyword tagging (no auto-reply)
+// ========= Tags =========
 function getTags(text) {
   const t = (text || "").toLowerCase();
   const tags = [];
 
-  // logistics
   if (/(track|tracking|deliver|delivery|ups|fedex|dhl|usps|shipment|物流|派送|签收|运单|快递)/i.test(t)) {
     tags.push("logistics");
   }
-
-  // after sales
   if (/(warranty|broken|issue|problem|fault|defect|return|replace|refund|not work|doesn't work|坏|故障|问题|退货|换货|退款)/i.test(t)) {
     tags.push("after_sales");
   }
-
-  // pre sales
   if (/(price|quote|quotation|invoice|pay|payment|discount|availability|lead time|报价|价格|发票|付款|折扣|有货|交期)/i.test(t)) {
     tags.push("pre_sales");
   }
@@ -142,94 +156,49 @@ function getTags(text) {
   return tags;
 }
 
-// ========= Health check =========
-app.get("/", (req, res) => {
-  res.status(200).send("OK");
-});
+// ========= State (Unread tracking) =========
+// state file: logs/state/<wa_id>.json
+// { last_seen_incoming_at: "ISO" }
+function statePath(waId) {
+  return path.join(stateDir, `${safeFileName(waId)}.json`);
+}
 
-// ========= GET webhook verify =========
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    console.log("✅ Webhook verified");
-    return res.status(200).send(challenge);
-  }
-  console.warn("❌ Webhook verify failed");
-  return res.sendStatus(403);
-});
-
-// ========= POST webhook receive =========
-app.post("/webhook", (req, res) => {
-  // Always ACK quickly
-  res.sendStatus(200);
-
+function readState(waId) {
   try {
-    // Optional signature verification (only if APP_SECRET is set)
-    if (!isValidSignature(req)) {
-      console.warn("❌ Invalid webhook signature");
-      return;
-    }
-
-    const body = req.body;
-    const entry = body?.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
-    const field = change?.field;
-
-    // Only handle message events
-    if (field !== "messages" || !value?.messages?.length) return;
-
-    const msg = value.messages[0];
-    const contact = value.contacts?.[0];
-
-    const record = {
-      received_at: new Date().toISOString(),
-      waba_id: entry?.id,
-      phone_number_id: value?.metadata?.phone_number_id,
-      display_phone_number: value?.metadata?.display_phone_number,
-
-      from: msg.from,
-      wa_id: contact?.wa_id || msg.from || null,
-      profile_name: contact?.profile?.name || null,
-
-      message_id: msg.id,
-      timestamp: msg.timestamp,
-      type: msg.type,
-
-      text: msg.text?.body ?? null,
-      tags: getTags(msg.text?.body ?? ""),
-      raw: msg,
-    };
-
-    const baseDir = path.join(__dirname, "logs");
-    const byDateDir = path.join(baseDir, "by-date");
-    const byUserDir = path.join(baseDir, "by-user");
-
-    ensureDir(byDateDir);
-    ensureDir(byUserDir);
-
-    // 1) daily full log
-    appendJsonl(path.join(byDateDir, todayFileName()), record);
-
-    // 2) per-user log (use wa_id)
-    const customerKey = safeFileName(record.wa_id || record.from);
-    appendJsonl(path.join(byUserDir, `${customerKey}.jsonl`), record);
-
-    console.log("📝 saved message:", record.type, record.from, record.text || "", record.tags?.length ? `tags=${record.tags.join(",")}` : "");
-  } catch (e) {
-    console.error("❌ webhook handler error:", e);
+    const p = statePath(waId);
+    if (!fs.existsSync(p)) return { last_seen_incoming_at: null };
+    const raw = fs.readFileSync(p, "utf8");
+    const obj = JSON.parse(raw);
+    return { last_seen_incoming_at: obj?.last_seen_incoming_at || null };
+  } catch (_) {
+    return { last_seen_incoming_at: null };
   }
-});
-// ========= Customer history APIs (read-only) =========
+}
 
-const baseLogsDir = path.join(__dirname, "logs");
-const byUserDir = path.join(baseLogsDir, "by-user");
+function writeState(waId, patch) {
+  try {
+    const cur = readState(waId);
+    const next = { ...cur, ...patch };
+    fs.writeFileSync(statePath(waId), JSON.stringify(next, null, 2), "utf8");
+  } catch (e) {
+    console.error("❌ writeState error:", e);
+  }
+}
 
-// read last N lines from a file (simple + safe for small/medium logs)
-function readJsonlLastN(filePath, n = 200) {
+function isoToMs(iso) {
+  const t = Date.parse(iso || "");
+  return Number.isFinite(t) ? t : 0;
+}
+
+function withinLastHours(iso, hours) {
+  const ms = isoToMs(iso);
+  if (!ms) return false;
+  const now = Date.now();
+  return now - ms <= hours * 3600 * 1000;
+}
+
+// ========= Read log =========
+function readJsonlLastN(filePath, n = 300) {
   if (!fs.existsSync(filePath)) return [];
   const content = fs.readFileSync(filePath, "utf8");
   const lines = content.split("\n").filter(Boolean);
@@ -243,73 +212,48 @@ function readJsonlLastN(filePath, n = 200) {
   return out;
 }
 
-// summarize a customer's log file
 function summarizeCustomer(filePath, waId) {
-  const rows = readJsonlLastN(filePath, 200); // last 200 is enough for summary
+  const rows = readJsonlLastN(filePath, 300);
   if (rows.length === 0) return null;
 
+  // find last message
   const last = rows[rows.length - 1];
+
+  // tag counts (last 300)
   const tagCounts = {};
   for (const r of rows) {
     for (const tag of r.tags || []) tagCounts[tag] = (tagCounts[tag] || 0) + 1;
   }
 
+  // unread counts based on state
+  const st = readState(waId);
+  const lastSeenMs = isoToMs(st.last_seen_incoming_at);
+  let unreadCount = 0;
+  let lastIncomingAt = null;
+
+  for (const r of rows) {
+    if (r.direction === "incoming") {
+      const t = r.received_at || null;
+      if (t) lastIncomingAt = t; // will end as last incoming
+      const ms = isoToMs(t);
+      if (ms && ms > lastSeenMs) unreadCount++;
+    }
+  }
+
   return {
     wa_id: waId,
     profile_name: last.profile_name || null,
-    last_time: last.received_at || null,
+    last_time: last.received_at || last.sent_at || null,
     last_text: last.text || null,
     last_type: last.type || null,
+    last_direction: last.direction || null,
     tags: tagCounts,
+    unread_count: unreadCount,
+    last_incoming_at: lastIncomingAt,
   };
 }
 
-// GET /customers -> list recent customers
-app.get("/customers", (req, res) => {
-  try {
-    ensureDir(byUserDir);
-    const files = fs.readdirSync(byUserDir).filter((f) => f.endsWith(".jsonl"));
-
-    const customers = [];
-    for (const f of files) {
-      const waId = f.replace(/\.jsonl$/i, "");
-      const filePath = path.join(byUserDir, f);
-      const summary = summarizeCustomer(filePath, waId);
-      if (summary) customers.push(summary);
-    }
-
-    // sort by last_time desc
-    customers.sort((a, b) => {
-      const ta = a.last_time ? Date.parse(a.last_time) : 0;
-      const tb = b.last_time ? Date.parse(b.last_time) : 0;
-      return tb - ta;
-    });
-
-    res.json({ count: customers.length, customers });
-  } catch (e) {
-    console.error("❌ /customers error:", e);
-    res.status(500).json({ error: "internal_error" });
-  }
-});
-
-// GET /customers/:wa_id/messages?limit=200
-app.get("/customers/:wa_id/messages", (req, res) => {
-  try {
-    const waId = safeFileName(req.params.wa_id);
-    const limit = Math.min(parseInt(req.query.limit || "200", 10) || 200, 2000);
-
-    const filePath = path.join(byUserDir, `${waId}.jsonl`);
-    const rows = readJsonlLastN(filePath, limit);
-
-    // return newest last (chronological). If you prefer newest-first, reverse().
-    res.json({ wa_id: waId, count: rows.length, messages: rows });
-  } catch (e) {
-    console.error("❌ /customers/:wa_id/messages error:", e);
-    res.status(500).json({ error: "internal_error" });
-  }
-});
-// ========= Simple Web UI (read-only) =========
-
+// ========= UI helpers =========
 function escapeHtml(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
@@ -326,48 +270,218 @@ function fmtTime(iso) {
   return d.toLocaleString();
 }
 
-app.get("/ui", (req, res) => {
+function buildQueryLink(basePath, current, patch) {
+  const u = new URL("http://localhost" + basePath);
+  const params = new URLSearchParams(current || {});
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (v === null || v === undefined || v === "") params.delete(k);
+    else params.set(k, String(v));
+  }
+  u.search = params.toString();
+  return u.pathname + (u.search ? `?${u.search}` : "");
+}
+
+// ========= Health =========
+app.get("/", (req, res) => res.status(200).send("OK"));
+
+// ========= Webhook verify =========
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("✅ Webhook verified");
+    return res.status(200).send(challenge);
+  }
+  console.warn("❌ Webhook verify failed");
+  return res.sendStatus(403);
+});
+
+// ========= Webhook receive (incoming) =========
+app.post("/webhook", (req, res) => {
+  res.sendStatus(200);
+
+  try {
+    if (!isValidSignature(req)) {
+      console.warn("❌ Invalid webhook signature");
+      return;
+    }
+
+    const body = req.body;
+    const entry = body?.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const field = change?.field;
+
+    if (field !== "messages" || !value?.messages?.length) return;
+
+    const msg = value.messages[0];
+    const contact = value.contacts?.[0];
+    const textBody = msg.text?.body ?? null;
+
+    const record = {
+      direction: "incoming",
+      received_at: new Date().toISOString(),
+
+      waba_id: entry?.id,
+      phone_number_id: value?.metadata?.phone_number_id,
+      display_phone_number: value?.metadata?.display_phone_number,
+
+      from: msg.from,
+      to: value?.metadata?.display_phone_number || null,
+
+      wa_id: contact?.wa_id || msg.from || null,
+      profile_name: contact?.profile?.name || null,
+
+      message_id: msg.id,
+      timestamp: msg.timestamp,
+      type: msg.type,
+
+      text: textBody,
+      tags: getTags(textBody ?? ""),
+      raw: msg,
+    };
+
+    appendJsonl(path.join(byDateDir, todayFileName("messages")), record);
+
+    const customerKey = safeFileName(record.wa_id || record.from);
+    appendJsonl(path.join(byUserDir, `${customerKey}.jsonl`), record);
+
+    console.log(
+      "📝 saved incoming:",
+      record.type,
+      record.from,
+      record.text || "",
+      record.tags?.length ? `tags=${record.tags.join(",")}` : ""
+    );
+  } catch (e) {
+    console.error("❌ webhook handler error:", e);
+  }
+});
+
+// ========= Customer APIs =========
+app.get("/customers", (req, res) => {
   try {
     ensureDir(byUserDir);
-    const q = (req.query.q || "").toString().trim().toLowerCase();
-
     const files = fs.readdirSync(byUserDir).filter((f) => f.endsWith(".jsonl"));
-    const customers = [];
 
+    const customers = [];
     for (const f of files) {
       const waId = f.replace(/\.jsonl$/i, "");
       const filePath = path.join(byUserDir, f);
       const summary = summarizeCustomer(filePath, waId);
+      if (summary) customers.push(summary);
+    }
+
+    customers.sort((a, b) => isoToMs(b.last_time) - isoToMs(a.last_time));
+
+    res.json({ count: customers.length, customers });
+  } catch (e) {
+    console.error("❌ /customers error:", e);
+    res.status(500).json({ error: "internal_error" });
+  }
+});
+
+app.get("/customers/:wa_id/messages", (req, res) => {
+  try {
+    const waId = safeFileName(req.params.wa_id);
+    const limit = Math.min(parseInt(req.query.limit || "300", 10) || 300, 3000);
+    const filePath = path.join(byUserDir, `${waId}.jsonl`);
+    const rows = readJsonlLastN(filePath, limit);
+    res.json({ wa_id: waId, count: rows.length, messages: rows });
+  } catch (e) {
+    console.error("❌ /customers/:wa_id/messages error:", e);
+    res.status(500).json({ error: "internal_error" });
+  }
+});
+
+// ========= UI: Customers list (filters: q, unread, recent24, tag) =========
+app.get("/ui", (req, res) => {
+  try {
+    ensureDir(byUserDir);
+
+    const q = (req.query.q || "").toString().trim().toLowerCase();
+    const unreadOnly = (req.query.unread || "").toString() === "1";
+    const recent24 = (req.query.recent24 || "").toString() === "1";
+    const tag = (req.query.tag || "").toString().trim().toLowerCase();
+
+    const files = fs.readdirSync(byUserDir).filter((f) => f.endsWith(".jsonl"));
+    const customers = [];
+
+    // build tag set
+    const allTagsSet = new Set();
+
+    for (const f of files) {
+      const waId = f.replace(/\.jsonl$/i, "");
+      const filePath = path.join(byUserDir, f);
+
+      const summary = summarizeCustomer(filePath, waId);
       if (!summary) continue;
+
+      // collect tags
+      for (const k of Object.keys(summary.tags || {})) allTagsSet.add(k);
+
+      // filters
+      if (unreadOnly && (summary.unread_count || 0) <= 0) continue;
+      if (recent24 && !withinLastHours(summary.last_time, 24)) continue;
 
       const hay = `${summary.wa_id} ${summary.profile_name || ""} ${summary.last_text || ""}`.toLowerCase();
       if (q && !hay.includes(q)) continue;
 
+      if (tag) {
+        const hasTag = (summary.tags && summary.tags[tag]) || 0;
+        if (!hasTag) continue;
+      }
+
       customers.push(summary);
     }
 
-    customers.sort((a, b) => {
-      const ta = a.last_time ? Date.parse(a.last_time) : 0;
-      const tb = b.last_time ? Date.parse(b.last_time) : 0;
-      return tb - ta;
-    });
+    customers.sort((a, b) => isoToMs(b.last_time) - isoToMs(a.last_time));
+
+    const allTags = Array.from(allTagsSet).sort();
 
     const rowsHtml = customers
       .map((c) => {
+        const unreadBadge =
+          (c.unread_count || 0) > 0
+            ? `<span class="badge">${c.unread_count}</span>`
+            : `<span class="badge ghost">0</span>`;
+
+        const lastDir = c.last_direction ? `<span class="pill ${escapeHtml(c.last_direction)}">${escapeHtml(c.last_direction)}</span>` : "";
         const tags = Object.entries(c.tags || {})
           .map(([k, v]) => `<span class="tag">${escapeHtml(k)}:${v}</span>`)
           .join(" ");
+
         return `
           <tr>
-            <td class="mono"><a href="/ui/customer/${encodeURIComponent(c.wa_id)}">${escapeHtml(c.wa_id)}</a></td>
+            <td class="mono">
+              <a href="/ui/customer/${encodeURIComponent(c.wa_id)}">${escapeHtml(c.wa_id)}</a>
+            </td>
             <td>${escapeHtml(c.profile_name || "")}</td>
             <td>${escapeHtml(fmtTime(c.last_time))}</td>
-            <td>${escapeHtml(c.last_text || "")}</td>
+            <td>${unreadBadge} ${lastDir} ${escapeHtml(c.last_text || "")}</td>
             <td>${tags}</td>
           </tr>
         `;
       })
       .join("");
+
+    const currentParams = {
+      q: q || "",
+      unread: unreadOnly ? "1" : "",
+      recent24: recent24 ? "1" : "",
+      tag: tag || "",
+    };
+
+    const unreadLink = buildQueryLink("/ui", currentParams, { unread: unreadOnly ? "" : "1" });
+    const recentLink = buildQueryLink("/ui", currentParams, { recent24: recent24 ? "" : "1" });
+    const clearLink = "/ui";
+
+    const tagOptions = [
+      `<option value="">All</option>`,
+      ...allTags.map((t) => `<option value="${escapeHtml(t)}" ${t === tag ? "selected" : ""}>${escapeHtml(t)}</option>`),
+    ].join("");
 
     const html = `<!doctype html>
 <html>
@@ -376,46 +490,83 @@ app.get("/ui", (req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>WhatsApp CS - Customers</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
+    :root {
+      --bg:#0b0f17; --card:#0f1623; --muted:#9aa4b2; --line:#1f2a3a; --text:#e7edf6;
+      --pill:#121c2b; --green:#21c55d; --blue:#60a5fa; --red:#fb7185;
+    }
+    body { font-family: Arial, sans-serif; margin: 0; background:var(--bg); color:var(--text); }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 18px; }
     .top { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-    input { padding: 8px 10px; min-width: 260px; }
-    table { width: 100%; border-collapse: collapse; margin-top: 14px; }
-    th, td { border-bottom: 1px solid #eee; padding: 10px; text-align: left; vertical-align: top; }
-    th { background: #fafafa; position: sticky; top: 0; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .tag { display:inline-block; padding:2px 6px; border:1px solid #ddd; border-radius: 999px; margin-right: 6px; font-size: 12px; }
-    .muted { color: #777; font-size: 13px; }
-    a { text-decoration: none; }
+    h2 { margin:0; font-size:18px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    a { color: var(--blue); text-decoration: none; }
     a:hover { text-decoration: underline; }
+
+    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    input, select { padding: 8px 10px; border:1px solid var(--line); background:var(--card); color:var(--text); border-radius:10px; }
+    button { padding: 8px 12px; border:1px solid var(--line); background:#162235; color:var(--text); border-radius:10px; cursor:pointer; }
+    button:hover { filter:brightness(1.05); }
+
+    .chip { display:inline-flex; gap:8px; align-items:center; padding:8px 10px; border:1px solid var(--line); border-radius:999px; background:var(--card); }
+    .chip.on { border-color:#2a3a55; background:#121c2b; }
+    .chip b { font-size:12px; }
+
+    table { width: 100%; border-collapse: collapse; margin-top: 14px; background:var(--card); border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+    th, td { border-bottom: 1px solid var(--line); padding: 12px; text-align: left; vertical-align: top; }
+    th { background: #0f1b2c; position: sticky; top: 0; z-index:1; font-size:12px; color:var(--muted); letter-spacing:.02em; }
+    tr:hover td { background:#0f1b2c; }
+
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .tag { display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius: 999px; margin-right: 6px; font-size: 12px; color:var(--muted); }
+    .pill { display:inline-block; font-size: 12px; padding:2px 8px; border:1px solid var(--line); border-radius: 999px; margin-right: 6px; color:var(--muted); background:var(--pill); }
+    .pill.incoming { border-color:#27405f; color:#93c5fd; }
+    .pill.outgoing { border-color:#1f4b35; color:#86efac; }
+
+    .badge { display:inline-flex; align-items:center; justify-content:center; min-width:22px; height:22px; padding:0 6px; border-radius:999px; background:var(--red); color:#fff; font-size:12px; margin-right:8px; }
+    .badge.ghost { background:#1a2434; color:var(--muted); border:1px solid var(--line); }
   </style>
 </head>
 <body>
-  <div class="top">
-    <div>
-      <h2 style="margin:0;">Customers</h2>
-      <div class="muted">Read-only. Data source: logs/by-user/*.jsonl</div>
-    </div>
-    <form method="get" action="/ui">
-      <input name="q" placeholder="Search wa_id / name / last text" value="${escapeHtml(q)}" />
-      <button type="submit">Search</button>
-      <a class="muted" href="/ui" style="margin-left:10px;">Clear</a>
-    </form>
-  </div>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h2>Customers</h2>
+        <div class="muted">Read-only UI. Logs: logs/by-user/*.jsonl &nbsp;|&nbsp; Unread state: logs/state/*.json</div>
+      </div>
 
-  <table>
-    <thead>
-      <tr>
-        <th>wa_id</th>
-        <th>Name</th>
-        <th>Last time</th>
-        <th>Last message</th>
-        <th>Tags (last 200)</th>
-      </tr>
-    </thead>
-    <tbody>
-      ${rowsHtml || `<tr><td colspan="5" class="muted">No customers found.</td></tr>`}
-    </tbody>
-  </table>
+      <div class="controls">
+        <a href="/send" class="chip"><b>Send Page</b></a>
+        <a href="${unreadLink}" class="chip ${unreadOnly ? "on" : ""}"><b>Unread Only</b></a>
+        <a href="${recentLink}" class="chip ${recent24 ? "on" : ""}"><b>Last 24h</b></a>
+      </div>
+
+      <form method="get" action="/ui" class="controls">
+        <input name="q" placeholder="Search wa_id / name / last text" value="${escapeHtml(q)}" />
+        <select name="tag">
+          ${tagOptions}
+        </select>
+        <input type="hidden" name="unread" value="${unreadOnly ? "1" : ""}" />
+        <input type="hidden" name="recent24" value="${recent24 ? "1" : ""}" />
+        <button type="submit">Apply</button>
+        <a class="muted" href="${clearLink}">Clear</a>
+      </form>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>wa_id</th>
+          <th>Name</th>
+          <th>Last time</th>
+          <th>Last message</th>
+          <th>Tags (last 300)</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rowsHtml || `<tr><td colspan="5" class="muted">No customers found.</td></tr>`}
+      </tbody>
+    </table>
+  </div>
 </body>
 </html>`;
 
@@ -426,41 +577,128 @@ app.get("/ui", (req, res) => {
   }
 });
 
+// ========= UI: Customer chat (bubble + filters: q, recent24, tag, unreadOnly=only unread incoming) =========
 app.get("/ui/customer/:wa_id", (req, res) => {
   try {
     const waId = safeFileName(req.params.wa_id);
+
     const q = (req.query.q || "").toString().trim().toLowerCase();
-    const limit = Math.min(parseInt(req.query.limit || "500", 10) || 500, 5000);
+    const limit = Math.min(parseInt(req.query.limit || "800", 10) || 800, 5000);
+
+    const recent24 = (req.query.recent24 || "").toString() === "1";
+    const tag = (req.query.tag || "").toString().trim().toLowerCase();
+    const unreadOnly = (req.query.unread || "").toString() === "1";
 
     const filePath = path.join(byUserDir, `${waId}.jsonl`);
     const rows = readJsonlLastN(filePath, limit);
 
-    const filtered = q
-      ? rows.filter((r) =>
-          `${r.text || ""} ${(r.tags || []).join(",")}`
-            .toLowerCase()
-            .includes(q)
-        )
-      : rows;
+    // Build tags dropdown from existing data
+    const tagsSet = new Set();
+    for (const r of rows) {
+      for (const t of r.tags || []) tagsSet.add(t);
+    }
+    const allTags = Array.from(tagsSet).sort();
 
-    const items = filtered
+    // unread computation
+    const st = readState(waId);
+    const lastSeenMs = isoToMs(st.last_seen_incoming_at);
+
+    // Filter
+    const filtered = rows.filter((r) => {
+      const text = (r.text || "").toString();
+      const tagsStr = (r.tags || []).join(",");
+      const hay = `${text} ${tagsStr}`.toLowerCase();
+
+      if (q && !hay.includes(q)) return false;
+
+      const timeIso = r.received_at || r.sent_at || null;
+      if (recent24 && !withinLastHours(timeIso, 24)) return false;
+
+      if (tag) {
+        const has = (r.tags || []).map((x) => String(x).toLowerCase()).includes(tag);
+        if (!has) return false;
+      }
+
+      if (unreadOnly) {
+        // show only unread incoming (received after last seen)
+        if (r.direction !== "incoming") return false;
+        const ms = isoToMs(r.received_at);
+        if (!ms || ms <= lastSeenMs) return false;
+      }
+
+      return true;
+    });
+
+    // When opening this page, mark all incoming as read (update last_seen_incoming_at)
+    // Mark based on latest incoming received_at in the FULL rows (not filtered) to avoid missing.
+    let latestIncoming = null;
+    for (const r of rows) {
+      if (r.direction === "incoming" && r.received_at) latestIncoming = r.received_at;
+    }
+    if (latestIncoming) {
+      // only update if newer
+      if (isoToMs(latestIncoming) > lastSeenMs) {
+        writeState(waId, { last_seen_incoming_at: latestIncoming });
+      }
+    }
+
+    const sentFlag = (req.query.sent || "").toString();
+    const errMsg = (req.query.err || "").toString();
+
+    const notice = errMsg
+      ? `<div class="alert err">❌ ${escapeHtml(errMsg)}</div>`
+      : sentFlag
+      ? `<div class="alert ok">✅ Sent</div>`
+      : "";
+
+    const bubbles = filtered
       .map((r) => {
-        const tags = (r.tags || [])
-          .map((t) => `<span class="tag">${escapeHtml(t)}</span>`)
-          .join(" ");
+        const dir = r.direction || "";
+        const isOut = dir === "outgoing";
+        const timeIso = r.received_at || r.sent_at || "";
+        const time = fmtTime(timeIso);
+
+        const tags = (r.tags || []).map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join(" ");
+
+        // unread indicator for incoming
+        let unreadMark = "";
+        if (r.direction === "incoming") {
+          const ms = isoToMs(r.received_at);
+          if (ms && ms > lastSeenMs) unreadMark = `<span class="dot" title="unread"></span>`;
+        }
+
         return `
-          <div class="msg">
-            <div class="meta">
-              <span class="mono">${escapeHtml(r.received_at)}</span>
-              <span class="mono">type=${escapeHtml(r.type || "")}</span>
-              <span class="mono">from=${escapeHtml(r.from || "")}</span>
-              <span>${tags}</span>
+          <div class="row ${isOut ? "right" : "left"}">
+            <div class="bubble ${isOut ? "out" : "in"}">
+              <div class="meta">
+                ${unreadMark}
+                <span class="time">${escapeHtml(time)}</span>
+                <span class="type">${escapeHtml(r.type || "")}</span>
+                ${tags ? `<span class="tags">${tags}</span>` : ""}
+              </div>
+              <div class="text">${escapeHtml(r.text || "")}</div>
             </div>
-            <div class="text">${escapeHtml(r.text || "")}</div>
           </div>
         `;
       })
       .join("");
+
+    const currentParams = {
+      q: q || "",
+      tag: tag || "",
+      recent24: recent24 ? "1" : "",
+      unread: unreadOnly ? "1" : "",
+      limit: String(limit),
+    };
+
+    const toggleUnreadLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, { unread: unreadOnly ? "" : "1" });
+    const toggleRecentLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, { recent24: recent24 ? "" : "1" });
+    const clearLink = `/ui/customer/${encodeURIComponent(waId)}`;
+
+    const tagOptions = [
+      `<option value="">All</option>`,
+      ...allTags.map((t) => `<option value="${escapeHtml(t)}" ${t === tag ? "selected" : ""}>${escapeHtml(t)}</option>`),
+    ].join("");
 
     const html = `<!doctype html>
 <html>
@@ -469,49 +707,110 @@ app.get("/ui/customer/:wa_id", (req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>WhatsApp CS - ${escapeHtml(waId)}</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
+    :root {
+      --bg:#0b0f17; --card:#0f1623; --muted:#9aa4b2; --line:#1f2a3a; --text:#e7edf6;
+      --in:#111b2c; --out:#0f2a1d;
+      --blue:#60a5fa; --green:#34d399; --red:#fb7185;
+    }
+    body { font-family: Arial, sans-serif; margin:0; background:var(--bg); color:var(--text); }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 18px; }
+    a { color: var(--blue); text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
     .top { display:flex; align-items:flex-end; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-    .mono { font-family: ui-monospace, monospace; }
-    .muted { color: #777; font-size: 13px; }
-    input, textarea { padding: 8px 10px; }
-    .tag { display:inline-block; padding:2px 6px; border:1px solid #ddd; border-radius:999px; margin-right:6px; font-size:12px; }
-    .msg { border:1px solid #eee; border-radius:10px; padding:10px 12px; margin-top:10px; }
-    .meta { display:flex; gap:10px; flex-wrap:wrap; font-size:12px; color:#444; }
-    .text { margin-top:8px; white-space: pre-wrap; }
-    textarea { width:100%; box-sizing:border-box; }
-    button { padding:6px 12px; }
+    h2 { margin:0; font-size:18px; }
+
+    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    input, select, textarea { padding: 10px 12px; border:1px solid var(--line); background:var(--card); color:var(--text); border-radius:12px; }
+    textarea { width:100%; box-sizing:border-box; resize: vertical; }
+    button { padding: 10px 14px; border:1px solid var(--line); background:#162235; color:var(--text); border-radius:12px; cursor:pointer; }
+    button:hover { filter:brightness(1.05); }
+
+    .chip { display:inline-flex; gap:8px; align-items:center; padding:8px 10px; border:1px solid var(--line); border-radius:999px; background:var(--card); }
+    .chip.on { border-color:#2a3a55; background:#121c2b; }
+    .chip b { font-size:12px; }
+
+    .chat { margin-top: 14px; background:var(--card); border:1px solid var(--line); border-radius:16px; padding: 14px; }
+    .row { display:flex; margin: 10px 0; }
+    .row.left { justify-content:flex-start; }
+    .row.right { justify-content:flex-end; }
+
+    .bubble { max-width: 78%; padding: 10px 12px; border-radius: 14px; border:1px solid var(--line); box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+    .bubble.in { background: var(--in); border-top-left-radius: 6px; }
+    .bubble.out { background: var(--out); border-top-right-radius: 6px; }
+
+    .meta { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
+    .time { color: var(--muted); }
+    .type { padding:2px 8px; border:1px solid var(--line); border-radius:999px; }
+    .tags .tag { margin-right:6px; }
+    .tag { display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius: 999px; font-size: 12px; color: var(--muted); }
+
+    .text { white-space: pre-wrap; line-height: 1.35; font-size: 14px; }
+
+    .reply { margin-top: 14px; background:var(--card); border:1px solid var(--line); border-radius:16px; padding: 14px; }
+    .replyTop { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom: 10px; }
+    .alert { margin-top:12px; padding:10px 12px; border-radius:12px; border:1px solid var(--line); }
+    .alert.ok { border-color:#1f4b35; background:#0f2a1d; color:#b7f7d4; }
+    .alert.err { border-color:#4b1f2a; background:#2a0f17; color:#ffd0d9; }
+
+    .dot { width:8px; height:8px; border-radius:999px; background: var(--red); display:inline-block; }
   </style>
 </head>
 <body>
-  <div class="top">
-    <div>
-      <h2 style="margin:0;">Customer: <span class="mono">${escapeHtml(waId)}</span></h2>
-      <div class="muted">
-        <a href="/ui">← Back</a> | Showing last ${filtered.length} messages
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h2>Customer: <span class="mono">${escapeHtml(waId)}</span></h2>
+        <div class="muted">
+          <a href="/ui">← Back</a>
+          &nbsp;|&nbsp; Showing ${filtered.length} messages
+          ${q ? ` (q="${escapeHtml(q)}")` : ""}
+          ${tag ? ` (tag="${escapeHtml(tag)}")` : ""}
+          ${recent24 ? ` (last 24h)` : ""}
+          ${unreadOnly ? ` (unread only)` : ""}
+        </div>
       </div>
+
+      <div class="controls">
+        <a href="${toggleUnreadLink}" class="chip ${unreadOnly ? "on" : ""}"><b>Unread Only</b></a>
+        <a href="${toggleRecentLink}" class="chip ${recent24 ? "on" : ""}"><b>Last 24h</b></a>
+      </div>
+
+      <form method="get" action="/ui/customer/${encodeURIComponent(waId)}" class="controls">
+        <input name="q" placeholder="Search text / tags" value="${escapeHtml(q)}" />
+        <select name="tag">${tagOptions}</select>
+        <input name="limit" type="hidden" value="${escapeHtml(String(limit))}" />
+        <input name="recent24" type="hidden" value="${recent24 ? "1" : ""}" />
+        <input name="unread" type="hidden" value="${unreadOnly ? "1" : ""}" />
+        <button type="submit">Apply</button>
+        <a class="muted" href="${clearLink}">Clear</a>
+      </form>
     </div>
-    <form method="get" action="/ui/customer/${encodeURIComponent(waId)}">
-      <input name="q" placeholder="Search..." value="${escapeHtml(q)}" />
-      <input name="limit" type="hidden" value="${escapeHtml(String(limit))}" />
-      <button type="submit">Search</button>
-      <a href="/ui/customer/${encodeURIComponent(waId)}">Clear</a>
-    </form>
-  </div>
 
-  ${items || `<div class="muted" style="margin-top:12px;">No messages found.</div>`}
+    ${notice}
 
-  <!-- Reply Box -->
-  <div style="margin-top:20px; padding:12px; border:1px solid #ddd; border-radius:10px;">
-    <form method="post" action="/send">
-      <input type="hidden" name="to" value="${escapeHtml(waId)}" />
-      <input type="hidden" name="redirect" value="/ui/customer/${encodeURIComponent(waId)}" />
-      <textarea name="text" rows="4" required placeholder="Type reply..."></textarea>
-      <div style="margin-top:10px;">
-        <button type="submit">Send</button>
+    <div class="chat">
+      ${bubbles || `<div class="muted">No messages found.</div>`}
+    </div>
+
+    <div class="reply">
+      <div class="replyTop">
+        <div class="muted">Reply (will be logged as outgoing)</div>
+        <div class="muted">After send: redirect back here</div>
       </div>
-    </form>
+      <form method="post" action="/send">
+        <input type="hidden" name="to" value="${escapeHtml(waId)}" />
+        <input type="hidden" name="redirect" value="/ui/customer/${encodeURIComponent(waId)}" />
+        <textarea name="text" rows="4" required placeholder="Type reply..."></textarea>
+        <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
+          <button type="submit">Send</button>
+          <a href="/send" class="chip"><b>Open Send Page</b></a>
+        </div>
+      </form>
+    </div>
   </div>
-
 </body>
 </html>`;
 
@@ -520,7 +819,9 @@ app.get("/ui/customer/:wa_id", (req, res) => {
     console.error("❌ /ui/customer error:", e);
     res.status(500).send("Internal error");
   }
-});// ===== SEND PAGE =====
+});
+
+// ===== SEND PAGE =====
 app.get("/send", (req, res) => {
   res.send(`
     <h2>Send WhatsApp Message</h2>
@@ -535,40 +836,55 @@ app.get("/send", (req, res) => {
   `);
 });
 
-app.use(express.urlencoded({ extended: false }));
-
-// ===== SEND API =====
+// ===== SEND API (outgoing + log) =====
 app.post("/send", async (req, res) => {
   try {
     const to = (req.body.to || "").trim();
     const text = (req.body.text || "").trim();
-
-    // 可选：从表单带过来的“发送后跳回哪里”
     const redirectTo = (req.body.redirect || "").trim();
 
     if (!to || !text) {
-      // 缺参数：如果有 redirect 就带错误信息跳回；否则直接提示
       if (redirectTo) {
-        const url = new URL(redirectTo, "http://localhost"); // 只是为了拼 query，用什么域名都行
-        url.searchParams.set("err", "Missing to/text");
-        return res.redirect(url.pathname + url.search);
+        const u = new URL(redirectTo, "http://localhost");
+        u.searchParams.set("err", "Missing to/text");
+        return res.redirect(u.pathname + u.search);
       }
       return res.status(400).send("Missing 'to' or 'text'");
     }
 
-    // ====== 你原本的发送代码（这里是标准 WhatsApp Cloud API 发文本） ======
-    const url = `https://graph.facebook.com/v25.0/${process.env.PHONE_NUMBER_ID}/messages`;
+    const WA_TOKEN = process.env.WA_TOKEN;
+    const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+
+    if (!WA_TOKEN) {
+      if (redirectTo) {
+        const u = new URL(redirectTo, "http://localhost");
+        u.searchParams.set("err", "Missing WA_TOKEN");
+        return res.redirect(u.pathname + u.search);
+      }
+      return res.status(500).send("Missing WA_TOKEN");
+    }
+    if (!PHONE_NUMBER_ID) {
+      if (redirectTo) {
+        const u = new URL(redirectTo, "http://localhost");
+        u.searchParams.set("err", "Missing PHONE_NUMBER_ID");
+        return res.redirect(u.pathname + u.search);
+      }
+      return res.status(500).send("Missing PHONE_NUMBER_ID");
+    }
+
+    const url = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
 
     const payload = {
       messaging_product: "whatsapp",
       to,
+      type: "text",
       text: { body: text },
     };
 
     const r = await fetch(url, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${process.env.WA_TOKEN}`,
+        Authorization: `Bearer ${WA_TOKEN}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
@@ -580,19 +896,46 @@ app.post("/send", async (req, res) => {
       console.error("❌ Send error:", data);
 
       if (redirectTo) {
-        const url2 = new URL(redirectTo, "http://localhost");
-        url2.searchParams.set("err", "Send failed");
-        return res.redirect(url2.pathname + url2.search);
+        const u = new URL(redirectTo, "http://localhost");
+        u.searchParams.set("err", "Send failed");
+        return res.redirect(u.pathname + u.search);
       }
-
       return res.status(500).send(`Error: ${JSON.stringify(data)}`);
     }
 
-    // ====== ✅ 发送成功后的行为：有 redirect 就跳回去，否则显示成功页 ======
+    // ✅ outgoing log
+    try {
+      const msgId = data?.messages?.[0]?.id || null;
+      const record = {
+        direction: "outgoing",
+        sent_at: new Date().toISOString(),
+        phone_number_id: PHONE_NUMBER_ID,
+        to,
+        from: null,
+        wa_id: to,
+        profile_name: null,
+        message_id: msgId,
+        type: "text",
+        text,
+        tags: getTags(text),
+        api: data,
+      };
+
+      appendJsonl(path.join(byDateDir, todayFileName("messages")), record);
+
+      const customerKey = safeFileName(to);
+      appendJsonl(path.join(byUserDir, `${customerKey}.jsonl`), record);
+
+      console.log("📝 saved outgoing:", to, text);
+    } catch (logErr) {
+      console.error("❌ outgoing log error:", logErr);
+    }
+
+    // ✅ redirect back
     if (redirectTo) {
-      const url3 = new URL(redirectTo, "http://localhost");
-      url3.searchParams.set("sent", "1");
-      return res.redirect(url3.pathname + url3.search);
+      const u = new URL(redirectTo, "http://localhost");
+      u.searchParams.set("sent", "1");
+      return res.redirect(u.pathname + u.search);
     }
 
     return res.send(`✅ Sent successfully\n\n${JSON.stringify(data, null, 2)}`);
@@ -601,6 +944,8 @@ app.post("/send", async (req, res) => {
     return res.status(500).send("Internal error");
   }
 });
+
+// ========= Start =========
 app.listen(PORT, () => {
   console.log("=====================================");
   console.log("🚀 WhatsApp Webhook Server Starting");
@@ -608,6 +953,10 @@ app.listen(PORT, () => {
   console.log("PORT:", PORT);
   console.log("VERIFY_TOKEN SET:", VERIFY_TOKEN ? "YES" : "NO");
   console.log("APP_SECRET SET:", APP_SECRET ? "YES" : "NO");
+  console.log("UI_USER SET:", UI_USER ? "YES" : "NO");
+  console.log("UI_PASS SET:", UI_PASS ? "YES" : "NO");
+  console.log("WA_TOKEN SET:", process.env.WA_TOKEN ? "YES" : "NO");
+  console.log("PHONE_NUMBER_ID SET:", process.env.PHONE_NUMBER_ID ? "YES" : "NO");
   console.log("=====================================");
   console.log(`✅ Server running on port ${PORT}`);
 });
