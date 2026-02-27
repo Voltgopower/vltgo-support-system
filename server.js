@@ -435,14 +435,19 @@ app.get("/ui/customer/:wa_id", (req, res) => {
     const filePath = path.join(byUserDir, `${waId}.jsonl`);
     const rows = readJsonlLastN(filePath, limit);
 
-    // filter by keyword if provided
     const filtered = q
-      ? rows.filter((r) => `${r.text || ""} ${(r.tags || []).join(",")}`.toLowerCase().includes(q))
+      ? rows.filter((r) =>
+          `${r.text || ""} ${(r.tags || []).join(",")}`
+            .toLowerCase()
+            .includes(q)
+        )
       : rows;
 
     const items = filtered
       .map((r) => {
-        const tags = (r.tags || []).map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join(" ");
+        const tags = (r.tags || [])
+          .map((t) => `<span class="tag">${escapeHtml(t)}</span>`)
+          .join(" ");
         return `
           <div class="msg">
             <div class="meta">
@@ -466,32 +471,47 @@ app.get("/ui/customer/:wa_id", (req, res) => {
   <style>
     body { font-family: Arial, sans-serif; margin: 20px; }
     .top { display:flex; align-items:flex-end; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .mono { font-family: ui-monospace, monospace; }
     .muted { color: #777; font-size: 13px; }
-    input { padding: 8px 10px; min-width: 260px; }
-    .tag { display:inline-block; padding:2px 6px; border:1px solid #ddd; border-radius: 999px; margin-right: 6px; font-size: 12px; }
-    .msg { border:1px solid #eee; border-radius: 10px; padding: 10px 12px; margin-top: 10px; }
-    .meta { display:flex; gap:10px; flex-wrap:wrap; align-items:center; font-size: 12px; color:#444; }
-    .text { margin-top: 8px; white-space: pre-wrap; }
-    a { text-decoration:none; }
-    a:hover { text-decoration:underline; }
+    input, textarea { padding: 8px 10px; }
+    .tag { display:inline-block; padding:2px 6px; border:1px solid #ddd; border-radius:999px; margin-right:6px; font-size:12px; }
+    .msg { border:1px solid #eee; border-radius:10px; padding:10px 12px; margin-top:10px; }
+    .meta { display:flex; gap:10px; flex-wrap:wrap; font-size:12px; color:#444; }
+    .text { margin-top:8px; white-space: pre-wrap; }
+    textarea { width:100%; box-sizing:border-box; }
+    button { padding:6px 12px; }
   </style>
 </head>
 <body>
   <div class="top">
     <div>
       <h2 style="margin:0;">Customer: <span class="mono">${escapeHtml(waId)}</span></h2>
-      <div class="muted"><a href="/ui">← Back</a> &nbsp;|&nbsp; Showing last ${filtered.length} messages ${q ? `(filtered by "${escapeHtml(q)}")` : ""}</div>
+      <div class="muted">
+        <a href="/ui">← Back</a> | Showing last ${filtered.length} messages
+      </div>
     </div>
     <form method="get" action="/ui/customer/${encodeURIComponent(waId)}">
-      <input name="q" placeholder="Search in messages / tags" value="${escapeHtml(q)}" />
+      <input name="q" placeholder="Search..." value="${escapeHtml(q)}" />
       <input name="limit" type="hidden" value="${escapeHtml(String(limit))}" />
       <button type="submit">Search</button>
-      <a class="muted" href="/ui/customer/${encodeURIComponent(waId)}" style="margin-left:10px;">Clear</a>
+      <a href="/ui/customer/${encodeURIComponent(waId)}">Clear</a>
     </form>
   </div>
 
   ${items || `<div class="muted" style="margin-top:12px;">No messages found.</div>`}
+
+  <!-- Reply Box -->
+  <div style="margin-top:20px; padding:12px; border:1px solid #ddd; border-radius:10px;">
+    <form method="post" action="/send">
+      <input type="hidden" name="to" value="${escapeHtml(waId)}" />
+      <input type="hidden" name="redirect" value="/ui/customer/${encodeURIComponent(waId)}" />
+      <textarea name="text" rows="4" required placeholder="Type reply..."></textarea>
+      <div style="margin-top:10px;">
+        <button type="submit">Send</button>
+      </div>
+    </form>
+  </div>
+
 </body>
 </html>`;
 
@@ -500,8 +520,7 @@ app.get("/ui/customer/:wa_id", (req, res) => {
     console.error("❌ /ui/customer error:", e);
     res.status(500).send("Internal error");
   }
-});
-// ===== SEND PAGE =====
+});// ===== SEND PAGE =====
 app.get("/send", (req, res) => {
   res.send(`
     <h2>Send WhatsApp Message</h2>
