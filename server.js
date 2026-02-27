@@ -501,6 +501,68 @@ app.get("/ui/customer/:wa_id", (req, res) => {
     res.status(500).send("Internal error");
   }
 });
+// ===== SEND PAGE =====
+app.get("/send", (req, res) => {
+  res.send(`
+    <h2>Send WhatsApp Message</h2>
+    <form method="post" action="/send">
+      <div>To (wa_id):</div>
+      <input name="to" required /><br/><br/>
+      <div>Message:</div>
+      <textarea name="text" rows="4" required></textarea><br/><br/>
+      <button type="submit">Send</button>
+    </form>
+    <p><a href="/ui">Back to UI</a></p>
+  `);
+});
+
+app.use(express.urlencoded({ extended: false }));
+
+// ===== SEND API =====
+app.post("/send", async (req, res) => {
+  try {
+    const to = req.body.to;
+    const text = req.body.text;
+
+    if (!to || !text) {
+      return res.status(400).send("Missing to or text");
+    }
+
+    const WA_TOKEN = process.env.WA_TOKEN;
+    const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+
+    if (!WA_TOKEN) return res.status(500).send("Missing WA_TOKEN");
+    if (!PHONE_NUMBER_ID) return res.status(500).send("Missing PHONE_NUMBER_ID");
+
+    const response = await fetch(
+      `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`,
+      {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${WA_TOKEN}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          to,
+          type: "text",
+          text: { body: text }
+        })
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      return res.status(500).send("Error: " + JSON.stringify(data));
+    }
+
+    res.send("✅ Sent successfully<br/><br/><a href='/send'>Send another</a>");
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("Send error");
+  }
+});
 app.listen(PORT, () => {
   console.log("=====================================");
   console.log("🚀 WhatsApp Webhook Server Starting");
