@@ -521,46 +521,65 @@ app.use(express.urlencoded({ extended: false }));
 // ===== SEND API =====
 app.post("/send", async (req, res) => {
   try {
-    const to = req.body.to;
-    const text = req.body.text;
+    const to = (req.body.to || "").trim();
+    const text = (req.body.text || "").trim();
+
+    // 可选：从表单带过来的“发送后跳回哪里”
+    const redirectTo = (req.body.redirect || "").trim();
 
     if (!to || !text) {
-      return res.status(400).send("Missing to or text");
-    }
-
-    const WA_TOKEN = process.env.WA_TOKEN;
-    const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-
-    if (!WA_TOKEN) return res.status(500).send("Missing WA_TOKEN");
-    if (!PHONE_NUMBER_ID) return res.status(500).send("Missing PHONE_NUMBER_ID");
-
-    const response = await fetch(
-      `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`,
-      {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${WA_TOKEN}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          messaging_product: "whatsapp",
-          to,
-          type: "text",
-          text: { body: text }
-        })
+      // 缺参数：如果有 redirect 就带错误信息跳回；否则直接提示
+      if (redirectTo) {
+        const url = new URL(redirectTo, "http://localhost"); // 只是为了拼 query，用什么域名都行
+        url.searchParams.set("err", "Missing to/text");
+        return res.redirect(url.pathname + url.search);
       }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      return res.status(500).send("Error: " + JSON.stringify(data));
+      return res.status(400).send("Missing 'to' or 'text'");
     }
 
-    res.send("✅ Sent successfully<br/><br/><a href='/send'>Send another</a>");
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Send error");
+    // ====== 你原本的发送代码（这里是标准 WhatsApp Cloud API 发文本） ======
+    const url = `https://graph.facebook.com/v25.0/${process.env.PHONE_NUMBER_ID}/messages`;
+
+    const payload = {
+      messaging_product: "whatsapp",
+      to,
+      text: { body: text },
+    };
+
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.WA_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await r.json();
+
+    if (!r.ok) {
+      console.error("❌ Send error:", data);
+
+      if (redirectTo) {
+        const url2 = new URL(redirectTo, "http://localhost");
+        url2.searchParams.set("err", "Send failed");
+        return res.redirect(url2.pathname + url2.search);
+      }
+
+      return res.status(500).send(`Error: ${JSON.stringify(data)}`);
+    }
+
+    // ====== ✅ 发送成功后的行为：有 redirect 就跳回去，否则显示成功页 ======
+    if (redirectTo) {
+      const url3 = new URL(redirectTo, "http://localhost");
+      url3.searchParams.set("sent", "1");
+      return res.redirect(url3.pathname + url3.search);
+    }
+
+    return res.send(`✅ Sent successfully\n\n${JSON.stringify(data, null, 2)}`);
+  } catch (e) {
+    console.error("❌ /send exception:", e);
+    return res.status(500).send("Internal error");
   }
 });
 app.listen(PORT, () => {
