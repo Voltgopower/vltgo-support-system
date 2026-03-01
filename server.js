@@ -1,11 +1,13 @@
 /**
- * WhatsApp Webhook Server
+ * WhatsApp Webhook Server (FAST A)
  * - Webhook receive + log jsonl (incoming)
- * - Send message + log jsonl (outgoing)
- * - UI: customers list + chat bubble view
+ * - Download incoming media to local disk (image/video/document/audio)
+ * - Send message: text + upload local file (image/video/document/audio)
+ * - UI: light theme + chat bubbles
  * - Filters: unread only / last 24h / tag filter
  * - Unread tracking via logs/state/<wa_id>.json (no jsonl rewrites)
- 
+ * - Version probe: /__version
+ *
  * .env required:
  *   VERIFY_TOKEN=voltgo_webhook_verify
  *   WA_TOKEN=xxxxxxxxxxxxxxxx
@@ -17,18 +19,17 @@
  *   APP_SECRET=xxxxx
  */
 
-
 require("dotenv").config();
 
 const express = require("express");
 const crypto = require("crypto");
-const { Pool } = require("pg");
 const fs = require("fs");
 const path = require("path");
+const multer = require("multer");
 
 const app = express();
 
-/** Save raw body for signature verification */
+// ========= RAW BODY SAVER (signature verify) =========
 function rawBodySaver(req, res, buf) {
   req.rawBody = buf;
 }
@@ -42,13 +43,15 @@ app.use(express.urlencoded({ extended: false }));
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PORT = process.env.PORT || 8080;
 const APP_SECRET = process.env.APP_SECRET || null; // optional
+const WA_TOKEN = process.env.WA_TOKEN;
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 if (!VERIFY_TOKEN) {
   console.error("Missing .env variable: VERIFY_TOKEN");
   process.exit(1);
 }
 
-// ========= Basic Auth (protect UI + send + APIs) =========
+// ========= Basic Auth (protect UI + send + APIs + media) =========
 const UI_USER = process.env.UI_USER;
 const UI_PASS = process.env.UI_PASS;
 
@@ -61,8 +64,11 @@ function basicAuth(req, res, next) {
   // allow webhook endpoints without auth (Meta calls)
   if (req.path === "/webhook") return next();
 
+  // allow health/version probes without auth (optional)
+  if (req.path === "/" || req.path === "/__version") return next();
+
   // protect these routes
-  const protectedPrefixes = ["/ui", "/customers", "/send"];
+  const protectedPrefixes = ["/ui", "/customers", "/send", "/media"];
   if (!protectedPrefixes.some((p) => req.path.startsWith(p))) return next();
 
   if (!UI_USER || !UI_PASS) {
@@ -83,72 +89,40 @@ function basicAuth(req, res, next) {
   if (user !== UI_USER || pass !== UI_PASS) return unauthorized(res);
   return next();
 }
+
 app.use(basicAuth);
-// ========= Postgres =========
-const DATABASE_URL = process.env.DATABASE_URL || null;
 
-const pgPool = DATABASE_URL
-  ? new Pool({
-      connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
-    })
-  : null;
-
-// ========= DB init route =========
-app.get("/__db_init", async (req, res) => {
-  try {
-    if (!pgPool) return res.status(500).send("Missing DATABASE_URL");
-
-    const sql = `
-CREATE TABLE IF NOT EXISTS wa_customers (
-  wa_id TEXT PRIMARY KEY,
-  profile_name TEXT,
-  last_seen_incoming_at TIMESTAMPTZ,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS wa_messages (
-  id BIGSERIAL PRIMARY KEY,
-  wa_id TEXT NOT NULL,
-  direction TEXT NOT NULL CHECK (direction IN ('incoming','outgoing')),
-  type TEXT NOT NULL,
-  text TEXT,
-  tags TEXT[] NOT NULL DEFAULT '{}',
-  message_id TEXT,
-  from_wa TEXT,
-  to_wa TEXT,
-  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-  media_id TEXT,
-  mime_type TEXT,
-  sha256 TEXT,
-  caption TEXT,
-  filename TEXT,
-
-  raw JSONB
-);
-
-CREATE INDEX IF NOT EXISTS idx_wa_messages_wa_id_ts ON wa_messages (wa_id, ts DESC);
-CREATE INDEX IF NOT EXISTS idx_wa_messages_tags ON wa_messages USING GIN (tags);
-CREATE INDEX IF NOT EXISTS idx_wa_messages_ts ON wa_messages (ts DESC);
-`;
-    await pgPool.query(sql);
-
-    return res.status(200).send("✅ DB init OK");
-  } catch (e) {
-    console.error("❌ DB init error:", e);
-    return res.status(500).send("DB init failed: " + e.message);
-  }
-});
 // ========= Log directories =========
 const baseLogsDir = path.join(__dirname, "logs");
 const byUserDir = path.join(baseLogsDir, "by-user");
 const byDateDir = path.join(baseLogsDir, "by-date");
 const stateDir = path.join(baseLogsDir, "state");
+const mediaDir = path.join(baseLogsDir, "media");
+const uploadsDir = path.join(baseLogsDir, "uploads");
 
 ensureDir(byUserDir);
 ensureDir(byDateDir);
 ensureDir(stateDir);
+ensureDir(mediaDir);
+ensureDir(uploadsDir);
+
+// ========= Multer upload =========
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: function (req, file, cb) {
+      cb(null, uploadsDir);
+    },
+    filename: function (req, file, cb) {
+      const safe = safeFileName(file.originalname || "file");
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      cb(null, `${ts}__${safe}`);
+    },
+  }),
+  limits: {
+    // 先给一个保守值；需要更大再调
+    fileSize: 25 * 1024 * 1024, // 25MB
+  },
+});
 
 // ========= Helpers =========
 function ensureDir(dir) {
@@ -173,6 +147,7 @@ function todayFileName(prefix = "messages") {
 function safeFileName(name) {
   return String(name || "")
     .replace(/[\\\/:*?"<>|]/g, "_")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
@@ -250,8 +225,7 @@ function isoToMs(iso) {
 function withinLastHours(iso, hours) {
   const ms = isoToMs(iso);
   if (!ms) return false;
-  const now = Date.now();
-  return now - ms <= hours * 3600 * 1000;
+  return Date.now() - ms <= hours * 3600 * 1000;
 }
 
 // ========= Read log =========
@@ -270,19 +244,16 @@ function readJsonlLastN(filePath, n = 300) {
 }
 
 function summarizeCustomer(filePath, waId) {
-  const rows = readJsonlLastN(filePath, 300);
+  const rows = readJsonlLastN(filePath, 400);
   if (rows.length === 0) return null;
 
-  // find last message
   const last = rows[rows.length - 1];
 
-  // tag counts (last 300)
   const tagCounts = {};
   for (const r of rows) {
     for (const tag of r.tags || []) tagCounts[tag] = (tagCounts[tag] || 0) + 1;
   }
 
-  // unread counts based on state
   const st = readState(waId);
   const lastSeenMs = isoToMs(st.last_seen_incoming_at);
   let unreadCount = 0;
@@ -291,7 +262,7 @@ function summarizeCustomer(filePath, waId) {
   for (const r of rows) {
     if (r.direction === "incoming") {
       const t = r.received_at || null;
-      if (t) lastIncomingAt = t; // will end as last incoming
+      if (t) lastIncomingAt = t;
       const ms = isoToMs(t);
       if (ms && ms > lastSeenMs) unreadCount++;
     }
@@ -301,7 +272,7 @@ function summarizeCustomer(filePath, waId) {
     wa_id: waId,
     profile_name: last.profile_name || null,
     last_time: last.received_at || last.sent_at || null,
-    last_text: last.text || null,
+    last_text: last.text || last.caption || null,
     last_type: last.type || null,
     last_direction: last.direction || null,
     tags: tagCounts,
@@ -337,16 +308,150 @@ function buildQueryLink(basePath, current, patch) {
   u.search = params.toString();
   return u.pathname + (u.search ? `?${u.search}` : "");
 }
+
+function setNoCache(res) {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+}
+
+// ========= Media helpers =========
+function extFromMime(mime) {
+  const m = (mime || "").toLowerCase();
+  if (m.includes("image/jpeg")) return "jpg";
+  if (m.includes("image/png")) return "png";
+  if (m.includes("image/webp")) return "webp";
+  if (m.includes("image/gif")) return "gif";
+  if (m.includes("video/mp4")) return "mp4";
+  if (m.includes("video/quicktime")) return "mov";
+  if (m.includes("audio/ogg")) return "ogg";
+  if (m.includes("audio/mpeg")) return "mp3";
+  if (m.includes("audio/mp4")) return "m4a";
+  if (m.includes("application/pdf")) return "pdf";
+  return "bin";
+}
+
+function mediaLocalDirForWaId(waId) {
+  const dir = path.join(mediaDir, safeFileName(waId || "unknown"));
+  ensureDir(dir);
+  return dir;
+}
+
+function mediaServePath(waId, filename) {
+  return `/media/file/${encodeURIComponent(waId)}/${encodeURIComponent(filename)}`;
+}
+
+// download incoming media by media_id -> save to logs/media/<wa_id>/<media_id>.<ext>
+async function downloadIncomingMedia(waId, mediaId) {
+  if (!WA_TOKEN) throw new Error("Missing WA_TOKEN");
+  if (!mediaId) return null;
+
+  // 1) get media URL + mime
+  const metaResp = await fetch(`https://graph.facebook.com/v25.0/${mediaId}`, {
+    headers: { Authorization: `Bearer ${WA_TOKEN}` },
+  });
+  const meta = await metaResp.json();
+  if (!metaResp.ok) {
+    throw new Error(`Media meta error: ${JSON.stringify(meta)}`);
+  }
+  const url = meta?.url;
+  const mime = meta?.mime_type || null;
+
+  if (!url) throw new Error("Media meta missing url");
+
+  // 2) download bytes using bearer token
+  const binResp = await fetch(url, {
+    headers: { Authorization: `Bearer ${WA_TOKEN}` },
+  });
+  if (!binResp.ok) {
+    const t = await binResp.text().catch(() => "");
+    throw new Error(`Media download error: ${binResp.status} ${t}`);
+  }
+  const buf = Buffer.from(await binResp.arrayBuffer());
+
+  const ext = extFromMime(mime);
+  const fileName = `${safeFileName(mediaId)}.${ext}`;
+  const dir = mediaLocalDirForWaId(waId);
+  const abs = path.join(dir, fileName);
+
+  // if already exists, skip write
+  if (!fs.existsSync(abs)) {
+    fs.writeFileSync(abs, buf);
+  }
+
+  return {
+    media_id: mediaId,
+    mime_type: mime,
+    local_file: abs,
+    local_url: mediaServePath(waId, fileName),
+    sha256: meta?.sha256 || null,
+  };
+}
+
+// upload outgoing media file to WhatsApp -> return media id
+async function uploadMediaToWhatsApp(filePath, mimeType) {
+  if (!WA_TOKEN) throw new Error("Missing WA_TOKEN");
+  if (!PHONE_NUMBER_ID) throw new Error("Missing PHONE_NUMBER_ID");
+
+  const buf = fs.readFileSync(filePath);
+  const name = path.basename(filePath);
+
+  // Node 22 has global File/FormData (undici)
+  const file = new File([buf], name, { type: mimeType || "application/octet-stream" });
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("file", file);
+
+  const r = await fetch(`https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/media`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${WA_TOKEN}`,
+      // 注意：FormData 会自动带 boundary，不要手动写 Content-Type
+    },
+    body: form,
+  });
+
+  const data = await r.json();
+  if (!r.ok) {
+    throw new Error(`Upload media failed: ${JSON.stringify(data)}`);
+  }
+  return data?.id || null;
+}
+
+function guessMimeByExt(filename) {
+  const f = (filename || "").toLowerCase();
+  if (f.endsWith(".jpg") || f.endsWith(".jpeg")) return "image/jpeg";
+  if (f.endsWith(".png")) return "image/png";
+  if (f.endsWith(".webp")) return "image/webp";
+  if (f.endsWith(".gif")) return "image/gif";
+  if (f.endsWith(".mp4")) return "video/mp4";
+  if (f.endsWith(".mov")) return "video/quicktime";
+  if (f.endsWith(".mp3")) return "audio/mpeg";
+  if (f.endsWith(".ogg")) return "audio/ogg";
+  if (f.endsWith(".m4a")) return "audio/mp4";
+  if (f.endsWith(".pdf")) return "application/pdf";
+  return "application/octet-stream";
+}
+
+function classifyMediaType(mimeType) {
+  const m = (mimeType || "").toLowerCase();
+  if (m.startsWith("image/")) return "image";
+  if (m.startsWith("video/")) return "video";
+  if (m.startsWith("audio/")) return "audio";
+  return "document";
+}
+
+// ========= Health + Version =========
+app.get("/", (req, res) => res.status(200).send("OK"));
+
 app.get("/__version", (req, res) => {
-  res.status(200).json({
+  return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "LIGHT_UI_2026-02-27_v1",
+    marker: "FAST_A_MEDIA_UI_2026-03-01_v1",
     node: process.version,
   });
 });
-// ========= Health =========
-app.get("/", (req, res) => res.status(200).send("OK"));
 
 // ========= Webhook verify =========
 app.get("/webhook", (req, res) => {
@@ -366,61 +471,147 @@ app.get("/webhook", (req, res) => {
 app.post("/webhook", (req, res) => {
   res.sendStatus(200);
 
-  try {
-    if (!isValidSignature(req)) {
-      console.warn("❌ Invalid webhook signature");
-      return;
+  (async () => {
+    try {
+      if (!isValidSignature(req)) {
+        console.warn("❌ Invalid webhook signature");
+        return;
+      }
+
+      const body = req.body;
+      const entry = body?.entry?.[0];
+      const change = entry?.changes?.[0];
+      const value = change?.value;
+      const field = change?.field;
+
+      if (field !== "messages" || !value?.messages?.length) return;
+
+      const msg = value.messages[0];
+      const contact = value.contacts?.[0];
+
+      const waId = contact?.wa_id || msg.from || null;
+      const profileName = contact?.profile?.name || null;
+
+      // parse different message types
+      const type = msg.type || "unknown";
+
+      let textBody = null;
+      let caption = null;
+      let mediaId = null;
+      let mimeType = null;
+      let sha256 = null;
+      let localMediaUrl = null;
+      let localMediaFile = null;
+
+      if (type === "text") {
+        textBody = msg.text?.body ?? null;
+      } else if (type === "image") {
+        mediaId = msg.image?.id || null;
+        mimeType = msg.image?.mime_type || null;
+        sha256 = msg.image?.sha256 || null;
+        caption = msg.image?.caption || null;
+      } else if (type === "video") {
+        mediaId = msg.video?.id || null;
+        mimeType = msg.video?.mime_type || null;
+        sha256 = msg.video?.sha256 || null;
+        caption = msg.video?.caption || null;
+      } else if (type === "document") {
+        mediaId = msg.document?.id || null;
+        mimeType = msg.document?.mime_type || null;
+        sha256 = msg.document?.sha256 || null;
+        caption = msg.document?.caption || msg.document?.filename || null;
+      } else if (type === "audio") {
+        mediaId = msg.audio?.id || null;
+        mimeType = msg.audio?.mime_type || null;
+        sha256 = msg.audio?.sha256 || null;
+      } else {
+        // fallback
+        textBody = null;
+      }
+
+      // download media if present
+      if (mediaId) {
+        try {
+          const dl = await downloadIncomingMedia(waId || msg.from, mediaId);
+          localMediaUrl = dl?.local_url || null;
+          localMediaFile = dl?.local_file || null;
+          mimeType = dl?.mime_type || mimeType;
+        } catch (e) {
+          console.error("❌ download media failed:", e?.message || e);
+        }
+      }
+
+      const record = {
+        direction: "incoming",
+        received_at: new Date().toISOString(),
+
+        waba_id: entry?.id,
+        phone_number_id: value?.metadata?.phone_number_id,
+        display_phone_number: value?.metadata?.display_phone_number,
+
+        from: msg.from,
+        to: value?.metadata?.display_phone_number || null,
+
+        wa_id: waId,
+        profile_name: profileName,
+
+        message_id: msg.id,
+        timestamp: msg.timestamp,
+        type,
+
+        text: textBody,
+        caption: caption,
+        media_id: mediaId,
+        mime_type: mimeType,
+        media_sha256: sha256,
+        local_media_url: localMediaUrl,
+        local_media_file: localMediaFile,
+
+        tags: getTags(textBody || caption || ""),
+        raw: msg,
+      };
+
+      appendJsonl(path.join(byDateDir, todayFileName("messages")), record);
+
+      const customerKey = safeFileName(record.wa_id || record.from);
+      appendJsonl(path.join(byUserDir, `${customerKey}.jsonl`), record);
+
+      console.log(
+        "📝 saved incoming:",
+        record.type,
+        record.from,
+        record.text || record.caption || "",
+        record.media_id ? `media=${record.media_id}` : "",
+        record.tags?.length ? `tags=${record.tags.join(",")}` : ""
+      );
+    } catch (e) {
+      console.error("❌ webhook handler error:", e);
     }
+  })();
+});
 
-    const body = req.body;
-    const entry = body?.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
-    const field = change?.field;
+// ========= Media serve =========
+// GET /media/file/:wa_id/:filename -> serve local media from logs/media/<wa_id>/<filename>
+app.get("/media/file/:wa_id/:filename", (req, res) => {
+  try {
+    const waId = safeFileName(req.params.wa_id);
+    const filename = safeFileName(req.params.filename);
 
-    if (field !== "messages" || !value?.messages?.length) return;
+    const abs = path.join(mediaDir, waId, filename);
+    if (!abs.startsWith(path.join(mediaDir, waId))) {
+      return res.status(400).send("Bad path");
+    }
+    if (!fs.existsSync(abs)) return res.status(404).send("Not found");
 
-    const msg = value.messages[0];
-    const contact = value.contacts?.[0];
-    const textBody = msg.text?.body ?? null;
+    // set content type roughly by ext
+    const mime = guessMimeByExt(filename);
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Cache-Control", "no-store");
 
-    const record = {
-      direction: "incoming",
-      received_at: new Date().toISOString(),
-
-      waba_id: entry?.id,
-      phone_number_id: value?.metadata?.phone_number_id,
-      display_phone_number: value?.metadata?.display_phone_number,
-
-      from: msg.from,
-      to: value?.metadata?.display_phone_number || null,
-
-      wa_id: contact?.wa_id || msg.from || null,
-      profile_name: contact?.profile?.name || null,
-
-      message_id: msg.id,
-      timestamp: msg.timestamp,
-      type: msg.type,
-
-      text: textBody,
-      tags: getTags(textBody ?? ""),
-      raw: msg,
-    };
-
-    appendJsonl(path.join(byDateDir, todayFileName("messages")), record);
-
-    const customerKey = safeFileName(record.wa_id || record.from);
-    appendJsonl(path.join(byUserDir, `${customerKey}.jsonl`), record);
-
-    console.log(
-      "📝 saved incoming:",
-      record.type,
-      record.from,
-      record.text || "",
-      record.tags?.length ? `tags=${record.tags.join(",")}` : ""
-    );
+    return fs.createReadStream(abs).pipe(res);
   } catch (e) {
-    console.error("❌ webhook handler error:", e);
+    console.error("❌ /media/file error:", e);
+    return res.status(500).send("Internal error");
   }
 });
 
@@ -439,7 +630,6 @@ app.get("/customers", (req, res) => {
     }
 
     customers.sort((a, b) => isoToMs(b.last_time) - isoToMs(a.last_time));
-
     res.json({ count: customers.length, customers });
   } catch (e) {
     console.error("❌ /customers error:", e);
@@ -463,6 +653,7 @@ app.get("/customers/:wa_id/messages", (req, res) => {
 // ========= UI: Customers list (filters: q, unread, recent24, tag) =========
 app.get("/ui", (req, res) => {
   try {
+    setNoCache(res);
     ensureDir(byUserDir);
 
     const q = (req.query.q || "").toString().trim().toLowerCase();
@@ -473,7 +664,6 @@ app.get("/ui", (req, res) => {
     const files = fs.readdirSync(byUserDir).filter((f) => f.endsWith(".jsonl"));
     const customers = [];
 
-    // build tag set
     const allTagsSet = new Set();
 
     for (const f of files) {
@@ -483,10 +673,8 @@ app.get("/ui", (req, res) => {
       const summary = summarizeCustomer(filePath, waId);
       if (!summary) continue;
 
-      // collect tags
       for (const k of Object.keys(summary.tags || {})) allTagsSet.add(k);
 
-      // filters
       if (unreadOnly && (summary.unread_count || 0) <= 0) continue;
       if (recent24 && !withinLastHours(summary.last_time, 24)) continue;
 
@@ -504,6 +692,10 @@ app.get("/ui", (req, res) => {
     customers.sort((a, b) => isoToMs(b.last_time) - isoToMs(a.last_time));
 
     const allTags = Array.from(allTagsSet).sort();
+    const tagOptions = [
+      `<option value="">All</option>`,
+      ...allTags.map((t) => `<option value="${escapeHtml(t)}" ${t === tag ? "selected" : ""}>${escapeHtml(t)}</option>`),
+    ].join("");
 
     const rowsHtml = customers
       .map((c) => {
@@ -520,6 +712,8 @@ app.get("/ui", (req, res) => {
           .map(([k, v]) => `<span class="tag">${escapeHtml(k)}:${v}</span>`)
           .join(" ");
 
+        const preview = escapeHtml(c.last_text || "");
+
         return `
           <tr>
             <td class="mono">
@@ -527,7 +721,7 @@ app.get("/ui", (req, res) => {
             </td>
             <td>${escapeHtml(c.profile_name || "")}</td>
             <td>${escapeHtml(fmtTime(c.last_time))}</td>
-            <td>${unreadBadge} ${lastDir} ${escapeHtml(c.last_text || "")}</td>
+            <td>${unreadBadge} ${lastDir} <span class="preview">${preview}</span></td>
             <td>${tags}</td>
           </tr>
         `;
@@ -545,13 +739,6 @@ app.get("/ui", (req, res) => {
     const recentLink = buildQueryLink("/ui", currentParams, { recent24: recent24 ? "" : "1" });
     const clearLink = "/ui";
 
-    const tagOptions = [
-      `<option value="">All</option>`,
-      ...allTags.map(
-        (t) => `<option value="${escapeHtml(t)}" ${t === tag ? "selected" : ""}>${escapeHtml(t)}</option>`
-      ),
-    ].join("");
-
     const html = `<!doctype html>
 <html>
 <head>
@@ -559,146 +746,40 @@ app.get("/ui", (req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>WhatsApp CS - Customers</title>
   <style>
-    :root {
-      --bg: #f6f7fb;
-      --card: #ffffff;
-      --border: #e6e8f0;
-      --text: #111827;
-      --muted: #6b7280;
-      --accent: #2563eb;
-      --pill: #eef2ff;
-      --incoming: #f1f5f9;
-      --outgoing: #dbeafe;
-      --danger: #ef4444;
+    :root{
+      --bg:#f6f7fb; --card:#ffffff; --text:#111827; --muted:#6b7280; --line:#e5e7eb;
+      --blue:#2563eb; --blue2:#1d4ed8; --green:#10b981; --red:#ef4444;
+      --chip:#f3f4f6;
     }
-
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-
-    .wrap { max-width: 1200px; margin: 0 auto; padding: 18px; }
-
-    .top { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-    h2 { margin:0; font-size:18px; font-weight: 650; }
-
-    .muted { color: var(--muted); font-size: 13px; }
-
-    a { color: var(--accent); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-
-    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-
-    input, select {
-      padding: 10px 12px;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: #fff;
-      color: var(--text);
-      outline: none;
-    }
-
-    button {
-      padding: 10px 14px;
-      border-radius: 10px;
-      border: 1px solid var(--border);
-      background: var(--accent);
-      color: #fff;
-      font-weight: 600;
-      cursor:pointer;
-    }
-    button:hover { opacity: .92; }
-
-    .chip {
-      display:inline-flex;
-      gap:8px;
-      align-items:center;
-      padding:8px 12px;
-      border:1px solid var(--border);
-      border-radius:999px;
-      background:#fff;
-      color: var(--text);
-    }
-    .chip b { font-size:12px; }
-    .chip.on { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37, 99, 235, .12); }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-top: 14px;
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      overflow:hidden;
-    }
-
-    th, td {
-      border-bottom: 1px solid var(--border);
-      padding: 12px;
-      text-align: left;
-      vertical-align: top;
-      font-size: 14px;
-    }
-
-    th {
-      background: #fafafa;
-      position: sticky;
-      top: 0;
-      z-index: 1;
-      font-size: 12px;
-      color: var(--muted);
-      letter-spacing: .02em;
-    }
-
-    tr:hover td { background: #f9fafb; }
-
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-
-    .tag {
-      display:inline-block;
-      padding: 3px 8px;
-      border-radius: 999px;
-      font-size: 12px;
-      background: #eef2ff;
-      color: #3730a3;
-      margin-right: 6px;
-    }
-
-    .pill {
-      display:inline-block;
-      font-size: 12px;
-      padding: 2px 8px;
-      border-radius: 999px;
-      margin-right: 6px;
-      background: var(--pill);
-      color: #3730a3;
-    }
-    .pill.incoming { background: #e0f2fe; color: #075985; }
-    .pill.outgoing { background: #dcfce7; color: #166534; }
-
-    .badge {
-      display:inline-flex;
-      align-items:center;
-      justify-content:center;
-      min-width:22px;
-      height:22px;
-      padding: 0 7px;
-      border-radius:999px;
-      background: var(--danger);
-      color:#fff;
-      font-size:12px;
-      margin-right:8px;
-      font-weight:700;
-    }
-
-    .badge.ghost {
-      background: #f3f4f6;
-      color: var(--muted);
-      border: 1px solid var(--border);
-      font-weight: 600;
-    }
+    *{box-sizing:border-box;}
+    body{margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:var(--bg); color:var(--text);}
+    a{color:var(--blue); text-decoration:none;}
+    a:hover{text-decoration:underline;}
+    .wrap{max-width:1200px; margin:0 auto; padding:18px;}
+    .top{display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end; justify-content:space-between;}
+    h2{margin:0; font-size:18px;}
+    .muted{color:var(--muted); font-size:13px;}
+    .controls{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
+    input, select{padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:var(--card); min-width:240px;}
+    button{padding:10px 14px; border:1px solid var(--line); border-radius:12px; background:var(--blue); color:white; cursor:pointer;}
+    button:hover{background:var(--blue2);}
+    .chip{display:inline-flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--line); border-radius:999px; background:var(--chip);}
+    .chip.on{border-color:#c7d2fe; background:#eef2ff;}
+    .chip b{font-size:12px; color:#111827;}
+    .card{margin-top:14px; background:var(--card); border:1px solid var(--line); border-radius:16px; overflow:hidden; box-shadow:0 10px 30px rgba(17,24,39,.06);}
+    table{width:100%; border-collapse:collapse;}
+    th, td{padding:12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top;}
+    th{background:#f9fafb; color:var(--muted); font-size:12px; letter-spacing:.02em; position:sticky; top:0; z-index:1;}
+    tr:hover td{background:#f9fafb;}
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;}
+    .tag{display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; margin-right:6px; font-size:12px; color:var(--muted); background:#fafafa;}
+    .pill{display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; font-size:12px; margin-right:6px; background:#fafafa; color:var(--muted);}
+    .pill.incoming{border-color:#bfdbfe; background:#eff6ff; color:#1d4ed8;}
+    .pill.outgoing{border-color:#bbf7d0; background:#ecfdf5; color:#047857;}
+    .badge{display:inline-flex; align-items:center; justify-content:center; min-width:22px; height:22px; padding:0 6px; border-radius:999px; background:var(--red); color:#fff; font-size:12px; margin-right:8px;}
+    .badge.ghost{background:#f3f4f6; color:var(--muted); border:1px solid var(--line);}
+    .preview{color:#111827;}
+    .footerNote{margin-top:10px; color:var(--muted); font-size:12px;}
   </style>
 </head>
 <body>
@@ -706,7 +787,7 @@ app.get("/ui", (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">Read-only UI. Logs: logs/by-user/*.jsonl &nbsp;|&nbsp; Unread state: logs/state/*.json</div>
+        <div class="muted">Light UI • Logs: logs/by-user/*.jsonl • State: logs/state/*.json</div>
       </div>
 
       <div class="controls">
@@ -717,9 +798,7 @@ app.get("/ui", (req, res) => {
 
       <form method="get" action="/ui" class="controls">
         <input name="q" placeholder="Search wa_id / name / last text" value="${escapeHtml(q)}" />
-        <select name="tag">
-          ${tagOptions}
-        </select>
+        <select name="tag">${tagOptions}</select>
         <input type="hidden" name="unread" value="${unreadOnly ? "1" : ""}" />
         <input type="hidden" name="recent24" value="${recent24 ? "1" : ""}" />
         <button type="submit">Apply</button>
@@ -727,20 +806,24 @@ app.get("/ui", (req, res) => {
       </form>
     </div>
 
-    <table>
-      <thead>
-        <tr>
-          <th>wa_id</th>
-          <th>Name</th>
-          <th>Last time</th>
-          <th>Last message</th>
-          <th>Tags (last 300)</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rowsHtml || `<tr><td colspan="5" class="muted">No customers found.</td></tr>`}
-      </tbody>
-    </table>
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>wa_id</th>
+            <th>Name</th>
+            <th>Last time</th>
+            <th>Last message</th>
+            <th>Tags (last 400)</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rowsHtml || `<tr><td colspan="5" class="muted">No customers found.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="footerNote">Version: FAST_A_MEDIA_UI_2026-03-01_v1</div>
   </div>
 </body>
 </html>`;
@@ -755,8 +838,9 @@ app.get("/ui", (req, res) => {
 // ========= UI: Customer chat (bubble + filters: q, recent24, tag, unreadOnly=only unread incoming) =========
 app.get("/ui/customer/:wa_id", (req, res) => {
   try {
-    const waId = safeFileName(req.params.wa_id);
+    setNoCache(res);
 
+    const waId = safeFileName(req.params.wa_id);
     const q = (req.query.q || "").toString().trim().toLowerCase();
     const limit = Math.min(parseInt(req.query.limit || "800", 10) || 800, 5000);
 
@@ -767,22 +851,23 @@ app.get("/ui/customer/:wa_id", (req, res) => {
     const filePath = path.join(byUserDir, `${waId}.jsonl`);
     const rows = readJsonlLastN(filePath, limit);
 
-    // Build tags dropdown from existing data
+    // tag dropdown
     const tagsSet = new Set();
     for (const r of rows) {
       for (const t of r.tags || []) tagsSet.add(t);
     }
     const allTags = Array.from(tagsSet).sort();
 
-    // unread computation
+    // unread state BEFORE we mark read
     const st = readState(waId);
     const lastSeenMs = isoToMs(st.last_seen_incoming_at);
 
-    // Filter
+    // filtered view
     const filtered = rows.filter((r) => {
       const text = (r.text || "").toString();
+      const cap = (r.caption || "").toString();
       const tagsStr = (r.tags || []).join(",");
-      const hay = `${text} ${tagsStr}`.toLowerCase();
+      const hay = `${text} ${cap} ${tagsStr}`.toLowerCase();
 
       if (q && !hay.includes(q)) return false;
 
@@ -795,7 +880,6 @@ app.get("/ui/customer/:wa_id", (req, res) => {
       }
 
       if (unreadOnly) {
-        // show only unread incoming (received after last seen)
         if (r.direction !== "incoming") return false;
         const ms = isoToMs(r.received_at);
         if (!ms || ms <= lastSeenMs) return false;
@@ -804,25 +888,84 @@ app.get("/ui/customer/:wa_id", (req, res) => {
       return true;
     });
 
-    // When opening this page, mark all incoming as read (update last_seen_incoming_at)
+    // mark as read when opening page (based on latest incoming in FULL rows)
     let latestIncoming = null;
     for (const r of rows) {
       if (r.direction === "incoming" && r.received_at) latestIncoming = r.received_at;
     }
-    if (latestIncoming) {
-      if (isoToMs(latestIncoming) > lastSeenMs) {
-        writeState(waId, { last_seen_incoming_at: latestIncoming });
-      }
+    if (latestIncoming && isoToMs(latestIncoming) > lastSeenMs) {
+      writeState(waId, { last_seen_incoming_at: latestIncoming });
     }
 
     const sentFlag = (req.query.sent || "").toString();
     const errMsg = (req.query.err || "").toString();
-
     const notice = errMsg
       ? `<div class="alert err">❌ ${escapeHtml(errMsg)}</div>`
       : sentFlag
       ? `<div class="alert ok">✅ Sent</div>`
       : "";
+
+    function renderMsgContent(r) {
+      const type = r.type || "";
+      const text = r.text || "";
+      const caption = r.caption || "";
+      const localUrl = r.local_media_url || null;
+
+      if (type === "text") {
+        return `<div class="text">${escapeHtml(text)}</div>`;
+      }
+
+      // media types
+      if (localUrl) {
+        if (type === "image") {
+          return `
+            ${caption ? `<div class="text">${escapeHtml(caption)}</div>` : ""}
+            <div class="media">
+              <a href="${localUrl}" target="_blank" rel="noreferrer">
+                <img src="${localUrl}" alt="image" />
+              </a>
+              <div class="mediaActions"><a href="${localUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
+            </div>
+          `;
+        }
+        if (type === "video") {
+          return `
+            ${caption ? `<div class="text">${escapeHtml(caption)}</div>` : ""}
+            <div class="media">
+              <video controls src="${localUrl}" style="max-width:100%; border-radius:12px;"></video>
+              <div class="mediaActions"><a href="${localUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
+            </div>
+          `;
+        }
+        if (type === "audio") {
+          return `
+            <div class="media">
+              <audio controls src="${localUrl}" style="width:100%;"></audio>
+              <div class="mediaActions"><a href="${localUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
+            </div>
+          `;
+        }
+        // document or others
+        return `
+          <div class="text">${escapeHtml(caption || "Document")}</div>
+          <div class="media">
+            <div class="fileBox">
+              <div class="fileMeta">
+                <div><b>${escapeHtml(type)}</b></div>
+                <div class="mutedSmall mono">${escapeHtml(r.mime_type || "")}</div>
+              </div>
+              <a class="btnLink" href="${localUrl}" target="_blank" rel="noreferrer">Download</a>
+            </div>
+          </div>
+        `;
+      }
+
+      // no local file yet
+      return `
+        <div class="text">${escapeHtml(caption || text || `[${type}]`)}</div>
+        ${r.media_id ? `<div class="mutedSmall mono">media_id=${escapeHtml(r.media_id)}</div>` : ""}
+      `;
+    }
 
     const bubbles = filtered
       .map((r) => {
@@ -833,7 +976,6 @@ app.get("/ui/customer/:wa_id", (req, res) => {
 
         const tags = (r.tags || []).map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join(" ");
 
-        // unread indicator for incoming
         let unreadMark = "";
         if (r.direction === "incoming") {
           const ms = isoToMs(r.received_at);
@@ -849,7 +991,7 @@ app.get("/ui/customer/:wa_id", (req, res) => {
                 <span class="type">${escapeHtml(r.type || "")}</span>
                 ${tags ? `<span class="tags">${tags}</span>` : ""}
               </div>
-              <div class="text">${escapeHtml(r.text || "")}</div>
+              ${renderMsgContent(r)}
             </div>
           </div>
         `;
@@ -864,19 +1006,13 @@ app.get("/ui/customer/:wa_id", (req, res) => {
       limit: String(limit),
     };
 
-    const toggleUnreadLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, {
-      unread: unreadOnly ? "" : "1",
-    });
-    const toggleRecentLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, {
-      recent24: recent24 ? "" : "1",
-    });
+    const toggleUnreadLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, { unread: unreadOnly ? "" : "1" });
+    const toggleRecentLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, { recent24: recent24 ? "" : "1" });
     const clearLink = `/ui/customer/${encodeURIComponent(waId)}`;
 
     const tagOptions = [
       `<option value="">All</option>`,
-      ...allTags.map(
-        (t) => `<option value="${escapeHtml(t)}" ${t === tag ? "selected" : ""}>${escapeHtml(t)}</option>`
-      ),
+      ...allTags.map((t) => `<option value="${escapeHtml(t)}" ${t === tag ? "selected" : ""}>${escapeHtml(t)}</option>`),
     ].join("");
 
     const html = `<!doctype html>
@@ -886,145 +1022,57 @@ app.get("/ui/customer/:wa_id", (req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>WhatsApp CS - ${escapeHtml(waId)}</title>
   <style>
-    :root {
-      --bg: #f6f7fb;
-      --card: #ffffff;
-      --border: #e6e8f0;
-      --text: #111827;
-      --muted: #6b7280;
-      --accent: #2563eb;
-
-      --incoming: #f1f5f9;
-      --outgoing: #dbeafe;
-
-      --okBg: #ecfdf5;
-      --okBorder: #a7f3d0;
-      --okText: #065f46;
-
-      --errBg: #fef2f2;
-      --errBorder: #fecaca;
-      --errText: #991b1b;
-
-      --danger: #ef4444;
+    :root{
+      --bg:#f6f7fb; --card:#ffffff; --text:#111827; --muted:#6b7280; --line:#e5e7eb;
+      --in:#ffffff; --out:#ecfdf5;
+      --blue:#2563eb; --blue2:#1d4ed8; --green:#10b981; --red:#ef4444;
+      --chip:#f3f4f6;
     }
+    *{box-sizing:border-box;}
+    body{margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:var(--bg); color:var(--text);}
+    a{color:var(--blue); text-decoration:none;}
+    a:hover{text-decoration:underline;}
+    .wrap{max-width:1100px; margin:0 auto; padding:18px;}
+    .top{display:flex; gap:14px; flex-wrap:wrap; align-items:flex-end; justify-content:space-between;}
+    h2{margin:0; font-size:18px;}
+    .muted{color:var(--muted); font-size:13px;}
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;}
+    .controls{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
+    input, select, textarea{padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:var(--card); color:var(--text);}
+    textarea{width:100%; resize:vertical;}
+    button{padding:10px 14px; border:1px solid var(--line); border-radius:12px; background:var(--blue); color:white; cursor:pointer;}
+    button:hover{background:var(--blue2);}
+    .chip{display:inline-flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--line); border-radius:999px; background:var(--chip);}
+    .chip.on{border-color:#c7d2fe; background:#eef2ff;}
+    .chip b{font-size:12px; color:#111827;}
 
-    body {
-      margin:0;
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
+    .card{margin-top:14px; background:var(--card); border:1px solid var(--line); border-radius:16px; box-shadow:0 10px 30px rgba(17,24,39,.06);}
+    .chat{padding:14px;}
+    .row{display:flex; margin:10px 0;}
+    .row.left{justify-content:flex-start;}
+    .row.right{justify-content:flex-end;}
+    .bubble{max-width:78%; padding:10px 12px; border-radius:16px; border:1px solid var(--line); box-shadow:0 10px 30px rgba(17,24,39,.08);}
+    .bubble.in{background:var(--in); border-top-left-radius:8px;}
+    .bubble.out{background:var(--out); border-top-right-radius:8px; border-color:#bbf7d0;}
+    .meta{display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:6px; color:var(--muted); font-size:12px;}
+    .type{padding:2px 8px; border:1px solid var(--line); border-radius:999px; background:#fafafa;}
+    .tag{display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; font-size:12px; color:var(--muted); background:#fafafa; margin-right:6px;}
+    .text{white-space:pre-wrap; line-height:1.4; font-size:14px;}
+    .dot{width:8px; height:8px; border-radius:999px; background:var(--red); display:inline-block;}
+    .media{margin-top:8px;}
+    .media img{max-width:100%; border-radius:12px; border:1px solid var(--line);}
+    .mediaActions{margin-top:6px; font-size:13px;}
+    .mutedSmall{color:var(--muted); font-size:12px; margin-top:4px;}
+    .fileBox{display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:#fafafa;}
+    .btnLink{display:inline-flex; padding:8px 10px; border-radius:10px; border:1px solid var(--line); background:#fff;}
+    .alert{margin-top:12px; padding:10px 12px; border-radius:12px; border:1px solid var(--line);}
+    .alert.ok{border-color:#bbf7d0; background:#ecfdf5; color:#065f46;}
+    .alert.err{border-color:#fecaca; background:#fef2f2; color:#991b1b;}
 
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 18px; }
-
-    a { color: var(--accent); text-decoration:none; }
-    a:hover { text-decoration:underline; }
-
-    .muted { color: var(--muted); font-size: 13px; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-
-    .top { display:flex; align-items:flex-end; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-    h2 { margin:0; font-size:18px; font-weight: 650; }
-
-    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-
-    input, select, textarea {
-      padding: 10px 12px;
-      border: 1px solid var(--border);
-      background: #fff;
-      color: var(--text);
-      border-radius: 12px;
-    }
-
-    textarea { width:100%; box-sizing:border-box; resize: vertical; }
-
-    button {
-      padding: 10px 14px;
-      border: 1px solid var(--border);
-      background: var(--accent);
-      color: #fff;
-      border-radius: 12px;
-      cursor:pointer;
-      font-weight: 650;
-    }
-    button:hover { opacity: .92; }
-
-    .chip {
-      display:inline-flex; gap:8px; align-items:center;
-      padding:8px 12px;
-      border:1px solid var(--border);
-      border-radius:999px;
-      background:#fff;
-      color: var(--text);
-    }
-    .chip.on { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(37,99,235,.12); }
-    .chip b { font-size:12px; }
-
-    .chat {
-      margin-top: 14px;
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 14px;
-    }
-
-    .row { display:flex; margin: 10px 0; }
-    .row.left { justify-content:flex-start; }
-    .row.right { justify-content:flex-end; }
-
-    .bubble {
-      max-width: 78%;
-      padding: 10px 12px;
-      border-radius: 14px;
-      border: 1px solid var(--border);
-      box-shadow: 0 10px 28px rgba(17,24,39,.08);
-      background: #fff;
-    }
-    .bubble.in { background: var(--incoming); border-bottom-left-radius: 6px; }
-    .bubble.out { background: var(--outgoing); border-bottom-right-radius: 6px; }
-
-    .meta {
-      display:flex; gap:10px; flex-wrap:wrap; align-items:center;
-      margin-bottom: 6px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .type {
-      padding:2px 8px;
-      border:1px solid var(--border);
-      border-radius:999px;
-      background:#fff;
-    }
-
-    .tag {
-      display:inline-block;
-      padding: 3px 8px;
-      border-radius: 999px;
-      font-size: 12px;
-      background: #eef2ff;
-      color: #3730a3;
-      margin-right: 6px;
-    }
-
-    .text { white-space: pre-wrap; line-height: 1.35; font-size: 14px; }
-
-    .reply {
-      margin-top: 14px;
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 14px;
-    }
-    .replyTop {
-      display:flex; align-items:center; justify-content:space-between;
-      gap:10px; flex-wrap:wrap; margin-bottom: 10px;
-    }
-
-    .alert { margin-top:12px; padding:10px 12px; border-radius:12px; border:1px solid var(--border); }
-    .alert.ok { border-color: var(--okBorder); background: var(--okBg); color: var(--okText); }
-    .alert.err { border-color: var(--errBorder); background: var(--errBg); color: var(--errText); }
-
-    .dot { width:8px; height:8px; border-radius:999px; background: var(--danger); display:inline-block; }
+    .reply{margin-top:14px; padding:14px;}
+    .replyTop{display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:10px;}
+    .row2{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
+    .fileHint{font-size:12px; color:var(--muted);}
   </style>
 </head>
 <body>
@@ -1060,25 +1108,37 @@ app.get("/ui/customer/:wa_id", (req, res) => {
 
     ${notice}
 
-    <div class="chat">
-      ${bubbles || `<div class="muted">No messages found.</div>`}
+    <div class="card">
+      <div class="chat">
+        ${bubbles || `<div class="muted">No messages found.</div>`}
+      </div>
+
+      <div class="reply">
+        <div class="replyTop">
+          <div class="muted"><b>Reply</b> (text + optional file upload)</div>
+          <div class="muted">After send: redirect back here</div>
+        </div>
+
+        <form method="post" action="/send" enctype="multipart/form-data">
+          <input type="hidden" name="to" value="${escapeHtml(waId)}" />
+          <input type="hidden" name="redirect" value="/ui/customer/${encodeURIComponent(waId)}" />
+
+          <textarea name="text" rows="3" placeholder="Type reply... (caption for media)"></textarea>
+
+          <div class="row2" style="margin-top:10px;">
+            <input type="file" name="file" />
+            <div class="fileHint">Support: image/video/audio/document • Max 25MB (can adjust)</div>
+          </div>
+
+          <div class="row2" style="margin-top:10px;">
+            <button type="submit">Send</button>
+            <a href="/send" class="chip"><b>Open Send Page</b></a>
+          </div>
+        </form>
+      </div>
     </div>
 
-    <div class="reply">
-      <div class="replyTop">
-        <div class="muted">Reply (will be logged as outgoing)</div>
-        <div class="muted">After send: redirect back here</div>
-      </div>
-      <form method="post" action="/send">
-        <input type="hidden" name="to" value="${escapeHtml(waId)}" />
-        <input type="hidden" name="redirect" value="/ui/customer/${encodeURIComponent(waId)}" />
-        <textarea name="text" rows="4" required placeholder="Type reply..."></textarea>
-        <div style="margin-top:10px; display:flex; gap:10px; flex-wrap:wrap;">
-          <button type="submit">Send</button>
-          <a href="/send" class="chip"><b>Open Send Page</b></a>
-        </div>
-      </form>
-    </div>
+    <div class="muted" style="margin-top:10px;">Version: FAST_A_MEDIA_UI_2026-03-01_v1</div>
   </div>
 </body>
 </html>`;
@@ -1092,37 +1152,54 @@ app.get("/ui/customer/:wa_id", (req, res) => {
 
 // ===== SEND PAGE =====
 app.get("/send", (req, res) => {
-  res.send(`
-    <h2>Send WhatsApp Message</h2>
-    <form method="post" action="/send">
-      <div>To (wa_id):</div>
-      <input name="to" required /><br/><br/>
-      <div>Message:</div>
-      <textarea name="text" rows="4" required></textarea><br/><br/>
-      <button type="submit">Send</button>
+  setNoCache(res);
+  res.send(`<!doctype html>
+<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Send</title>
+<style>
+  body{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#f6f7fb; margin:0; padding:18px;}
+  .card{max-width:900px; margin:0 auto; background:#fff; border:1px solid #e5e7eb; border-radius:16px; padding:16px; box-shadow:0 10px 30px rgba(17,24,39,.06);}
+  input, textarea{width:100%; padding:10px 12px; border:1px solid #e5e7eb; border-radius:12px; margin-top:6px;}
+  button{padding:10px 14px; border:1px solid #e5e7eb; border-radius:12px; background:#2563eb; color:#fff; cursor:pointer;}
+  button:hover{background:#1d4ed8;}
+  .muted{color:#6b7280; font-size:13px;}
+</style>
+</head><body>
+  <div class="card">
+    <h2 style="margin:0 0 8px 0;">Send WhatsApp Message</h2>
+    <div class="muted">Text + optional file upload</div>
+    <form method="post" action="/send" enctype="multipart/form-data" style="margin-top:12px;">
+      <label class="muted">To (wa_id)</label>
+      <input name="to" required />
+      <label class="muted" style="display:block; margin-top:10px;">Text (or caption for media)</label>
+      <textarea name="text" rows="4" placeholder="Type message..."></textarea>
+      <label class="muted" style="display:block; margin-top:10px;">File (optional)</label>
+      <input type="file" name="file" />
+      <div style="margin-top:12px;">
+        <button type="submit">Send</button>
+      </div>
     </form>
-    <p><a href="/ui">Back to UI</a></p>
-  `);
+    <p style="margin-top:12px;"><a href="/ui">Back to UI</a></p>
+  </div>
+</body></html>`);
 });
 
 // ===== SEND API (outgoing + log) =====
-app.post("/send", async (req, res) => {
+// supports: text only OR file (with optional caption in text)
+app.post("/send", upload.single("file"), async (req, res) => {
   try {
     const to = (req.body.to || "").trim();
     const text = (req.body.text || "").trim();
     const redirectTo = (req.body.redirect || "").trim();
 
-    if (!to || !text) {
+    if (!to) {
       if (redirectTo) {
         const u = new URL(redirectTo, "http://localhost");
-        u.searchParams.set("err", "Missing to/text");
+        u.searchParams.set("err", "Missing to");
         return res.redirect(u.pathname + u.search);
       }
-      return res.status(400).send("Missing 'to' or 'text'");
+      return res.status(400).send("Missing 'to'");
     }
-
-    const WA_TOKEN = process.env.WA_TOKEN;
-    const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
     if (!WA_TOKEN) {
       if (redirectTo) {
@@ -1141,15 +1218,89 @@ app.post("/send", async (req, res) => {
       return res.status(500).send("Missing PHONE_NUMBER_ID");
     }
 
+    const hasFile = !!req.file;
+
+    // If no file, require text
+    if (!hasFile && !text) {
+      if (redirectTo) {
+        const u = new URL(redirectTo, "http://localhost");
+        u.searchParams.set("err", "Missing text (or upload a file)");
+        return res.redirect(u.pathname + u.search);
+      }
+      return res.status(400).send("Missing 'text' (or upload a file)");
+    }
+
+    let payload = null;
+    let outType = "text";
+    let uploadedMediaId = null;
+    let mimeType = null;
+    let localOutFile = null;
+
+    if (!hasFile) {
+      // ---- TEXT ----
+      payload = {
+        messaging_product: "whatsapp",
+        to,
+        type: "text",
+        text: { body: text },
+      };
+      outType = "text";
+    } else {
+      // ---- MEDIA ----
+      localOutFile = req.file.path;
+      mimeType = req.file.mimetype || guessMimeByExt(req.file.originalname);
+      const category = classifyMediaType(mimeType);
+
+      // upload
+      uploadedMediaId = await uploadMediaToWhatsApp(localOutFile, mimeType);
+      if (!uploadedMediaId) throw new Error("Upload succeeded but missing media id");
+
+      outType = category;
+
+      if (category === "image") {
+        payload = {
+          messaging_product: "whatsapp",
+          to,
+          type: "image",
+          image: {
+            id: uploadedMediaId,
+            ...(text ? { caption: text } : {}),
+          },
+        };
+      } else if (category === "video") {
+        payload = {
+          messaging_product: "whatsapp",
+          to,
+          type: "video",
+          video: {
+            id: uploadedMediaId,
+            ...(text ? { caption: text } : {}),
+          },
+        };
+      } else if (category === "audio") {
+        payload = {
+          messaging_product: "whatsapp",
+          to,
+          type: "audio",
+          audio: { id: uploadedMediaId },
+        };
+      } else {
+        // document
+        payload = {
+          messaging_product: "whatsapp",
+          to,
+          type: "document",
+          document: {
+            id: uploadedMediaId,
+            ...(req.file.originalname ? { filename: req.file.originalname } : {}),
+            ...(text ? { caption: text } : {}),
+          },
+        };
+      }
+    }
+
+    // send message
     const url = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
-
-    const payload = {
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: text },
-    };
-
     const r = await fetch(url, {
       method: "POST",
       headers: {
@@ -1175,6 +1326,24 @@ app.post("/send", async (req, res) => {
     // ✅ outgoing log
     try {
       const msgId = data?.messages?.[0]?.id || null;
+
+      // If we sent media, keep a copy in logs/media/<wa_id>/outgoing__xxx.ext for easy preview later
+      let localMediaUrl = null;
+      let savedOutFile = null;
+
+      if (hasFile && localOutFile) {
+        const waDir = mediaLocalDirForWaId(to);
+        const ext = extFromMime(mimeType);
+        const base = safeFileName(path.basename(localOutFile));
+        const outName = `outgoing__${base}.${ext}`;
+        const dest = path.join(waDir, outName);
+
+        // copy (do not delete uploads; keep both is ok)
+        fs.copyFileSync(localOutFile, dest);
+        savedOutFile = dest;
+        localMediaUrl = mediaServePath(to, outName);
+      }
+
       const record = {
         direction: "outgoing",
         sent_at: new Date().toISOString(),
@@ -1184,18 +1353,21 @@ app.post("/send", async (req, res) => {
         wa_id: to,
         profile_name: null,
         message_id: msgId,
-        type: "text",
-        text,
+        type: outType,
+        text: outType === "text" ? text : null,
+        caption: outType !== "text" ? (text || null) : null,
+        media_id: uploadedMediaId,
+        mime_type: mimeType,
+        local_media_url: localMediaUrl,
+        local_media_file: savedOutFile,
         tags: getTags(text),
         api: data,
       };
 
       appendJsonl(path.join(byDateDir, todayFileName("messages")), record);
+      appendJsonl(path.join(byUserDir, `${safeFileName(to)}.jsonl`), record);
 
-      const customerKey = safeFileName(to);
-      appendJsonl(path.join(byUserDir, `${customerKey}.jsonl`), record);
-
-      console.log("📝 saved outgoing:", to, text);
+      console.log("📝 saved outgoing:", to, outType, text ? `(caption/text=${text})` : "");
     } catch (logErr) {
       console.error("❌ outgoing log error:", logErr);
     }
@@ -1210,7 +1382,13 @@ app.post("/send", async (req, res) => {
     return res.send(`✅ Sent successfully\n\n${JSON.stringify(data, null, 2)}`);
   } catch (e) {
     console.error("❌ /send exception:", e);
-    return res.status(500).send("Internal error");
+    const redirectTo = (req.body.redirect || "").trim();
+    if (redirectTo) {
+      const u = new URL(redirectTo, "http://localhost");
+      u.searchParams.set("err", e?.message || "Internal error");
+      return res.redirect(u.pathname + u.search);
+    }
+    return res.status(500).send(e?.message || "Internal error");
   }
 });
 
@@ -1224,8 +1402,11 @@ app.listen(PORT, () => {
   console.log("APP_SECRET SET:", APP_SECRET ? "YES" : "NO");
   console.log("UI_USER SET:", UI_USER ? "YES" : "NO");
   console.log("UI_PASS SET:", UI_PASS ? "YES" : "NO");
-  console.log("WA_TOKEN SET:", process.env.WA_TOKEN ? "YES" : "NO");
-  console.log("PHONE_NUMBER_ID SET:", process.env.PHONE_NUMBER_ID ? "YES" : "NO");
+  console.log("WA_TOKEN SET:", WA_TOKEN ? "YES" : "NO");
+  console.log("PHONE_NUMBER_ID SET:", PHONE_NUMBER_ID ? "YES" : "NO");
+  console.log("MEDIA DIR:", mediaDir);
+  console.log("UPLOADS DIR:", uploadsDir);
+  console.log("VERSION MARKER: FAST_A_MEDIA_UI_2026-03-01_v1");
   console.log("=====================================");
   console.log(`✅ Server running on port ${PORT}`);
 });
