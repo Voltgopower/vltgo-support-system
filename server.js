@@ -5,7 +5,7 @@
  * - UI: customers list + chat bubble view
  * - Filters: unread only / last 24h / tag filter
  * - Unread tracking via logs/state/<wa_id>.json (no jsonl rewrites)
- *
+ 
  * .env required:
  *   VERIFY_TOKEN=voltgo_webhook_verify
  *   WA_TOKEN=xxxxxxxxxxxxxxxx
@@ -16,6 +16,7 @@
  *   PORT=8080
  *   APP_SECRET=xxxxx
  */
+
 
 require("dotenv").config();
 
@@ -83,7 +84,62 @@ function basicAuth(req, res, next) {
   return next();
 }
 app.use(basicAuth);
+// ========= Postgres =========
+const DATABASE_URL = process.env.DATABASE_URL || null;
 
+const pgPool = DATABASE_URL
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : null;
+
+// ========= DB init route =========
+app.get("/__db_init", async (req, res) => {
+  try {
+    if (!pgPool) return res.status(500).send("Missing DATABASE_URL");
+
+    const sql = `
+CREATE TABLE IF NOT EXISTS wa_customers (
+  wa_id TEXT PRIMARY KEY,
+  profile_name TEXT,
+  last_seen_incoming_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS wa_messages (
+  id BIGSERIAL PRIMARY KEY,
+  wa_id TEXT NOT NULL,
+  direction TEXT NOT NULL CHECK (direction IN ('incoming','outgoing')),
+  type TEXT NOT NULL,
+  text TEXT,
+  tags TEXT[] NOT NULL DEFAULT '{}',
+  message_id TEXT,
+  from_wa TEXT,
+  to_wa TEXT,
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  media_id TEXT,
+  mime_type TEXT,
+  sha256 TEXT,
+  caption TEXT,
+  filename TEXT,
+
+  raw JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_wa_messages_wa_id_ts ON wa_messages (wa_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_wa_messages_tags ON wa_messages USING GIN (tags);
+CREATE INDEX IF NOT EXISTS idx_wa_messages_ts ON wa_messages (ts DESC);
+`;
+    await pgPool.query(sql);
+
+    return res.status(200).send("✅ DB init OK");
+  } catch (e) {
+    console.error("❌ DB init error:", e);
+    return res.status(500).send("DB init failed: " + e.message);
+  }
+});
 // ========= Log directories =========
 const baseLogsDir = path.join(__dirname, "logs");
 const byUserDir = path.join(baseLogsDir, "by-user");
