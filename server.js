@@ -132,13 +132,20 @@ app.post("/webhook", async (req, res) => {
     }
 
     await pool.query(
-      `
-      INSERT INTO messages
-      (wa_id, direction, type, text, caption, media_id, mime_type)
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
-      `,
-      [wa_id, "incoming", type, text, caption, media_id, mime_type]
-    );
+  `
+  INSERT INTO messages
+  (conversation_id, direction, msg_type, text, media_url, wa_message_id)
+  VALUES ($1,$2,$3,$4,$5,$6)
+  `,
+  [
+    wa_id,                      // conversation_id 用 wa_id 代替
+    "incoming",
+    type,
+    text || caption || null,
+    null,                       // 你暂时没下载 media，用 null
+    msg.id || null
+  ]
+);
 
     console.log("📝 Saved incoming:", type, wa_id);
   } catch (err) {
