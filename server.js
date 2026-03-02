@@ -1,5 +1,5 @@
 /**
- * WhatsApp Webhook Server (FAST A)
+ * WhatsApp Webhook Server (FAST A - FULL)
  * - Webhook receive + log jsonl (incoming)
  * - Download incoming media to local disk (image/video/document/audio)
  * - Send message: text + upload local file (image/video/document/audio)
@@ -8,9 +8,8 @@
  * - Unread tracking via logs/state/<wa_id>.json (no jsonl rewrites)
  * - Version probe: /__version
  * - Media routes:
- *    - /media/file/:wa_id/:filename      (no-store)
- *    - /media/original/:wa_id/:filename  (strong cache)
- *    - /media/thumb/:wa_id/:filename     (webp thumbnail + strong cache)
+ *    - /media/original/:wa_id/:filename   (original file + strong cache)
+ *    - /media/thumb/:wa_id/:filename      (webp thumbnail if sharp installed; otherwise fallback to original) + strong cache
  *
  * .env required:
  *   VERIFY_TOKEN=voltgo_webhook_verify
@@ -30,11 +29,15 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
+
+// -------- Optional sharp (do NOT crash if missing) --------
 let sharp = null;
 try {
+  // eslint-disable-next-line global-require
   sharp = require("sharp");
+  console.log("✅ sharp enabled: thumbnails will be generated");
 } catch (e) {
-  console.warn("⚠️ sharp not available, thumb route will fallback. Install with: npm i sharp");
+  console.log("⚠️ sharp not installed: /media/thumb will fallback to original");
 }
 
 const app = express();
@@ -46,13 +49,12 @@ function rawBodySaver(req, res, buf) {
 
 // IMPORTANT: JSON must be before routes (keep raw body for signature check)
 app.use(express.json({ verify: rawBodySaver }));
-// IMPORTANT: enable form POST
 app.use(express.urlencoded({ extended: false }));
 
 // ========= ENV =========
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PORT = process.env.PORT || 8080;
-const APP_SECRET = process.env.APP_SECRET || null; // optional
+const APP_SECRET = process.env.APP_SECRET || null;
 const WA_TOKEN = process.env.WA_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
@@ -61,7 +63,7 @@ if (!VERIFY_TOKEN) {
   process.exit(1);
 }
 
-// ========= Basic Auth (protect UI + send + APIs + media) =========
+// ========= Basic Auth =========
 const UI_USER = process.env.UI_USER;
 const UI_PASS = process.env.UI_PASS;
 
@@ -74,10 +76,10 @@ function basicAuth(req, res, next) {
   // allow webhook endpoints without auth (Meta calls)
   if (req.path === "/webhook") return next();
 
-  // allow health/version probes without auth (optional)
+  // allow health/version probes without auth
   if (req.path === "/" || req.path === "/__version") return next();
 
-  // protect these routes
+  // protect UI + APIs + media
   const protectedPrefixes = ["/ui", "/customers", "/send", "/media"];
   if (!protectedPrefixes.some((p) => req.path.startsWith(p))) return next();
 
@@ -107,6 +109,13 @@ function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
+function safeFileName(name) {
+  return String(name || "")
+    .replace(/[\\\/:*?"<>|]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function appendJsonl(filePath, obj) {
   const line = JSON.stringify(obj) + "\n";
   fs.appendFile(filePath, line, (err) => {
@@ -122,11 +131,42 @@ function todayFileName(prefix = "messages") {
   return `${prefix}-${yyyy}-${mm}-${dd}.jsonl`;
 }
 
-function safeFileName(name) {
-  return String(name || "")
-    .replace(/[\\\/:*?"<>|]/g, "_")
-    .replace(/\s+/g, " ")
-    .trim();
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function fmtTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return escapeHtml(iso);
+  return d.toLocaleString();
+}
+
+function isoToMs(iso) {
+  const t = Date.parse(iso || "");
+  return Number.isFinite(t) ? t : 0;
+}
+
+function withinLastHours(iso, hours) {
+  const ms = isoToMs(iso);
+  if (!ms) return false;
+  return Date.now() - ms <= hours * 3600 * 1000;
+}
+
+function buildQueryLink(basePath, current, patch) {
+  const u = new URL("http://localhost" + basePath);
+  const params = new URLSearchParams(current || {});
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (v === null || v === undefined || v === "") params.delete(k);
+    else params.set(k, String(v));
+  }
+  u.search = params.toString();
+  return u.pathname + (u.search ? `?${u.search}` : "");
 }
 
 function setNoCache(res) {
@@ -135,7 +175,49 @@ function setNoCache(res) {
   res.setHeader("Expires", "0");
 }
 
-/** Optional: verify Meta webhook signature */
+function setStrongCache(res) {
+  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+}
+
+function extFromMime(mime) {
+  const m = (mime || "").toLowerCase();
+  if (m.includes("image/jpeg")) return "jpg";
+  if (m.includes("image/png")) return "png";
+  if (m.includes("image/webp")) return "webp";
+  if (m.includes("image/gif")) return "gif";
+  if (m.includes("video/mp4")) return "mp4";
+  if (m.includes("video/quicktime")) return "mov";
+  if (m.includes("audio/ogg")) return "ogg";
+  if (m.includes("audio/mpeg")) return "mp3";
+  if (m.includes("audio/mp4")) return "m4a";
+  if (m.includes("application/pdf")) return "pdf";
+  return "bin";
+}
+
+function guessMimeByExt(filename) {
+  const f = (filename || "").toLowerCase();
+  if (f.endsWith(".jpg") || f.endsWith(".jpeg")) return "image/jpeg";
+  if (f.endsWith(".png")) return "image/png";
+  if (f.endsWith(".webp")) return "image/webp";
+  if (f.endsWith(".gif")) return "image/gif";
+  if (f.endsWith(".mp4")) return "video/mp4";
+  if (f.endsWith(".mov")) return "video/quicktime";
+  if (f.endsWith(".mp3")) return "audio/mpeg";
+  if (f.endsWith(".ogg")) return "audio/ogg";
+  if (f.endsWith(".m4a")) return "audio/mp4";
+  if (f.endsWith(".pdf")) return "application/pdf";
+  return "application/octet-stream";
+}
+
+function classifyMediaType(mimeType) {
+  const m = (mimeType || "").toLowerCase();
+  if (m.startsWith("image/")) return "image";
+  if (m.startsWith("video/")) return "video";
+  if (m.startsWith("audio/")) return "audio";
+  return "document";
+}
+
+// ========= Optional: verify Meta webhook signature =========
 function isValidSignature(req) {
   if (!APP_SECRET) return true;
   const sig = req.get("x-hub-signature-256");
@@ -154,14 +236,42 @@ function isValidSignature(req) {
   return crypto.timingSafeEqual(a, b);
 }
 
-// ========= Log directories =========
+// ========= Tags =========
+function getTags(text) {
+  const t = (text || "").toLowerCase();
+  const tags = [];
+
+  if (
+    /(track|tracking|deliver|delivery|ups|fedex|dhl|usps|shipment|物流|派送|签收|运单|快递)/i.test(t)
+  ) {
+    tags.push("logistics");
+  }
+  if (
+    /(warranty|broken|issue|problem|fault|defect|return|replace|refund|not work|doesn't work|坏|故障|问题|退货|换货|退款)/i.test(
+      t
+    )
+  ) {
+    tags.push("after_sales");
+  }
+  if (
+    /(price|quote|quotation|invoice|pay|payment|discount|availability|lead time|报价|价格|发票|付款|折扣|有货|交期)/i.test(
+      t
+    )
+  ) {
+    tags.push("pre_sales");
+  }
+
+  return tags;
+}
+
+// ========= Directories =========
 const baseLogsDir = path.join(__dirname, "logs");
 const byUserDir = path.join(baseLogsDir, "by-user");
 const byDateDir = path.join(baseLogsDir, "by-date");
 const stateDir = path.join(baseLogsDir, "state");
 const mediaDir = path.join(baseLogsDir, "media");
 const uploadsDir = path.join(baseLogsDir, "uploads");
-const thumbsDir = path.join(mediaDir, "__thumbs"); // ✅ thumbs root
+const thumbsDir = path.join(mediaDir, "__thumbs"); // thumbs root
 
 ensureDir(byUserDir);
 ensureDir(byDateDir);
@@ -183,48 +293,9 @@ const upload = multer({
     },
   }),
   limits: {
-    fileSize: 25 * 1024 * 1024, // 25MB
+    fileSize: 25 * 1024 * 1024, // 25MB (adjust if needed)
   },
 });
-
-// ========= Thumb generator =========
-// 生成缩略图：同一张图片只生成一次
-async function ensureImageThumb(srcPath, thumbPath) {
-  if (!sharp) throw new Error("sharp_not_installed");
-  if (fs.existsSync(thumbPath)) return;
-  ensureDir(path.dirname(thumbPath));
-  await sharp(srcPath)
-    .resize({ width: 520, height: 520, fit: "inside", withoutEnlargement: true })
-    .webp({ quality: 78 })
-    .toFile(thumbPath);
-}
-async function ensureImageThumb(srcPath, thumbPath) {
-  if (fs.existsSync(thumbPath)) return;
-  ensureDir(path.dirname(thumbPath));
-
-  await sharp(srcPath)
-    .resize({ width: 520, height: 520, fit: "inside", withoutEnlargement: true })
-    .webp({ quality: 78 })
-    .toFile(thumbPath);
-}
-
-// ========= Tags =========
-function getTags(text) {
-  const t = (text || "").toLowerCase();
-  const tags = [];
-
-  if (/(track|tracking|deliver|delivery|ups|fedex|dhl|usps|shipment|物流|派送|签收|运单|快递)/i.test(t)) {
-    tags.push("logistics");
-  }
-  if (/(warranty|broken|issue|problem|fault|defect|return|replace|refund|not work|doesn't work|坏|故障|问题|退货|换货|退款)/i.test(t)) {
-    tags.push("after_sales");
-  }
-  if (/(price|quote|quotation|invoice|pay|payment|discount|availability|lead time|报价|价格|发票|付款|折扣|有货|交期)/i.test(t)) {
-    tags.push("pre_sales");
-  }
-
-  return tags;
-}
 
 // ========= State (Unread tracking) =========
 function statePath(waId) {
@@ -251,17 +322,6 @@ function writeState(waId, patch) {
   } catch (e) {
     console.error("❌ writeState error:", e);
   }
-}
-
-function isoToMs(iso) {
-  const t = Date.parse(iso || "");
-  return Number.isFinite(t) ? t : 0;
-}
-
-function withinLastHours(iso, hours) {
-  const ms = isoToMs(iso);
-  if (!ms) return false;
-  return Date.now() - ms <= hours * 3600 * 1000;
 }
 
 // ========= Read log =========
@@ -317,81 +377,11 @@ function summarizeCustomer(filePath, waId) {
   };
 }
 
-// ========= UI helpers =========
-function escapeHtml(s) {
-  return String(s ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
-function fmtTime(iso) {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return escapeHtml(iso);
-  return d.toLocaleString();
-}
-
-function buildQueryLink(basePath, current, patch) {
-  const u = new URL("http://localhost" + basePath);
-  const params = new URLSearchParams(current || {});
-  for (const [k, v] of Object.entries(patch || {})) {
-    if (v === null || v === undefined || v === "") params.delete(k);
-    else params.set(k, String(v));
-  }
-  u.search = params.toString();
-  return u.pathname + (u.search ? `?${u.search}` : "");
-}
-
-// ========= Media helpers =========
-function extFromMime(mime) {
-  const m = (mime || "").toLowerCase();
-  if (m.includes("image/jpeg")) return "jpg";
-  if (m.includes("image/png")) return "png";
-  if (m.includes("image/webp")) return "webp";
-  if (m.includes("image/gif")) return "gif";
-  if (m.includes("video/mp4")) return "mp4";
-  if (m.includes("video/quicktime")) return "mov";
-  if (m.includes("audio/ogg")) return "ogg";
-  if (m.includes("audio/mpeg")) return "mp3";
-  if (m.includes("audio/mp4")) return "m4a";
-  if (m.includes("application/pdf")) return "pdf";
-  return "bin";
-}
-
-function guessMimeByExt(filename) {
-  const f = (filename || "").toLowerCase();
-  if (f.endsWith(".jpg") || f.endsWith(".jpeg")) return "image/jpeg";
-  if (f.endsWith(".png")) return "image/png";
-  if (f.endsWith(".webp")) return "image/webp";
-  if (f.endsWith(".gif")) return "image/gif";
-  if (f.endsWith(".mp4")) return "video/mp4";
-  if (f.endsWith(".mov")) return "video/quicktime";
-  if (f.endsWith(".mp3")) return "audio/mpeg";
-  if (f.endsWith(".ogg")) return "audio/ogg";
-  if (f.endsWith(".m4a")) return "audio/mp4";
-  if (f.endsWith(".pdf")) return "application/pdf";
-  return "application/octet-stream";
-}
-
-function classifyMediaType(mimeType) {
-  const m = (mimeType || "").toLowerCase();
-  if (m.startsWith("image/")) return "image";
-  if (m.startsWith("video/")) return "video";
-  if (m.startsWith("audio/")) return "audio";
-  return "document";
-}
-
+// ========= Media path helpers =========
 function mediaLocalDirForWaId(waId) {
   const dir = path.join(mediaDir, safeFileName(waId || "unknown"));
   ensureDir(dir);
   return dir;
-}
-
-function mediaServePath(waId, filename) {
-  return `/media/file/${encodeURIComponent(waId)}/${encodeURIComponent(filename)}`;
 }
 
 function mediaOriginalPath(waId, filename) {
@@ -402,23 +392,38 @@ function mediaThumbPath(waId, filename) {
   return `/media/thumb/${encodeURIComponent(waId)}/${encodeURIComponent(filename)}`;
 }
 
-// download incoming media by media_id -> save to logs/media/<wa_id>/<media_id>.<ext>
+// ========= Thumbnail generator (only if sharp exists) =========
+async function ensureImageThumb(srcPath, thumbPath) {
+  if (!sharp) return false;
+  if (fs.existsSync(thumbPath)) return true;
+
+  ensureDir(path.dirname(thumbPath));
+
+  await sharp(srcPath)
+    .resize({ width: 520, height: 520, fit: "inside", withoutEnlargement: true })
+    .webp({ quality: 78 })
+    .toFile(thumbPath);
+
+  return true;
+}
+
+// ========= Download incoming media (by media_id) =========
 async function downloadIncomingMedia(waId, mediaId) {
   if (!WA_TOKEN) throw new Error("Missing WA_TOKEN");
   if (!mediaId) return null;
 
+  // 1) get media URL + mime
   const metaResp = await fetch(`https://graph.facebook.com/v25.0/${mediaId}`, {
     headers: { Authorization: `Bearer ${WA_TOKEN}` },
   });
   const meta = await metaResp.json();
-  if (!metaResp.ok) {
-    throw new Error(`Media meta error: ${JSON.stringify(meta)}`);
-  }
+  if (!metaResp.ok) throw new Error(`Media meta error: ${JSON.stringify(meta)}`);
 
   const url = meta?.url;
   const mime = meta?.mime_type || null;
   if (!url) throw new Error("Media meta missing url");
 
+  // 2) download bytes
   const binResp = await fetch(url, {
     headers: { Authorization: `Bearer ${WA_TOKEN}` },
   });
@@ -435,18 +440,22 @@ async function downloadIncomingMedia(waId, mediaId) {
 
   if (!fs.existsSync(abs)) fs.writeFileSync(abs, buf);
 
+  // pre-calc thumb url for images (no need to generate immediately)
+  const isImage = (mime || "").toLowerCase().startsWith("image/");
+  const originalUrl = mediaOriginalPath(waId, fileName);
+  const thumbUrl = isImage ? mediaThumbPath(waId, fileName) : null;
+
   return {
     media_id: mediaId,
     mime_type: mime,
     local_file: abs,
-    local_url: mediaServePath(waId, fileName),
-    local_original_url: mediaOriginalPath(waId, fileName),
-    local_thumb_url: mediaThumbPath(waId, fileName),
+    local_original_url: originalUrl,
+    local_thumb_url: thumbUrl,
     sha256: meta?.sha256 || null,
   };
 }
 
-// upload outgoing media file to WhatsApp -> return media id
+// ========= Upload outgoing media =========
 async function uploadMediaToWhatsApp(filePath, mimeType) {
   if (!WA_TOKEN) throw new Error("Missing WA_TOKEN");
   if (!PHONE_NUMBER_ID) throw new Error("Missing PHONE_NUMBER_ID");
@@ -454,6 +463,7 @@ async function uploadMediaToWhatsApp(filePath, mimeType) {
   const buf = fs.readFileSync(filePath);
   const name = path.basename(filePath);
 
+  // Node 22 has global File/FormData
   const file = new File([buf], name, { type: mimeType || "application/octet-stream" });
   const form = new FormData();
   form.append("messaging_product", "whatsapp");
@@ -461,9 +471,7 @@ async function uploadMediaToWhatsApp(filePath, mimeType) {
 
   const r = await fetch(`https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/media`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${WA_TOKEN}`,
-    },
+    headers: { Authorization: `Bearer ${WA_TOKEN}` },
     body: form,
   });
 
@@ -479,8 +487,9 @@ app.get("/__version", (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "FAST_A_MEDIA_UI_2026-03-01_v2_THUMB",
+    marker: "FAST_A_MEDIA_UI_2026-03-01_v2_THUMB_SAFE",
     node: process.version,
+    sharp: !!sharp,
   });
 });
 
@@ -531,10 +540,9 @@ app.post("/webhook", (req, res) => {
       let mimeType = null;
       let sha256 = null;
 
-      let localMediaUrl = null;
+      let localMediaFile = null;
       let localOriginalUrl = null;
       let localThumbUrl = null;
-      let localMediaFile = null;
 
       if (type === "text") {
         textBody = msg.text?.body ?? null;
@@ -562,10 +570,9 @@ app.post("/webhook", (req, res) => {
       if (mediaId) {
         try {
           const dl = await downloadIncomingMedia(waId || msg.from, mediaId);
-          localMediaUrl = dl?.local_url || null;
+          localMediaFile = dl?.local_file || null;
           localOriginalUrl = dl?.local_original_url || null;
           localThumbUrl = dl?.local_thumb_url || null;
-          localMediaFile = dl?.local_file || null;
           mimeType = dl?.mime_type || mimeType;
         } catch (e) {
           console.error("❌ download media failed:", e?.message || e);
@@ -596,19 +603,16 @@ app.post("/webhook", (req, res) => {
         mime_type: mimeType,
         media_sha256: sha256,
 
-        local_media_url: localMediaUrl,
-        local_original_url: localOriginalUrl,
-        local_thumb_url: localThumbUrl,
         local_media_file: localMediaFile,
+        local_media_url: localOriginalUrl,     // ✅ 原图/原文件 URL
+        local_thumb_url: localThumbUrl,        // ✅ 缩略图 URL（仅 image 才有）
 
         tags: getTags(textBody || caption || ""),
         raw: msg,
       };
 
       appendJsonl(path.join(byDateDir, todayFileName("messages")), record);
-
-      const customerKey = safeFileName(record.wa_id || record.from);
-      appendJsonl(path.join(byUserDir, `${customerKey}.jsonl`), record);
+      appendJsonl(path.join(byUserDir, `${safeFileName(record.wa_id || record.from)}.jsonl`), record);
 
       console.log(
         "📝 saved incoming:",
@@ -624,40 +628,21 @@ app.post("/webhook", (req, res) => {
   })();
 });
 
-// ========= Media serve =========
-// 1) Raw serve (debug): no-store
-app.get("/media/file/:wa_id/:filename", (req, res) => {
-  try {
-    const waId = safeFileName(req.params.wa_id);
-    const filename = safeFileName(req.params.filename);
-    const base = path.join(mediaDir, waId);
-    const abs = path.join(base, filename);
+// ========= Media routes =========
 
-    if (!abs.startsWith(base)) return res.status(400).send("Bad path");
-    if (!fs.existsSync(abs)) return res.status(404).send("Not found");
-
-    res.setHeader("Content-Type", guessMimeByExt(filename));
-    res.setHeader("Cache-Control", "no-store");
-    return fs.createReadStream(abs).pipe(res);
-  } catch (e) {
-    console.error("❌ /media/file error:", e);
-    return res.status(500).send("Internal error");
-  }
-});
-
-// 2) Original (strong cache)
+// 1) Original: strong cache
 app.get("/media/original/:wa_id/:filename", (req, res) => {
   try {
     const waId = safeFileName(req.params.wa_id);
     const filename = safeFileName(req.params.filename);
-    const base = path.join(mediaDir, waId);
-    const abs = path.join(base, filename);
 
+    const abs = path.join(mediaDir, waId, filename);
+    const base = path.join(mediaDir, waId);
     if (!abs.startsWith(base)) return res.status(400).send("Bad path");
     if (!fs.existsSync(abs)) return res.status(404).send("Not found");
 
     res.setHeader("Content-Type", guessMimeByExt(filename));
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    setStrongCache(res);
     return res.sendFile(abs);
   } catch (e) {
     console.error("❌ /media/original error:", e);
@@ -665,29 +650,40 @@ app.get("/media/original/:wa_id/:filename", (req, res) => {
   }
 });
 
-// 3) Thumb (webp + strong cache) — only works for images
+// 2) Thumb: webp + strong cache (sharp installed) else fallback to original
 app.get("/media/thumb/:wa_id/:filename", async (req, res) => {
   try {
     const waId = safeFileName(req.params.wa_id);
     const filename = safeFileName(req.params.filename);
-    const base = path.join(mediaDir, waId);
-    const src = path.join(base, filename);
 
+    const src = path.join(mediaDir, waId, filename);
+    const base = path.join(mediaDir, waId);
     if (!src.startsWith(base)) return res.status(400).send("Bad path");
     if (!fs.existsSync(src)) return res.status(404).send("Not found");
 
     const mime = guessMimeByExt(filename);
-    if (!mime.startsWith("image/")) {
-      return res.status(400).send("thumb only supports image files");
+    const isImage = mime.startsWith("image/");
+    if (!isImage) {
+      // thumb only supports image; fallback to original for non-images
+      res.setHeader("Content-Type", mime);
+      setStrongCache(res);
+      return res.sendFile(src);
     }
 
+    // if sharp not available: fallback to original image (still strong cache)
+    if (!sharp) {
+      res.setHeader("Content-Type", mime);
+      setStrongCache(res);
+      return res.sendFile(src);
+    }
+
+    // generate thumb path: logs/media/__thumbs/<wa_id>/<stem>.webp
     const stem = filename.replace(/\.[^.]+$/, "");
     const thumbAbs = path.join(thumbsDir, waId, `${stem}.webp`);
-
     await ensureImageThumb(src, thumbAbs);
 
     res.setHeader("Content-Type", "image/webp");
-    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    setStrongCache(res);
     return res.sendFile(thumbAbs);
   } catch (e) {
     console.error("❌ /media/thumb error:", e);
@@ -730,7 +726,7 @@ app.get("/customers/:wa_id/messages", (req, res) => {
   }
 });
 
-// ========= UI: Customers list (filters: q, unread, recent24, tag) =========
+// ========= UI: Customers list =========
 app.get("/ui", (req, res) => {
   try {
     setNoCache(res);
@@ -791,8 +787,6 @@ app.get("/ui", (req, res) => {
           .map(([k, v]) => `<span class="tag">${escapeHtml(k)}:${v}</span>`)
           .join(" ");
 
-        const preview = escapeHtml(c.last_text || "");
-
         return `
           <tr>
             <td class="mono">
@@ -800,7 +794,7 @@ app.get("/ui", (req, res) => {
             </td>
             <td>${escapeHtml(c.profile_name || "")}</td>
             <td>${escapeHtml(fmtTime(c.last_time))}</td>
-            <td>${unreadBadge} ${lastDir} <span class="preview">${preview}</span></td>
+            <td>${unreadBadge} ${lastDir} <span class="preview">${escapeHtml(c.last_text || "")}</span></td>
             <td>${tags}</td>
           </tr>
         `;
@@ -827,7 +821,7 @@ app.get("/ui", (req, res) => {
   <style>
     :root{
       --bg:#f6f7fb; --card:#ffffff; --text:#111827; --muted:#6b7280; --line:#e5e7eb;
-      --blue:#2563eb; --blue2:#1d4ed8; --red:#ef4444;
+      --blue:#2563eb; --blue2:#1d4ed8; --green:#10b981; --red:#ef4444;
       --chip:#f3f4f6;
     }
     *{box-sizing:border-box;}
@@ -857,6 +851,7 @@ app.get("/ui", (req, res) => {
     .pill.outgoing{border-color:#bbf7d0; background:#ecfdf5; color:#047857;}
     .badge{display:inline-flex; align-items:center; justify-content:center; min-width:22px; height:22px; padding:0 6px; border-radius:999px; background:var(--red); color:#fff; font-size:12px; margin-right:8px;}
     .badge.ghost{background:#f3f4f6; color:var(--muted); border:1px solid var(--line);}
+    .preview{color:#111827;}
     .footerNote{margin-top:10px; color:var(--muted); font-size:12px;}
   </style>
 </head>
@@ -901,7 +896,7 @@ app.get("/ui", (req, res) => {
       </table>
     </div>
 
-    <div class="footerNote">Version: FAST_A_MEDIA_UI_2026-03-01_v2_THUMB</div>
+    <div class="footerNote">Version: FAST_A_MEDIA_UI_2026-03-01_v2_THUMB_SAFE</div>
   </div>
 </body>
 </html>`;
@@ -929,15 +924,16 @@ app.get("/ui/customer/:wa_id", (req, res) => {
     const filePath = path.join(byUserDir, `${waId}.jsonl`);
     const rows = readJsonlLastN(filePath, limit);
 
+    // tags dropdown
     const tagsSet = new Set();
-    for (const r of rows) {
-      for (const t of r.tags || []) tagsSet.add(t);
-    }
+    for (const r of rows) for (const t of r.tags || []) tagsSet.add(t);
     const allTags = Array.from(tagsSet).sort();
 
+    // unread state BEFORE we mark read
     const st = readState(waId);
     const lastSeenMs = isoToMs(st.last_seen_incoming_at);
 
+    // filter
     const filtered = rows.filter((r) => {
       const text = (r.text || "").toString();
       const cap = (r.caption || "").toString();
@@ -963,7 +959,7 @@ app.get("/ui/customer/:wa_id", (req, res) => {
       return true;
     });
 
-    // mark as read
+    // mark read
     let latestIncoming = null;
     for (const r of rows) {
       if (r.direction === "incoming" && r.received_at) latestIncoming = r.received_at;
@@ -979,54 +975,45 @@ app.get("/ui/customer/:wa_id", (req, res) => {
       : sentFlag
       ? `<div class="alert ok">✅ Sent</div>`
       : "";
-const originalUrl = r.local_media_url || null;
-const thumbUrl = r.local_thumb_url || (originalUrl ? originalUrl.replace("/media/original/", "/media/thumb/") : null);
-const localUrl = originalUrl; // ✅ 关键：给 localUrl 一个定义（别名）
+
     function renderMsgContent(r) {
       const type = r.type || "";
       const text = r.text || "";
       const caption = r.caption || "";
 
-      // Prefer thumb for images if available
-      const rawUrl = r.local_media_url || null;
+      // ✅ 关键：统一定义，避免 localUrl is not defined
+      const originalUrl = r.local_media_url || null;
       const thumbUrl = r.local_thumb_url || null;
-      const originalUrl = r.local_original_url || rawUrl;
+      const localUrl = originalUrl;
 
       if (type === "text") {
         return `<div class="text">${escapeHtml(text)}</div>`;
       }
 
-      if (originalUrl) {
-      if (type === "image") {
-  const originalUrl = localUrl;
-
-  const thumbUrl =
-    r.local_thumb_url ||
-    (originalUrl ? originalUrl.replace("/media/original/", "/media/thumb/") : null);
-
-  const imgSrc = thumbUrl || originalUrl;
-
-  return `
-    ${caption ? `<div class="text">${escapeHtml(caption)}</div>` : ""}
-    <div class="media">
-      <a href="${originalUrl}" target="_blank" rel="noreferrer">
-        <img src="${imgSrc}"
-             alt="image"
-             loading="lazy"
-             onerror="this.onerror=null;this.src='${originalUrl}';" />
-      </a>
-      <div class="mediaActions">
-        <a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a>
-      </div>
-    </div>
-  `;
-}
+      // media
+      if (localUrl) {
+        if (type === "image") {
+          const imgSrc = thumbUrl || originalUrl;
+          return `
+            ${caption ? `<div class="text">${escapeHtml(caption)}</div>` : ""}
+            <div class="media">
+              <a href="${originalUrl}" target="_blank" rel="noreferrer">
+                <img src="${imgSrc}" alt="image" />
+              </a>
+              <div class="mediaActions">
+                <a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a>
+              </div>
+            </div>
+          `;
+        }
         if (type === "video") {
           return `
             ${caption ? `<div class="text">${escapeHtml(caption)}</div>` : ""}
             <div class="media">
               <video controls src="${originalUrl}" style="max-width:100%; border-radius:12px;"></video>
-              <div class="mediaActions"><a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
+              <div class="mediaActions">
+                <a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a>
+              </div>
             </div>
           `;
         }
@@ -1034,10 +1021,13 @@ const localUrl = originalUrl; // ✅ 关键：给 localUrl 一个定义（别名
           return `
             <div class="media">
               <audio controls src="${originalUrl}" style="width:100%;"></audio>
-              <div class="mediaActions"><a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
+              <div class="mediaActions">
+                <a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a>
+              </div>
             </div>
           `;
         }
+        // document
         return `
           <div class="text">${escapeHtml(caption || "Document")}</div>
           <div class="media">
@@ -1052,6 +1042,7 @@ const localUrl = originalUrl; // ✅ 关键：给 localUrl 一个定义（别名
         `;
       }
 
+      // no local url
       return `
         <div class="text">${escapeHtml(caption || text || `[${type}]`)}</div>
         ${r.media_id ? `<div class="mutedSmall mono">media_id=${escapeHtml(r.media_id)}</div>` : ""}
@@ -1097,8 +1088,12 @@ const localUrl = originalUrl; // ✅ 关键：给 localUrl 一个定义（别名
       limit: String(limit),
     };
 
-    const toggleUnreadLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, { unread: unreadOnly ? "" : "1" });
-    const toggleRecentLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, { recent24: recent24 ? "" : "1" });
+    const toggleUnreadLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, {
+      unread: unreadOnly ? "" : "1",
+    });
+    const toggleRecentLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, {
+      recent24: recent24 ? "" : "1",
+    });
     const clearLink = `/ui/customer/${encodeURIComponent(waId)}`;
 
     const tagOptions = [
@@ -1116,7 +1111,7 @@ const localUrl = originalUrl; // ✅ 关键：给 localUrl 一个定义（别名
     :root{
       --bg:#f6f7fb; --card:#ffffff; --text:#111827; --muted:#6b7280; --line:#e5e7eb;
       --in:#ffffff; --out:#ecfdf5;
-      --blue:#2563eb; --blue2:#1d4ed8; --red:#ef4444;
+      --blue:#2563eb; --blue2:#1d4ed8; --green:#10b981; --red:#ef4444;
       --chip:#f3f4f6;
     }
     *{box-sizing:border-box;}
@@ -1174,6 +1169,10 @@ const localUrl = originalUrl; // ✅ 关键：给 localUrl 一个定义（别名
         <div class="muted">
           <a href="/ui">← Back</a>
           &nbsp;|&nbsp; Showing ${filtered.length} messages
+          ${q ? ` (q="${escapeHtml(q)}")` : ""}
+          ${tag ? ` (tag="${escapeHtml(tag)}")` : ""}
+          ${recent24 ? ` (last 24h)` : ""}
+          ${unreadOnly ? ` (unread only)` : ""}
         </div>
       </div>
 
@@ -1214,7 +1213,7 @@ const localUrl = originalUrl; // ✅ 关键：给 localUrl 一个定义（别名
 
           <div class="row2" style="margin-top:10px;">
             <input type="file" name="file" />
-            <div class="fileHint">Support: image/video/audio/document • Max 25MB (can adjust)</div>
+            <div class="fileHint">Support: image/video/audio/document • Max 25MB</div>
           </div>
 
           <div class="row2" style="margin-top:10px;">
@@ -1225,7 +1224,7 @@ const localUrl = originalUrl; // ✅ 关键：给 localUrl 一个定义（别名
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: FAST_A_MEDIA_UI_2026-03-01_v2_THUMB</div>
+    <div class="muted" style="margin-top:10px;">Version: FAST_A_MEDIA_UI_2026-03-01_v2_THUMB_SAFE</div>
   </div>
 </body>
 </html>`;
@@ -1340,11 +1339,26 @@ app.post("/send", upload.single("file"), async (req, res) => {
       outType = category;
 
       if (category === "image") {
-        payload = { messaging_product: "whatsapp", to, type: "image", image: { id: uploadedMediaId, ...(text ? { caption: text } : {}) } };
+        payload = {
+          messaging_product: "whatsapp",
+          to,
+          type: "image",
+          image: { id: uploadedMediaId, ...(text ? { caption: text } : {}) },
+        };
       } else if (category === "video") {
-        payload = { messaging_product: "whatsapp", to, type: "video", video: { id: uploadedMediaId, ...(text ? { caption: text } : {}) } };
+        payload = {
+          messaging_product: "whatsapp",
+          to,
+          type: "video",
+          video: { id: uploadedMediaId, ...(text ? { caption: text } : {}) },
+        };
       } else if (category === "audio") {
-        payload = { messaging_product: "whatsapp", to, type: "audio", audio: { id: uploadedMediaId } };
+        payload = {
+          messaging_product: "whatsapp",
+          to,
+          type: "audio",
+          audio: { id: uploadedMediaId },
+        };
       } else {
         payload = {
           messaging_product: "whatsapp",
@@ -1362,11 +1376,15 @@ app.post("/send", upload.single("file"), async (req, res) => {
     const url = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
     const r = await fetch(url, {
       method: "POST",
-      headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" },
+      headers: {
+        Authorization: `Bearer ${WA_TOKEN}`,
+        "Content-Type": "application/json",
+      },
       body: JSON.stringify(payload),
     });
 
     const data = await r.json();
+
     if (!r.ok) {
       console.error("❌ Send error:", data);
       if (redirectTo) {
@@ -1377,11 +1395,10 @@ app.post("/send", upload.single("file"), async (req, res) => {
       return res.status(500).send(`Error: ${JSON.stringify(data)}`);
     }
 
-    // outgoing log + local preview copy
+    // outgoing log
     try {
       const msgId = data?.messages?.[0]?.id || null;
 
-      let localMediaUrl = null;
       let localOriginalUrl = null;
       let localThumbUrl = null;
       let savedOutFile = null;
@@ -1396,9 +1413,10 @@ app.post("/send", upload.single("file"), async (req, res) => {
         fs.copyFileSync(localOutFile, dest);
         savedOutFile = dest;
 
-        localMediaUrl = mediaServePath(to, outName);
         localOriginalUrl = mediaOriginalPath(to, outName);
-        localThumbUrl = mediaThumbPath(to, outName);
+        if ((mimeType || "").toLowerCase().startsWith("image/")) {
+          localThumbUrl = mediaThumbPath(to, outName);
+        }
       }
 
       const record = {
@@ -1415,10 +1433,9 @@ app.post("/send", upload.single("file"), async (req, res) => {
         caption: outType !== "text" ? (text || null) : null,
         media_id: uploadedMediaId,
         mime_type: mimeType,
-        local_media_url: localMediaUrl,
-        local_original_url: localOriginalUrl,
-        local_thumb_url: localThumbUrl,
         local_media_file: savedOutFile,
+        local_media_url: localOriginalUrl,
+        local_thumb_url: localThumbUrl,
         tags: getTags(text),
         api: data,
       };
@@ -1465,7 +1482,8 @@ app.listen(PORT, () => {
   console.log("MEDIA DIR:", mediaDir);
   console.log("THUMBS DIR:", thumbsDir);
   console.log("UPLOADS DIR:", uploadsDir);
-  console.log("VERSION MARKER: FAST_A_MEDIA_UI_2026-03-01_v2_THUMB");
+  console.log("VERSION MARKER: FAST_A_MEDIA_UI_2026-03-01_v2_THUMB_SAFE");
+  console.log("SHARP ENABLED:", !!sharp);
   console.log("=====================================");
   console.log(`✅ Server running on port ${PORT}`);
 });
