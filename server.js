@@ -995,20 +995,30 @@ app.get("/ui/customer/:wa_id", (req, res) => {
       }
 
       if (originalUrl) {
-        if (type === "image") {
-          const imgSrc = thumbUrl || originalUrl;
-          return `
-            ${caption ? `<div class="text">${escapeHtml(caption)}</div>` : ""}
-            <div class="media">
-              <a href="${originalUrl}" target="_blank" rel="noreferrer">
-                <img src="${imgSrc}" alt="image" />
-              </a>
-              <div class="mediaActions">
-                <a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a>
-              </div>
-            </div>
-          `;
-        }
+      if (type === "image") {
+  const originalUrl = localUrl;
+
+  const thumbUrl =
+    r.local_thumb_url ||
+    (originalUrl ? originalUrl.replace("/media/original/", "/media/thumb/") : null);
+
+  const imgSrc = thumbUrl || originalUrl;
+
+  return `
+    ${caption ? `<div class="text">${escapeHtml(caption)}</div>` : ""}
+    <div class="media">
+      <a href="${originalUrl}" target="_blank" rel="noreferrer">
+        <img src="${imgSrc}"
+             alt="image"
+             loading="lazy"
+             onerror="this.onerror=null;this.src='${originalUrl}';" />
+      </a>
+      <div class="mediaActions">
+        <a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a>
+      </div>
+    </div>
+  `;
+}
         if (type === "video") {
           return `
             ${caption ? `<div class="text">${escapeHtml(caption)}</div>` : ""}
