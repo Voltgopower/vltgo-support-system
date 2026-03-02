@@ -979,7 +979,9 @@ app.get("/ui/customer/:wa_id", (req, res) => {
       : sentFlag
       ? `<div class="alert ok">✅ Sent</div>`
       : "";
-
+const originalUrl = r.local_media_url || null;
+const thumbUrl = r.local_thumb_url || (originalUrl ? originalUrl.replace("/media/original/", "/media/thumb/") : null);
+const localUrl = originalUrl; // ✅ 关键：给 localUrl 一个定义（别名）
     function renderMsgContent(r) {
       const type = r.type || "";
       const text = r.text || "";
