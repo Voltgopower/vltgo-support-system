@@ -23,13 +23,66 @@
  */
 
 require("dotenv").config();
-
+console.log("🔥 DB VERSION CHECK 2026-03-02");
 const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
+const { Pool } = require("pg");
+const { Pool } = require("pg");
 
+// --- DB (Railway Postgres) ---
+const DATABASE_URL = process.env.DATABASE_URL || process.env.DATABASE_URI || "";
+
+let pool = null;
+if (DATABASE_URL) {
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false }, // Railway 常用；如果你用 Private Network 也可以先保留
+  });
+} else {
+  console.log("⚠️ DATABASE_URL not set: DB features disabled");
+}
+
+async function initDB() {
+  if (!pool) return;
+
+  // 1) 连接测试
+  const r = await pool.query("select now() as now");
+  console.log("✅ DB connected, now =", r.rows?.[0]?.now);
+
+  // 2) 建表（先做最小表，后续再扩展字段）
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id BIGSERIAL PRIMARY KEY,
+      wa_id TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      type TEXT,
+      text TEXT,
+      caption TEXT,
+      media_id TEXT,
+      mime_type TEXT,
+      local_media_url TEXT,
+      local_thumb_url TEXT,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  console.log("✅ messages table ready");
+}
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+pool.on("connect", () => {
+  console.log("✅ PostgreSQL connected");
+});
+
+pool.on("error", (err) => {
+  console.error("❌ PostgreSQL error:", err);
+});
 // -------- Optional sharp (do NOT crash if missing) --------
 let sharp = null;
 try {
@@ -1466,24 +1519,42 @@ app.post("/send", upload.single("file"), async (req, res) => {
     return res.status(500).send(e?.message || "Internal error");
   }
 });
+async function testDB() {
+  try {
+    await pool.query("SELECT 1");
+    console.log("✅ DB test OK");
+  } catch (err) {
+    console.error("❌ DB test failed:", err);
+  }
+}
 
+testDB();
 // ========= Start =========
-app.listen(PORT, () => {
-  console.log("=====================================");
-  console.log("🚀 WhatsApp Webhook Server Starting");
-  console.log("NODE VERSION:", process.version);
-  console.log("PORT:", PORT);
-  console.log("VERIFY_TOKEN SET:", VERIFY_TOKEN ? "YES" : "NO");
-  console.log("APP_SECRET SET:", APP_SECRET ? "YES" : "NO");
-  console.log("UI_USER SET:", UI_USER ? "YES" : "NO");
-  console.log("UI_PASS SET:", UI_PASS ? "YES" : "NO");
-  console.log("WA_TOKEN SET:", WA_TOKEN ? "YES" : "NO");
-  console.log("PHONE_NUMBER_ID SET:", PHONE_NUMBER_ID ? "YES" : "NO");
-  console.log("MEDIA DIR:", mediaDir);
-  console.log("THUMBS DIR:", thumbsDir);
-  console.log("UPLOADS DIR:", uploadsDir);
-  console.log("VERSION MARKER: FAST_A_MEDIA_UI_2026-03-01_v2_THUMB_SAFE");
-  console.log("SHARP ENABLED:", !!sharp);
-  console.log("=====================================");
-  console.log(`✅ Server running on port ${PORT}`);
-});
+(async () => {
+  try {
+    await initDB();
+  } catch (e) {
+    console.error("❌ initDB failed:", e?.message || e);
+  }
+
+  app.listen(PORT, () => {
+    console.log("=====================================");
+    console.log("🚀 WhatsApp Webhook Server Starting");
+    console.log("NODE VERSION:", process.version);
+    console.log("PORT:", PORT);
+    console.log("VERIFY_TOKEN SET:", VERIFY_TOKEN ? "YES" : "NO");
+    console.log("APP_SECRET SET:", APP_SECRET ? "YES" : "NO");
+    console.log("UI_USER SET:", UI_USER ? "YES" : "NO");
+    console.log("UI_PASS SET:", UI_PASS ? "YES" : "NO");
+    console.log("WA_TOKEN SET:", WA_TOKEN ? "YES" : "NO");
+    console.log("PHONE_NUMBER_ID SET:", PHONE_NUMBER_ID ? "YES" : "NO");
+    console.log("DATABASE_URL SET:", process.env.DATABASE_URL ? "YES" : "NO");
+    console.log("MEDIA DIR:", mediaDir);
+    console.log("THUMBS DIR:", thumbsDir);
+    console.log("UPLOADS DIR:", uploadsDir);
+    console.log("VERSION MARKER: FAST_A_MEDIA_UI_2026-03-01_v2_THUMB_SAFE");
+    console.log("SHARP ENABLED:", !!sharp);
+    console.log("=====================================");
+    console.log(`✅ Server running on port ${PORT}`);
+  });
+})();
