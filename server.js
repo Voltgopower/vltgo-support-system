@@ -30,7 +30,6 @@ const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
 const { Pool } = require("pg");
-const { Pool } = require("pg");
 
 // --- DB (Railway Postgres) ---
 const DATABASE_URL = process.env.DATABASE_URL || process.env.DATABASE_URI || "";
