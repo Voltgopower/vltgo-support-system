@@ -468,7 +468,19 @@ app.get("/__db_init", async (req, res) => {
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
-
+app.get("/__db_migrate", async (req, res) => {
+  try {
+    await pool.query(`
+      ALTER TABLE messages
+      ALTER COLUMN conversation_id TYPE TEXT
+      USING conversation_id::text;
+    `);
+    res.json({ ok: true, message: "conversation_id migrated to TEXT" });
+  } catch (e) {
+    console.error("Migration error:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 // ========= Webhook verify =========
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
