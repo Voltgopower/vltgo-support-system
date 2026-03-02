@@ -462,6 +462,17 @@ app.get("/__version", (req, res) => {
 app.get("/__db_init", async (req, res) => {
   try {
     await dbInit();
+app.get("/__db_migrate", async (req, res) => {
+  try {
+    // 1) 先移除外键（不然无法改类型）
+    await pool.query(`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_conversation_id_fkey;`);
+
+    // 2) 再把 conversation_id 改为 TEXT（保留原数据）
+    await pool.query(`
+      ALTER TABLE messages
+      ALTER COLUMN conversation_id TYPE TEXT
+      USING conversation_id::text;
+    `);
     return res.json({ ok: true, ts: new Date().toISOString(), marker: "DB_INIT_OK" });
   } catch (e) {
     console.error("❌ __db_init error:", e);
