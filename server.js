@@ -7,6 +7,10 @@
  * - Filters: unread only / last 24h / tag filter
  * - Unread tracking via logs/state/<wa_id>.json (no jsonl rewrites)
  * - Version probe: /__version
+ * - Media routes:
+ *    - /media/file/:wa_id/:filename      (no-store)
+ *    - /media/original/:wa_id/:filename  (strong cache)
+ *    - /media/thumb/:wa_id/:filename     (webp thumbnail + strong cache)
  *
  * .env required:
  *   VERIFY_TOKEN=voltgo_webhook_verify
@@ -26,6 +30,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
+const sharp = require("sharp");
 
 const app = express();
 
@@ -92,38 +97,6 @@ function basicAuth(req, res, next) {
 
 app.use(basicAuth);
 
-// ========= Log directories =========
-const baseLogsDir = path.join(__dirname, "logs");
-const byUserDir = path.join(baseLogsDir, "by-user");
-const byDateDir = path.join(baseLogsDir, "by-date");
-const stateDir = path.join(baseLogsDir, "state");
-const mediaDir = path.join(baseLogsDir, "media");
-const uploadsDir = path.join(baseLogsDir, "uploads");
-
-ensureDir(byUserDir);
-ensureDir(byDateDir);
-ensureDir(stateDir);
-ensureDir(mediaDir);
-ensureDir(uploadsDir);
-
-// ========= Multer upload =========
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: function (req, file, cb) {
-      cb(null, uploadsDir);
-    },
-    filename: function (req, file, cb) {
-      const safe = safeFileName(file.originalname || "file");
-      const ts = new Date().toISOString().replace(/[:.]/g, "-");
-      cb(null, `${ts}__${safe}`);
-    },
-  }),
-  limits: {
-    // 先给一个保守值；需要更大再调
-    fileSize: 25 * 1024 * 1024, // 25MB
-  },
-});
-
 // ========= Helpers =========
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -151,6 +124,12 @@ function safeFileName(name) {
     .trim();
 }
 
+function setNoCache(res) {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+}
+
 /** Optional: verify Meta webhook signature */
 function isValidSignature(req) {
   if (!APP_SECRET) return true;
@@ -168,6 +147,51 @@ function isValidSignature(req) {
   const b = Buffer.from(sig);
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
+}
+
+// ========= Log directories =========
+const baseLogsDir = path.join(__dirname, "logs");
+const byUserDir = path.join(baseLogsDir, "by-user");
+const byDateDir = path.join(baseLogsDir, "by-date");
+const stateDir = path.join(baseLogsDir, "state");
+const mediaDir = path.join(baseLogsDir, "media");
+const uploadsDir = path.join(baseLogsDir, "uploads");
+const thumbsDir = path.join(mediaDir, "__thumbs"); // ✅ thumbs root
+
+ensureDir(byUserDir);
+ensureDir(byDateDir);
+ensureDir(stateDir);
+ensureDir(mediaDir);
+ensureDir(uploadsDir);
+ensureDir(thumbsDir);
+
+// ========= Multer upload =========
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: function (req, file, cb) {
+      cb(null, uploadsDir);
+    },
+    filename: function (req, file, cb) {
+      const safe = safeFileName(file.originalname || "file");
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      cb(null, `${ts}__${safe}`);
+    },
+  }),
+  limits: {
+    fileSize: 25 * 1024 * 1024, // 25MB
+  },
+});
+
+// ========= Thumb generator =========
+// 生成缩略图：同一张图片只生成一次
+async function ensureImageThumb(srcPath, thumbPath) {
+  if (fs.existsSync(thumbPath)) return;
+  ensureDir(path.dirname(thumbPath));
+
+  await sharp(srcPath)
+    .resize({ width: 520, height: 520, fit: "inside", withoutEnlargement: true })
+    .webp({ quality: 78 })
+    .toFile(thumbPath);
 }
 
 // ========= Tags =========
@@ -189,8 +213,6 @@ function getTags(text) {
 }
 
 // ========= State (Unread tracking) =========
-// state file: logs/state/<wa_id>.json
-// { last_seen_incoming_at: "ISO" }
 function statePath(waId) {
   return path.join(stateDir, `${safeFileName(waId)}.json`);
 }
@@ -309,12 +331,6 @@ function buildQueryLink(basePath, current, patch) {
   return u.pathname + (u.search ? `?${u.search}` : "");
 }
 
-function setNoCache(res) {
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
-}
-
 // ========= Media helpers =========
 function extFromMime(mime) {
   const m = (mime || "").toLowerCase();
@@ -329,93 +345,6 @@ function extFromMime(mime) {
   if (m.includes("audio/mp4")) return "m4a";
   if (m.includes("application/pdf")) return "pdf";
   return "bin";
-}
-
-function mediaLocalDirForWaId(waId) {
-  const dir = path.join(mediaDir, safeFileName(waId || "unknown"));
-  ensureDir(dir);
-  return dir;
-}
-
-function mediaServePath(waId, filename) {
-  return `/media/file/${encodeURIComponent(waId)}/${encodeURIComponent(filename)}`;
-}
-
-// download incoming media by media_id -> save to logs/media/<wa_id>/<media_id>.<ext>
-async function downloadIncomingMedia(waId, mediaId) {
-  if (!WA_TOKEN) throw new Error("Missing WA_TOKEN");
-  if (!mediaId) return null;
-
-  // 1) get media URL + mime
-  const metaResp = await fetch(`https://graph.facebook.com/v25.0/${mediaId}`, {
-    headers: { Authorization: `Bearer ${WA_TOKEN}` },
-  });
-  const meta = await metaResp.json();
-  if (!metaResp.ok) {
-    throw new Error(`Media meta error: ${JSON.stringify(meta)}`);
-  }
-  const url = meta?.url;
-  const mime = meta?.mime_type || null;
-
-  if (!url) throw new Error("Media meta missing url");
-
-  // 2) download bytes using bearer token
-  const binResp = await fetch(url, {
-    headers: { Authorization: `Bearer ${WA_TOKEN}` },
-  });
-  if (!binResp.ok) {
-    const t = await binResp.text().catch(() => "");
-    throw new Error(`Media download error: ${binResp.status} ${t}`);
-  }
-  const buf = Buffer.from(await binResp.arrayBuffer());
-
-  const ext = extFromMime(mime);
-  const fileName = `${safeFileName(mediaId)}.${ext}`;
-  const dir = mediaLocalDirForWaId(waId);
-  const abs = path.join(dir, fileName);
-
-  // if already exists, skip write
-  if (!fs.existsSync(abs)) {
-    fs.writeFileSync(abs, buf);
-  }
-
-  return {
-    media_id: mediaId,
-    mime_type: mime,
-    local_file: abs,
-    local_url: mediaServePath(waId, fileName),
-    sha256: meta?.sha256 || null,
-  };
-}
-
-// upload outgoing media file to WhatsApp -> return media id
-async function uploadMediaToWhatsApp(filePath, mimeType) {
-  if (!WA_TOKEN) throw new Error("Missing WA_TOKEN");
-  if (!PHONE_NUMBER_ID) throw new Error("Missing PHONE_NUMBER_ID");
-
-  const buf = fs.readFileSync(filePath);
-  const name = path.basename(filePath);
-
-  // Node 22 has global File/FormData (undici)
-  const file = new File([buf], name, { type: mimeType || "application/octet-stream" });
-  const form = new FormData();
-  form.append("messaging_product", "whatsapp");
-  form.append("file", file);
-
-  const r = await fetch(`https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/media`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${WA_TOKEN}`,
-      // 注意：FormData 会自动带 boundary，不要手动写 Content-Type
-    },
-    body: form,
-  });
-
-  const data = await r.json();
-  if (!r.ok) {
-    throw new Error(`Upload media failed: ${JSON.stringify(data)}`);
-  }
-  return data?.id || null;
 }
 
 function guessMimeByExt(filename) {
@@ -441,6 +370,94 @@ function classifyMediaType(mimeType) {
   return "document";
 }
 
+function mediaLocalDirForWaId(waId) {
+  const dir = path.join(mediaDir, safeFileName(waId || "unknown"));
+  ensureDir(dir);
+  return dir;
+}
+
+function mediaServePath(waId, filename) {
+  return `/media/file/${encodeURIComponent(waId)}/${encodeURIComponent(filename)}`;
+}
+
+function mediaOriginalPath(waId, filename) {
+  return `/media/original/${encodeURIComponent(waId)}/${encodeURIComponent(filename)}`;
+}
+
+function mediaThumbPath(waId, filename) {
+  return `/media/thumb/${encodeURIComponent(waId)}/${encodeURIComponent(filename)}`;
+}
+
+// download incoming media by media_id -> save to logs/media/<wa_id>/<media_id>.<ext>
+async function downloadIncomingMedia(waId, mediaId) {
+  if (!WA_TOKEN) throw new Error("Missing WA_TOKEN");
+  if (!mediaId) return null;
+
+  const metaResp = await fetch(`https://graph.facebook.com/v25.0/${mediaId}`, {
+    headers: { Authorization: `Bearer ${WA_TOKEN}` },
+  });
+  const meta = await metaResp.json();
+  if (!metaResp.ok) {
+    throw new Error(`Media meta error: ${JSON.stringify(meta)}`);
+  }
+
+  const url = meta?.url;
+  const mime = meta?.mime_type || null;
+  if (!url) throw new Error("Media meta missing url");
+
+  const binResp = await fetch(url, {
+    headers: { Authorization: `Bearer ${WA_TOKEN}` },
+  });
+  if (!binResp.ok) {
+    const t = await binResp.text().catch(() => "");
+    throw new Error(`Media download error: ${binResp.status} ${t}`);
+  }
+  const buf = Buffer.from(await binResp.arrayBuffer());
+
+  const ext = extFromMime(mime);
+  const fileName = `${safeFileName(mediaId)}.${ext}`;
+  const dir = mediaLocalDirForWaId(waId);
+  const abs = path.join(dir, fileName);
+
+  if (!fs.existsSync(abs)) fs.writeFileSync(abs, buf);
+
+  return {
+    media_id: mediaId,
+    mime_type: mime,
+    local_file: abs,
+    local_url: mediaServePath(waId, fileName),
+    local_original_url: mediaOriginalPath(waId, fileName),
+    local_thumb_url: mediaThumbPath(waId, fileName),
+    sha256: meta?.sha256 || null,
+  };
+}
+
+// upload outgoing media file to WhatsApp -> return media id
+async function uploadMediaToWhatsApp(filePath, mimeType) {
+  if (!WA_TOKEN) throw new Error("Missing WA_TOKEN");
+  if (!PHONE_NUMBER_ID) throw new Error("Missing PHONE_NUMBER_ID");
+
+  const buf = fs.readFileSync(filePath);
+  const name = path.basename(filePath);
+
+  const file = new File([buf], name, { type: mimeType || "application/octet-stream" });
+  const form = new FormData();
+  form.append("messaging_product", "whatsapp");
+  form.append("file", file);
+
+  const r = await fetch(`https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/media`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${WA_TOKEN}`,
+    },
+    body: form,
+  });
+
+  const data = await r.json();
+  if (!r.ok) throw new Error(`Upload media failed: ${JSON.stringify(data)}`);
+  return data?.id || null;
+}
+
 // ========= Health + Version =========
 app.get("/", (req, res) => res.status(200).send("OK"));
 
@@ -448,7 +465,7 @@ app.get("/__version", (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "FAST_A_MEDIA_UI_2026-03-01_v1",
+    marker: "FAST_A_MEDIA_UI_2026-03-01_v2_THUMB",
     node: process.version,
   });
 });
@@ -492,7 +509,6 @@ app.post("/webhook", (req, res) => {
       const waId = contact?.wa_id || msg.from || null;
       const profileName = contact?.profile?.name || null;
 
-      // parse different message types
       const type = msg.type || "unknown";
 
       let textBody = null;
@@ -500,7 +516,10 @@ app.post("/webhook", (req, res) => {
       let mediaId = null;
       let mimeType = null;
       let sha256 = null;
+
       let localMediaUrl = null;
+      let localOriginalUrl = null;
+      let localThumbUrl = null;
       let localMediaFile = null;
 
       if (type === "text") {
@@ -524,16 +543,14 @@ app.post("/webhook", (req, res) => {
         mediaId = msg.audio?.id || null;
         mimeType = msg.audio?.mime_type || null;
         sha256 = msg.audio?.sha256 || null;
-      } else {
-        // fallback
-        textBody = null;
       }
 
-      // download media if present
       if (mediaId) {
         try {
           const dl = await downloadIncomingMedia(waId || msg.from, mediaId);
           localMediaUrl = dl?.local_url || null;
+          localOriginalUrl = dl?.local_original_url || null;
+          localThumbUrl = dl?.local_thumb_url || null;
           localMediaFile = dl?.local_file || null;
           mimeType = dl?.mime_type || mimeType;
         } catch (e) {
@@ -560,11 +577,14 @@ app.post("/webhook", (req, res) => {
         type,
 
         text: textBody,
-        caption: caption,
+        caption,
         media_id: mediaId,
         mime_type: mimeType,
         media_sha256: sha256,
+
         local_media_url: localMediaUrl,
+        local_original_url: localOriginalUrl,
+        local_thumb_url: localThumbUrl,
         local_media_file: localMediaFile,
 
         tags: getTags(textBody || caption || ""),
@@ -591,27 +611,73 @@ app.post("/webhook", (req, res) => {
 });
 
 // ========= Media serve =========
-// GET /media/file/:wa_id/:filename -> serve local media from logs/media/<wa_id>/<filename>
+// 1) Raw serve (debug): no-store
 app.get("/media/file/:wa_id/:filename", (req, res) => {
   try {
     const waId = safeFileName(req.params.wa_id);
     const filename = safeFileName(req.params.filename);
+    const base = path.join(mediaDir, waId);
+    const abs = path.join(base, filename);
 
-    const abs = path.join(mediaDir, waId, filename);
-    if (!abs.startsWith(path.join(mediaDir, waId))) {
-      return res.status(400).send("Bad path");
-    }
+    if (!abs.startsWith(base)) return res.status(400).send("Bad path");
     if (!fs.existsSync(abs)) return res.status(404).send("Not found");
 
-    // set content type roughly by ext
-    const mime = guessMimeByExt(filename);
-    res.setHeader("Content-Type", mime);
+    res.setHeader("Content-Type", guessMimeByExt(filename));
     res.setHeader("Cache-Control", "no-store");
-
     return fs.createReadStream(abs).pipe(res);
   } catch (e) {
     console.error("❌ /media/file error:", e);
     return res.status(500).send("Internal error");
+  }
+});
+
+// 2) Original (strong cache)
+app.get("/media/original/:wa_id/:filename", (req, res) => {
+  try {
+    const waId = safeFileName(req.params.wa_id);
+    const filename = safeFileName(req.params.filename);
+    const base = path.join(mediaDir, waId);
+    const abs = path.join(base, filename);
+
+    if (!abs.startsWith(base)) return res.status(400).send("Bad path");
+    if (!fs.existsSync(abs)) return res.status(404).send("Not found");
+
+    res.setHeader("Content-Type", guessMimeByExt(filename));
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    return res.sendFile(abs);
+  } catch (e) {
+    console.error("❌ /media/original error:", e);
+    return res.status(500).send("Internal error");
+  }
+});
+
+// 3) Thumb (webp + strong cache) — only works for images
+app.get("/media/thumb/:wa_id/:filename", async (req, res) => {
+  try {
+    const waId = safeFileName(req.params.wa_id);
+    const filename = safeFileName(req.params.filename);
+    const base = path.join(mediaDir, waId);
+    const src = path.join(base, filename);
+
+    if (!src.startsWith(base)) return res.status(400).send("Bad path");
+    if (!fs.existsSync(src)) return res.status(404).send("Not found");
+
+    const mime = guessMimeByExt(filename);
+    if (!mime.startsWith("image/")) {
+      return res.status(400).send("thumb only supports image files");
+    }
+
+    const stem = filename.replace(/\.[^.]+$/, "");
+    const thumbAbs = path.join(thumbsDir, waId, `${stem}.webp`);
+
+    await ensureImageThumb(src, thumbAbs);
+
+    res.setHeader("Content-Type", "image/webp");
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    return res.sendFile(thumbAbs);
+  } catch (e) {
+    console.error("❌ /media/thumb error:", e);
+    return res.status(500).send("thumb error");
   }
 });
 
@@ -663,7 +729,6 @@ app.get("/ui", (req, res) => {
 
     const files = fs.readdirSync(byUserDir).filter((f) => f.endsWith(".jsonl"));
     const customers = [];
-
     const allTagsSet = new Set();
 
     for (const f of files) {
@@ -748,7 +813,7 @@ app.get("/ui", (req, res) => {
   <style>
     :root{
       --bg:#f6f7fb; --card:#ffffff; --text:#111827; --muted:#6b7280; --line:#e5e7eb;
-      --blue:#2563eb; --blue2:#1d4ed8; --green:#10b981; --red:#ef4444;
+      --blue:#2563eb; --blue2:#1d4ed8; --red:#ef4444;
       --chip:#f3f4f6;
     }
     *{box-sizing:border-box;}
@@ -778,7 +843,6 @@ app.get("/ui", (req, res) => {
     .pill.outgoing{border-color:#bbf7d0; background:#ecfdf5; color:#047857;}
     .badge{display:inline-flex; align-items:center; justify-content:center; min-width:22px; height:22px; padding:0 6px; border-radius:999px; background:var(--red); color:#fff; font-size:12px; margin-right:8px;}
     .badge.ghost{background:#f3f4f6; color:var(--muted); border:1px solid var(--line);}
-    .preview{color:#111827;}
     .footerNote{margin-top:10px; color:var(--muted); font-size:12px;}
   </style>
 </head>
@@ -823,7 +887,7 @@ app.get("/ui", (req, res) => {
       </table>
     </div>
 
-    <div class="footerNote">Version: FAST_A_MEDIA_UI_2026-03-01_v1</div>
+    <div class="footerNote">Version: FAST_A_MEDIA_UI_2026-03-01_v2_THUMB</div>
   </div>
 </body>
 </html>`;
@@ -835,7 +899,7 @@ app.get("/ui", (req, res) => {
   }
 });
 
-// ========= UI: Customer chat (bubble + filters: q, recent24, tag, unreadOnly=only unread incoming) =========
+// ========= UI: Customer chat =========
 app.get("/ui/customer/:wa_id", (req, res) => {
   try {
     setNoCache(res);
@@ -851,18 +915,15 @@ app.get("/ui/customer/:wa_id", (req, res) => {
     const filePath = path.join(byUserDir, `${waId}.jsonl`);
     const rows = readJsonlLastN(filePath, limit);
 
-    // tag dropdown
     const tagsSet = new Set();
     for (const r of rows) {
       for (const t of r.tags || []) tagsSet.add(t);
     }
     const allTags = Array.from(tagsSet).sort();
 
-    // unread state BEFORE we mark read
     const st = readState(waId);
     const lastSeenMs = isoToMs(st.last_seen_incoming_at);
 
-    // filtered view
     const filtered = rows.filter((r) => {
       const text = (r.text || "").toString();
       const cap = (r.caption || "").toString();
@@ -888,7 +949,7 @@ app.get("/ui/customer/:wa_id", (req, res) => {
       return true;
     });
 
-    // mark as read when opening page (based on latest incoming in FULL rows)
+    // mark as read
     let latestIncoming = null;
     for (const r of rows) {
       if (r.direction === "incoming" && r.received_at) latestIncoming = r.received_at;
@@ -909,22 +970,28 @@ app.get("/ui/customer/:wa_id", (req, res) => {
       const type = r.type || "";
       const text = r.text || "";
       const caption = r.caption || "";
-      const localUrl = r.local_media_url || null;
+
+      // Prefer thumb for images if available
+      const rawUrl = r.local_media_url || null;
+      const thumbUrl = r.local_thumb_url || null;
+      const originalUrl = r.local_original_url || rawUrl;
 
       if (type === "text") {
         return `<div class="text">${escapeHtml(text)}</div>`;
       }
 
-      // media types
-      if (localUrl) {
+      if (originalUrl) {
         if (type === "image") {
+          const imgSrc = thumbUrl || originalUrl;
           return `
             ${caption ? `<div class="text">${escapeHtml(caption)}</div>` : ""}
             <div class="media">
-              <a href="${localUrl}" target="_blank" rel="noreferrer">
-                <img src="${localUrl}" alt="image" />
+              <a href="${originalUrl}" target="_blank" rel="noreferrer">
+                <img src="${imgSrc}" alt="image" />
               </a>
-              <div class="mediaActions"><a href="${localUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
+              <div class="mediaActions">
+                <a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a>
+              </div>
             </div>
           `;
         }
@@ -932,20 +999,19 @@ app.get("/ui/customer/:wa_id", (req, res) => {
           return `
             ${caption ? `<div class="text">${escapeHtml(caption)}</div>` : ""}
             <div class="media">
-              <video controls src="${localUrl}" style="max-width:100%; border-radius:12px;"></video>
-              <div class="mediaActions"><a href="${localUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
+              <video controls src="${originalUrl}" style="max-width:100%; border-radius:12px;"></video>
+              <div class="mediaActions"><a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
             </div>
           `;
         }
         if (type === "audio") {
           return `
             <div class="media">
-              <audio controls src="${localUrl}" style="width:100%;"></audio>
-              <div class="mediaActions"><a href="${localUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
+              <audio controls src="${originalUrl}" style="width:100%;"></audio>
+              <div class="mediaActions"><a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
             </div>
           `;
         }
-        // document or others
         return `
           <div class="text">${escapeHtml(caption || "Document")}</div>
           <div class="media">
@@ -954,13 +1020,12 @@ app.get("/ui/customer/:wa_id", (req, res) => {
                 <div><b>${escapeHtml(type)}</b></div>
                 <div class="mutedSmall mono">${escapeHtml(r.mime_type || "")}</div>
               </div>
-              <a class="btnLink" href="${localUrl}" target="_blank" rel="noreferrer">Download</a>
+              <a class="btnLink" href="${originalUrl}" target="_blank" rel="noreferrer">Download</a>
             </div>
           </div>
         `;
       }
 
-      // no local file yet
       return `
         <div class="text">${escapeHtml(caption || text || `[${type}]`)}</div>
         ${r.media_id ? `<div class="mutedSmall mono">media_id=${escapeHtml(r.media_id)}</div>` : ""}
@@ -1025,7 +1090,7 @@ app.get("/ui/customer/:wa_id", (req, res) => {
     :root{
       --bg:#f6f7fb; --card:#ffffff; --text:#111827; --muted:#6b7280; --line:#e5e7eb;
       --in:#ffffff; --out:#ecfdf5;
-      --blue:#2563eb; --blue2:#1d4ed8; --green:#10b981; --red:#ef4444;
+      --blue:#2563eb; --blue2:#1d4ed8; --red:#ef4444;
       --chip:#f3f4f6;
     }
     *{box-sizing:border-box;}
@@ -1083,10 +1148,6 @@ app.get("/ui/customer/:wa_id", (req, res) => {
         <div class="muted">
           <a href="/ui">← Back</a>
           &nbsp;|&nbsp; Showing ${filtered.length} messages
-          ${q ? ` (q="${escapeHtml(q)}")` : ""}
-          ${tag ? ` (tag="${escapeHtml(tag)}")` : ""}
-          ${recent24 ? ` (last 24h)` : ""}
-          ${unreadOnly ? ` (unread only)` : ""}
         </div>
       </div>
 
@@ -1138,7 +1199,7 @@ app.get("/ui/customer/:wa_id", (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: FAST_A_MEDIA_UI_2026-03-01_v1</div>
+    <div class="muted" style="margin-top:10px;">Version: FAST_A_MEDIA_UI_2026-03-01_v2_THUMB</div>
   </div>
 </body>
 </html>`;
@@ -1185,7 +1246,6 @@ app.get("/send", (req, res) => {
 });
 
 // ===== SEND API (outgoing + log) =====
-// supports: text only OR file (with optional caption in text)
 app.post("/send", upload.single("file"), async (req, res) => {
   try {
     const to = (req.body.to || "").trim();
@@ -1220,7 +1280,6 @@ app.post("/send", upload.single("file"), async (req, res) => {
 
     const hasFile = !!req.file;
 
-    // If no file, require text
     if (!hasFile && !text) {
       if (redirectTo) {
         const u = new URL(redirectTo, "http://localhost");
@@ -1237,7 +1296,6 @@ app.post("/send", upload.single("file"), async (req, res) => {
     let localOutFile = null;
 
     if (!hasFile) {
-      // ---- TEXT ----
       payload = {
         messaging_product: "whatsapp",
         to,
@@ -1246,46 +1304,22 @@ app.post("/send", upload.single("file"), async (req, res) => {
       };
       outType = "text";
     } else {
-      // ---- MEDIA ----
       localOutFile = req.file.path;
       mimeType = req.file.mimetype || guessMimeByExt(req.file.originalname);
       const category = classifyMediaType(mimeType);
 
-      // upload
       uploadedMediaId = await uploadMediaToWhatsApp(localOutFile, mimeType);
       if (!uploadedMediaId) throw new Error("Upload succeeded but missing media id");
 
       outType = category;
 
       if (category === "image") {
-        payload = {
-          messaging_product: "whatsapp",
-          to,
-          type: "image",
-          image: {
-            id: uploadedMediaId,
-            ...(text ? { caption: text } : {}),
-          },
-        };
+        payload = { messaging_product: "whatsapp", to, type: "image", image: { id: uploadedMediaId, ...(text ? { caption: text } : {}) } };
       } else if (category === "video") {
-        payload = {
-          messaging_product: "whatsapp",
-          to,
-          type: "video",
-          video: {
-            id: uploadedMediaId,
-            ...(text ? { caption: text } : {}),
-          },
-        };
+        payload = { messaging_product: "whatsapp", to, type: "video", video: { id: uploadedMediaId, ...(text ? { caption: text } : {}) } };
       } else if (category === "audio") {
-        payload = {
-          messaging_product: "whatsapp",
-          to,
-          type: "audio",
-          audio: { id: uploadedMediaId },
-        };
+        payload = { messaging_product: "whatsapp", to, type: "audio", audio: { id: uploadedMediaId } };
       } else {
-        // document
         payload = {
           messaging_product: "whatsapp",
           to,
@@ -1299,22 +1333,16 @@ app.post("/send", upload.single("file"), async (req, res) => {
       }
     }
 
-    // send message
     const url = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
     const r = await fetch(url, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${WA_TOKEN}`,
-        "Content-Type": "application/json",
-      },
+      headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
 
     const data = await r.json();
-
     if (!r.ok) {
       console.error("❌ Send error:", data);
-
       if (redirectTo) {
         const u = new URL(redirectTo, "http://localhost");
         u.searchParams.set("err", "Send failed");
@@ -1323,12 +1351,13 @@ app.post("/send", upload.single("file"), async (req, res) => {
       return res.status(500).send(`Error: ${JSON.stringify(data)}`);
     }
 
-    // ✅ outgoing log
+    // outgoing log + local preview copy
     try {
       const msgId = data?.messages?.[0]?.id || null;
 
-      // If we sent media, keep a copy in logs/media/<wa_id>/outgoing__xxx.ext for easy preview later
       let localMediaUrl = null;
+      let localOriginalUrl = null;
+      let localThumbUrl = null;
       let savedOutFile = null;
 
       if (hasFile && localOutFile) {
@@ -1338,10 +1367,12 @@ app.post("/send", upload.single("file"), async (req, res) => {
         const outName = `outgoing__${base}.${ext}`;
         const dest = path.join(waDir, outName);
 
-        // copy (do not delete uploads; keep both is ok)
         fs.copyFileSync(localOutFile, dest);
         savedOutFile = dest;
+
         localMediaUrl = mediaServePath(to, outName);
+        localOriginalUrl = mediaOriginalPath(to, outName);
+        localThumbUrl = mediaThumbPath(to, outName);
       }
 
       const record = {
@@ -1359,6 +1390,8 @@ app.post("/send", upload.single("file"), async (req, res) => {
         media_id: uploadedMediaId,
         mime_type: mimeType,
         local_media_url: localMediaUrl,
+        local_original_url: localOriginalUrl,
+        local_thumb_url: localThumbUrl,
         local_media_file: savedOutFile,
         tags: getTags(text),
         api: data,
@@ -1372,7 +1405,6 @@ app.post("/send", upload.single("file"), async (req, res) => {
       console.error("❌ outgoing log error:", logErr);
     }
 
-    // ✅ redirect back
     if (redirectTo) {
       const u = new URL(redirectTo, "http://localhost");
       u.searchParams.set("sent", "1");
@@ -1405,8 +1437,9 @@ app.listen(PORT, () => {
   console.log("WA_TOKEN SET:", WA_TOKEN ? "YES" : "NO");
   console.log("PHONE_NUMBER_ID SET:", PHONE_NUMBER_ID ? "YES" : "NO");
   console.log("MEDIA DIR:", mediaDir);
+  console.log("THUMBS DIR:", thumbsDir);
   console.log("UPLOADS DIR:", uploadsDir);
-  console.log("VERSION MARKER: FAST_A_MEDIA_UI_2026-03-01_v1");
+  console.log("VERSION MARKER: FAST_A_MEDIA_UI_2026-03-01_v2_THUMB");
   console.log("=====================================");
   console.log(`✅ Server running on port ${PORT}`);
 });
