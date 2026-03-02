@@ -30,7 +30,12 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
-const sharp = require("sharp");
+let sharp = null;
+try {
+  sharp = require("sharp");
+} catch (e) {
+  console.warn("⚠️ sharp not available, thumb route will fallback. Install with: npm i sharp");
+}
 
 const app = express();
 
@@ -184,6 +189,15 @@ const upload = multer({
 
 // ========= Thumb generator =========
 // 生成缩略图：同一张图片只生成一次
+async function ensureImageThumb(srcPath, thumbPath) {
+  if (!sharp) throw new Error("sharp_not_installed");
+  if (fs.existsSync(thumbPath)) return;
+  ensureDir(path.dirname(thumbPath));
+  await sharp(srcPath)
+    .resize({ width: 520, height: 520, fit: "inside", withoutEnlargement: true })
+    .webp({ quality: 78 })
+    .toFile(thumbPath);
+}
 async function ensureImageThumb(srcPath, thumbPath) {
   if (fs.existsSync(thumbPath)) return;
   ensureDir(path.dirname(thumbPath));
