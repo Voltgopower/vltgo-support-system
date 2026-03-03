@@ -296,8 +296,8 @@ async function dbInit() {
     END $$;
   `);
 
-  // ✅ Compatibility for old schema: conversations.contact_id sometimes exists and is NOT NULL.
-  // Our app uses wa_id as the identifier, so we relax contact_id requirement.
+  // ✅ Compatibility for old schema: conversations.contact_id may exist (often INTEGER + NOT NULL).
+  // We MUST NOT assign wa_id (TEXT) into contact_id (INTEGER). We only relax NOT NULL to prevent insert failures.
   await pool.query(`
     DO $$
     BEGIN
@@ -305,13 +305,6 @@ async function dbInit() {
         SELECT 1 FROM information_schema.columns
         WHERE table_schema='public' AND table_name='conversations' AND column_name='contact_id'
       ) THEN
-        -- Fill existing NULLs with wa_id (best effort), then drop NOT NULL to prevent insert failures.
-        BEGIN
-          EXECUTE 'UPDATE public.conversations SET contact_id = wa_id WHERE contact_id IS NULL';
-        EXCEPTION WHEN undefined_column THEN
-          NULL;
-        END;
-
         BEGIN
           EXECUTE 'ALTER TABLE public.conversations ALTER COLUMN contact_id DROP NOT NULL';
         EXCEPTION
@@ -659,7 +652,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "FAST_A_DB_COMPAT_2026-03-02_v1_PATCH3_CONSTRAINT_CONTACTID_FIX",
+    marker: "FAST_A_DB_COMPAT_2026-03-02_v1_PATCH4_CONTACTID_INT_SAFE",
     node: process.version,
     has_DATABASE_URL: !!DATABASE_URL,
     db_ok: dbOk,
@@ -1044,7 +1037,7 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH3_CONSTRAINT_CONTACTID_FIX</div>
+        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH4_CONTACTID_INT_SAFE</div>
       </div>
 
       <div class="controls">
@@ -1460,7 +1453,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH3_CONSTRAINT_CONTACTID_FIX</div>
+    <div class="muted" style="margin-top:10px;">Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH4_CONTACTID_INT_SAFE</div>
   </div>
 </body>
 </html>`;
@@ -1659,7 +1652,7 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH3_CONSTRAINT_CONTACTID_FIX");
+    console.log("VERSION MARKER: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH4_CONTACTID_INT_SAFE");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
