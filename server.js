@@ -1678,4 +1678,3 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log(`✅ Server running on port ${PORT}`);
   });
 })();
-patch5: trigger fill conversations.id from wa_id
