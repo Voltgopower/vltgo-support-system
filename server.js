@@ -259,17 +259,66 @@ async function dbInit() {
   // ✅ Indexes (after columns exist)
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_id);`);
-
-  // ✅ Unique constraint on conversations.wa_id (best effort)
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_id);`);  // ✅ Unique on conversations.wa_id (safe even if old DB already has index/constraint)
+  // Some old schemas already have an index named conversations_wa_id_key, so adding a constraint can fail.
   await pool.query(`
     DO $$
     BEGIN
-      BEGIN
-        ALTER TABLE conversations ADD CONSTRAINT conversations_wa_id_key UNIQUE (wa_id);
-      EXCEPTION WHEN duplicate_object THEN
-        -- ignore
-      END;
+      -- If there is already a UNIQUE index named conversations_wa_id_key, do nothing.
+      IF EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind = 'i'
+          AND n.nspname = 'public'
+          AND c.relname = 'conversations_wa_id_key'
+      ) THEN
+        RETURN;
+      END IF;
+
+      -- If there is already a UNIQUE constraint on wa_id, do nothing.
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'public.conversations'::regclass
+          AND contype = 'u'
+          AND conkey = ARRAY[ (SELECT attnum FROM pg_attribute WHERE attrelid='public.conversations'::regclass AND attname='wa_id') ]
+      ) THEN
+        RETURN;
+      END IF;
+
+      -- Otherwise create a unique index (safe + enough for ON CONFLICT on unique constraint?)
+      -- NOTE: ON CONFLICT requires a UNIQUE constraint OR a UNIQUE index on the conflict target.
+      EXECUTE 'CREATE UNIQUE INDEX conversations_wa_id_key ON public.conversations(wa_id)';
+    EXCEPTION
+      WHEN duplicate_table THEN  -- 42P07
+        NULL;
+      WHEN duplicate_object THEN
+        NULL;
+    END $$;
+  `);
+
+  // ✅ Compatibility for old schema: conversations.contact_id sometimes exists and is NOT NULL.
+  // Our app uses wa_id as the identifier, so we relax contact_id requirement.
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='conversations' AND column_name='contact_id'
+      ) THEN
+        -- Fill existing NULLs with wa_id (best effort), then drop NOT NULL to prevent insert failures.
+        BEGIN
+          EXECUTE 'UPDATE public.conversations SET contact_id = wa_id WHERE contact_id IS NULL';
+        EXCEPTION WHEN undefined_column THEN
+          NULL;
+        END;
+
+        BEGIN
+          EXECUTE 'ALTER TABLE public.conversations ALTER COLUMN contact_id DROP NOT NULL';
+        EXCEPTION
+          WHEN undefined_column THEN NULL;
+          WHEN invalid_table_definition THEN NULL;
+        END;
+      END IF;
     END $$;
   `);
 }
@@ -610,7 +659,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "FAST_A_DB_COMPAT_2026-03-02_v1_PATCH2_DBINIT_CLEAN",
+    marker: "FAST_A_DB_COMPAT_2026-03-02_v1_PATCH3_CONSTRAINT_CONTACTID_FIX",
     node: process.version,
     has_DATABASE_URL: !!DATABASE_URL,
     db_ok: dbOk,
@@ -995,7 +1044,7 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH2_DBINIT_CLEAN</div>
+        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH3_CONSTRAINT_CONTACTID_FIX</div>
       </div>
 
       <div class="controls">
@@ -1411,7 +1460,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH2_DBINIT_CLEAN</div>
+    <div class="muted" style="margin-top:10px;">Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH3_CONSTRAINT_CONTACTID_FIX</div>
   </div>
 </body>
 </html>`;
@@ -1610,7 +1659,7 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH2_DBINIT_CLEAN");
+    console.log("VERSION MARKER: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH3_CONSTRAINT_CONTACTID_FIX");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
