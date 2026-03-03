@@ -256,6 +256,26 @@ async function dbInit() {
     END $$;
   `);
 
+  // ✅ Ensure conversations.id is never NULL: old code may insert only wa_id.
+  // This trigger auto-fills id from wa_id when id is NULL, preventing NOT NULL/PK violations.
+  await pool.query(`
+    CREATE OR REPLACE FUNCTION public._conv_set_id_from_wa_id()
+    RETURNS trigger AS $$
+    BEGIN
+      IF NEW.id IS NULL THEN
+        NEW.id := NEW.wa_id;
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    DROP TRIGGER IF EXISTS trg_conv_set_id_from_wa_id ON public.conversations;
+    CREATE TRIGGER trg_conv_set_id_from_wa_id
+    BEFORE INSERT ON public.conversations
+    FOR EACH ROW
+    EXECUTE FUNCTION public._conv_set_id_from_wa_id();
+  `);
+
   // ✅ Indexes (after columns exist)
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);`);
@@ -652,7 +672,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "FAST_A_DB_COMPAT_2026-03-02_v1_PATCH4_CONTACTID_INT_SAFE",
+    marker: "FAST_A_DB_COMPAT_2026-03-02_v1_PATCH5_ID_FROM_WAID_TRIGGER",
     node: process.version,
     has_DATABASE_URL: !!DATABASE_URL,
     db_ok: dbOk,
@@ -1037,7 +1057,7 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH4_CONTACTID_INT_SAFE</div>
+        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH5_ID_FROM_WAID_TRIGGER</div>
       </div>
 
       <div class="controls">
@@ -1453,7 +1473,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH4_CONTACTID_INT_SAFE</div>
+    <div class="muted" style="margin-top:10px;">Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH5_ID_FROM_WAID_TRIGGER</div>
   </div>
 </body>
 </html>`;
@@ -1652,9 +1672,10 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH4_CONTACTID_INT_SAFE");
+    console.log("VERSION MARKER: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH5_ID_FROM_WAID_TRIGGER");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
   });
 })();
+patch5: trigger fill conversations.id from wa_id
