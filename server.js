@@ -21,7 +21,7 @@
  */
 
 require("dotenv").config();
-
+console.log("✅ LOADED NEW SERVER.JS: 2026-03-02 cache-busted");
 const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -160,43 +160,118 @@ async function dbPing() {
   return r.rows?.[0]?.ok === 1;
 }
 
+
 async function dbInit() {
-  // Create tables (TEXT wa_id!)
+  // ✅ Ensure base tables exist (compatible schema)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS conversations (
-      id BIGSERIAL PRIMARY KEY,
+      id TEXT PRIMARY KEY,
       wa_id TEXT UNIQUE NOT NULL,
       profile_name TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       last_message_at TIMESTAMPTZ,
-      last_seen_incoming_at TIMESTAMPTZ
+      last_seen_incoming_at TIMESTAMPTZ,
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      created_at TIMESTAMPTZ DEFAULT now()
     );
-  `);
 
-  await pool.query(`
     CREATE TABLE IF NOT EXISTS messages (
       id BIGSERIAL PRIMARY KEY,
-      conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-      wa_id TEXT NOT NULL,
-      direction TEXT NOT NULL,              -- incoming/outgoing
-      msg_type TEXT,                        -- text/image/video/audio/document
+      conversation_id TEXT NOT NULL,
+      wa_id TEXT,
+      direction TEXT NOT NULL,
+      msg_type TEXT,
       text TEXT,
       caption TEXT,
       tags JSONB NOT NULL DEFAULT '[]'::jsonb,
-
-      wa_message_id TEXT,                   -- WhatsApp message id
-      timestamp_wa TEXT,                    -- Meta timestamp string if provided
-
+      wa_message_id TEXT,
+      timestamp_wa TEXT,
       media_id TEXT,
       mime_type TEXT,
       local_original_url TEXT,
       local_thumb_url TEXT,
       local_file_path TEXT,
-
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ DEFAULT now()
     );
   `);
+
+  // ✅ Lightweight migration: add missing columns BEFORE creating indexes
+  await pool.query(`
+    DO $$
+    BEGIN
+      -- conversations
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='wa_id') THEN
+        ALTER TABLE conversations ADD COLUMN wa_id TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='profile_name') THEN
+        ALTER TABLE conversations ADD COLUMN profile_name TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='last_message_at') THEN
+        ALTER TABLE conversations ADD COLUMN last_message_at TIMESTAMPTZ;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='last_seen_incoming_at') THEN
+        ALTER TABLE conversations ADD COLUMN last_seen_incoming_at TIMESTAMPTZ;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='updated_at') THEN
+        ALTER TABLE conversations ADD COLUMN updated_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='created_at') THEN
+        ALTER TABLE conversations ADD COLUMN created_at TIMESTAMPTZ DEFAULT now();
+      END IF;
+
+      -- messages
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='wa_id') THEN
+        ALTER TABLE messages ADD COLUMN wa_id TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='caption') THEN
+        ALTER TABLE messages ADD COLUMN caption TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='tags') THEN
+        ALTER TABLE messages ADD COLUMN tags JSONB NOT NULL DEFAULT '[]'::jsonb;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='timestamp_wa') THEN
+        ALTER TABLE messages ADD COLUMN timestamp_wa TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='media_id') THEN
+        ALTER TABLE messages ADD COLUMN media_id TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='mime_type') THEN
+        ALTER TABLE messages ADD COLUMN mime_type TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='local_original_url') THEN
+        ALTER TABLE messages ADD COLUMN local_original_url TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='local_thumb_url') THEN
+        ALTER TABLE messages ADD COLUMN local_thumb_url TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='local_file_path') THEN
+        ALTER TABLE messages ADD COLUMN local_file_path TEXT;
+      END IF;
+    END $$;
+  `);
+
+  // ✅ Indexes (after columns exist)
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_id);`);
+
+  // ✅ Ensure uniqueness on conversations.wa_id
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'conversations_wa_id_key'
+      ) THEN
+        -- If unique already exists with a different name, this may no-op
+        BEGIN
+          ALTER TABLE conversations ADD CONSTRAINT conversations_wa_id_key UNIQUE (wa_id);
+        EXCEPTION WHEN duplicate_object THEN
+          -- ignore
+        END;
+      END IF;
+    END $$;
+  `);
+}
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);`);
@@ -556,7 +631,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "FAST_A_DB_COMPAT_2026-03-02_v1",
+    marker: "FAST_A_DB_COMPAT_2026-03-02_v1_PATCH_WAID_INDEX",
     node: process.version,
     has_DATABASE_URL: !!DATABASE_URL,
     db_ok: dbOk,
@@ -941,7 +1016,7 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1</div>
+        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH_WAID_INDEX</div>
       </div>
 
       <div class="controls">
@@ -1357,7 +1432,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: FAST_A_DB_COMPAT_2026-03-02_v1</div>
+    <div class="muted" style="margin-top:10px;">Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH_WAID_INDEX</div>
   </div>
 </body>
 </html>`;
@@ -1556,7 +1631,7 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: FAST_A_DB_COMPAT_2026-03-02_v1");
+    console.log("VERSION MARKER: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH_WAID_INDEX");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
