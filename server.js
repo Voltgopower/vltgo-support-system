@@ -273,9 +273,7 @@ async function dbInit() {
   `);
 }
 
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_id);`);
+  
 
   // lightweight "migration": add missing columns if old table exists with missing fields
   // (won't fail if already exists)
