@@ -1,40 +1,23 @@
 /**
- * WhatsApp Webhook Server (FAST A - DB COMPAT v1)
+ * WhatsApp Webhook Server (FAST A - DB + MEDIA + LIGHT UI) - 2026-03-02
  *
- * ✅ DB schema COMPAT (existing table):
- *   messages(
- *     id BIGSERIAL PRIMARY KEY,
- *     conversation_id TEXT NOT NULL,
- *     direction TEXT NOT NULL,
- *     msg_type TEXT,
- *     text TEXT,
- *     media_url TEXT,
- *     wa_message_id TEXT,
- *     created_at TIMESTAMPTZ DEFAULT NOW()
- *   )
+ * Key:
+ * - Postgres is the source of truth (messages won't disappear after redeploy)
+ * - wa_id stored as TEXT (no integer overflow)
+ * - Optional sharp for thumbs (won't crash if missing)
+ * - /__db_init endpoint creates/updates tables
  *
- * Features:
- * - Webhook receive (incoming) -> save to Postgres
- * - Download incoming media to disk (image/video/document/audio) and save local media_url
- * - Send message: text OR upload local file (image/video/document/audio)
- * - UI: light theme + chat bubbles
- * - Filters: unread only / last 24h / tag filter
- * - Unread tracking via logs/state/<wa_id>.json
- * - Version probe: /__version
- * - Media routes:
- *    - /media/original/:wa_id/:filename   (original file + strong cache)
- *    - /media/thumb/:wa_id/:filename      (webp thumbnail if sharp installed; else fallback original) + strong cache
- *
- * .env required:
+ * Required ENV:
  *   VERIFY_TOKEN=voltgo_webhook_verify
  *   WA_TOKEN=xxxxxxxxxxxxxxxx
  *   PHONE_NUMBER_ID=xxxxxxxxxxxxxxxx
  *   UI_USER=xxxxx
  *   UI_PASS=xxxxx
  *   DATABASE_URL=postgresql://...
- * optional:
+ *
+ * Optional:
  *   PORT=8080
- *   APP_SECRET=xxxxx
+ *   APP_SECRET=xxxxx  (Meta webhook signature verify)
  */
 
 require("dotenv").config();
@@ -49,21 +32,12 @@ const { Pool } = require("pg");
 // -------- Optional sharp (do NOT crash if missing) --------
 let sharp = null;
 try {
+  // eslint-disable-next-line global-require
   sharp = require("sharp");
   console.log("✅ sharp enabled: thumbnails will be generated");
 } catch (e) {
   console.log("⚠️ sharp not installed: /media/thumb will fallback to original");
 }
-
-const app = express();
-
-// ========= RAW BODY SAVER (signature verify) =========
-function rawBodySaver(req, res, buf) {
-  req.rawBody = buf;
-}
-
-app.use(express.json({ verify: rawBodySaver }));
-app.use(express.urlencoded({ extended: false }));
 
 // ========= ENV =========
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
@@ -82,28 +56,51 @@ if (!VERIFY_TOKEN) {
   console.error("Missing .env variable: VERIFY_TOKEN");
   process.exit(1);
 }
-if (!WA_TOKEN) console.warn("⚠️ WA_TOKEN missing: webhook media download/send will fail");
-if (!PHONE_NUMBER_ID) console.warn("⚠️ PHONE_NUMBER_ID missing: send will fail");
-if (!DATABASE_URL) console.warn("⚠️ DATABASE_URL missing: DB write/read will fail");
+if (!WA_TOKEN) {
+  console.error("Missing .env variable: WA_TOKEN");
+  process.exit(1);
+}
+if (!PHONE_NUMBER_ID) {
+  console.error("Missing .env variable: PHONE_NUMBER_ID");
+  process.exit(1);
+}
+if (!DATABASE_URL) {
+  console.error("Missing .env variable: DATABASE_URL");
+  process.exit(1);
+}
 
-// ========= Basic Auth (protect UI + send + APIs + media) =========
+// ========= Express =========
+const app = express();
+
+/** Save raw body for signature verification */
+function rawBodySaver(req, res, buf) {
+  req.rawBody = buf;
+}
+
+// IMPORTANT: JSON must be before routes (keep raw body for signature check)
+app.use(express.json({ verify: rawBodySaver }));
+app.use(express.urlencoded({ extended: false }));
+
+// ========= Basic Auth =========
 function unauthorized(res) {
   res.set("WWW-Authenticate", 'Basic realm="WhatsApp CS"');
   return res.status(401).send("Authentication required");
 }
 
 function basicAuth(req, res, next) {
-  // allow webhook endpoints without auth (Meta calls)
+  // allow Meta calls
   if (req.path === "/webhook") return next();
 
-  // allow health/version probes without auth
+  // allow probes
   if (req.path === "/" || req.path === "/__version") return next();
 
-  // protect these routes
+  // protect these prefixes
   const protectedPrefixes = ["/ui", "/customers", "/send", "/media", "/__db_init"];
   if (!protectedPrefixes.some((p) => req.path.startsWith(p))) return next();
 
-  if (!UI_USER || !UI_PASS) return res.status(500).send("UI auth not configured on server");
+  if (!UI_USER || !UI_PASS) {
+    return res.status(500).send("UI auth not configured on server");
+  }
 
   const header = req.headers.authorization || "";
   if (!header.startsWith("Basic ")) return unauthorized(res);
@@ -121,15 +118,14 @@ function basicAuth(req, res, next) {
 }
 app.use(basicAuth);
 
-// ========= Local dirs (state/media/uploads) =========
-const baseLogsDir = path.join(__dirname, "logs");
-const stateDir = path.join(baseLogsDir, "state");
-const mediaDir = path.join(baseLogsDir, "media");
+// ========= Local dirs (ephemeral on Railway without volume) =========
+const baseDir = __dirname;
+const logsDir = path.join(baseDir, "logs");
+const mediaDir = path.join(logsDir, "media");
 const thumbsDir = path.join(mediaDir, "__thumbs");
-const uploadsDir = path.join(baseLogsDir, "uploads");
+const uploadsDir = path.join(logsDir, "uploads");
 
-ensureDir(baseLogsDir);
-ensureDir(stateDir);
+ensureDir(logsDir);
 ensureDir(mediaDir);
 ensureDir(thumbsDir);
 ensureDir(uploadsDir);
@@ -151,6 +147,175 @@ const upload = multer({
   },
 });
 
+// ========= DB =========
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL.includes("rlwy") || DATABASE_URL.includes("railway")
+    ? { rejectUnauthorized: false }
+    : undefined,
+});
+
+async function dbPing() {
+  const r = await pool.query("SELECT 1 AS ok");
+  return r.rows?.[0]?.ok === 1;
+}
+
+async function dbInit() {
+  // Create tables (TEXT wa_id!)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id BIGSERIAL PRIMARY KEY,
+      wa_id TEXT UNIQUE NOT NULL,
+      profile_name TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_message_at TIMESTAMPTZ,
+      last_seen_incoming_at TIMESTAMPTZ
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id BIGSERIAL PRIMARY KEY,
+      conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      wa_id TEXT NOT NULL,
+      direction TEXT NOT NULL,              -- incoming/outgoing
+      msg_type TEXT,                        -- text/image/video/audio/document
+      text TEXT,
+      caption TEXT,
+      tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+
+      wa_message_id TEXT,                   -- WhatsApp message id
+      timestamp_wa TEXT,                    -- Meta timestamp string if provided
+
+      media_id TEXT,
+      mime_type TEXT,
+      local_original_url TEXT,
+      local_thumb_url TEXT,
+      local_file_path TEXT,
+
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_id);`);
+
+  // lightweight "migration": add missing columns if old table exists with missing fields
+  // (won't fail if already exists)
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='wa_id') THEN
+        ALTER TABLE messages ADD COLUMN wa_id TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='tags') THEN
+        ALTER TABLE messages ADD COLUMN tags JSONB NOT NULL DEFAULT '[]'::jsonb;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='local_thumb_url') THEN
+        ALTER TABLE messages ADD COLUMN local_thumb_url TEXT;
+      END IF;
+    END $$;
+  `);
+}
+
+async function getOrCreateConversation(waId, profileName) {
+  const wa_id = String(waId || "").trim();
+  if (!wa_id) throw new Error("Missing wa_id");
+
+  // Upsert conversation
+  const r = await pool.query(
+    `
+    INSERT INTO conversations (wa_id, profile_name, updated_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (wa_id)
+    DO UPDATE SET
+      profile_name = COALESCE(EXCLUDED.profile_name, conversations.profile_name),
+      updated_at = NOW()
+    RETURNING id, wa_id, profile_name, last_seen_incoming_at;
+    `,
+    [wa_id, profileName || null]
+  );
+  return r.rows[0];
+}
+
+async function insertMessage(row) {
+  const {
+    conversation_id,
+    wa_id,
+    direction,
+    msg_type,
+    text,
+    caption,
+    tags,
+    wa_message_id,
+    timestamp_wa,
+    media_id,
+    mime_type,
+    local_original_url,
+    local_thumb_url,
+    local_file_path,
+  } = row;
+
+  await pool.query(
+    `
+    INSERT INTO messages
+    (conversation_id, wa_id, direction, msg_type, text, caption, tags, wa_message_id, timestamp_wa, media_id, mime_type, local_original_url, local_thumb_url, local_file_path)
+    VALUES
+    ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11,$12,$13,$14)
+    `,
+    [
+      conversation_id,
+      String(wa_id),
+      direction,
+      msg_type || null,
+      text || null,
+      caption || null,
+      JSON.stringify(Array.isArray(tags) ? tags : []),
+      wa_message_id || null,
+      timestamp_wa || null,
+      media_id || null,
+      mime_type || null,
+      local_original_url || null,
+      local_thumb_url || null,
+      local_file_path || null,
+    ]
+  );
+
+  // maintain last_message_at
+  await pool.query(
+    `UPDATE conversations SET last_message_at = NOW(), updated_at = NOW() WHERE id = $1`,
+    [conversation_id]
+  );
+}
+
+async function countUnread(conversationId) {
+  const r = await pool.query(
+    `
+    SELECT COUNT(*)::int AS n
+    FROM messages m
+    JOIN conversations c ON c.id = m.conversation_id
+    WHERE m.conversation_id = $1
+      AND m.direction = 'incoming'
+      AND (c.last_seen_incoming_at IS NULL OR m.created_at > c.last_seen_incoming_at)
+    `,
+    [conversationId]
+  );
+  return r.rows?.[0]?.n || 0;
+}
+
+async function markConversationSeen(waId) {
+  await pool.query(
+    `
+    UPDATE conversations
+    SET last_seen_incoming_at = NOW(), updated_at = NOW()
+    WHERE wa_id = $1
+    `,
+    [String(waId)]
+  );
+}
+
 // ========= Helpers =========
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -163,6 +328,12 @@ function safeFileName(name) {
     .trim();
 }
 
+function setNoCache(res) {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+}
+
 function escapeHtml(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
@@ -172,25 +343,22 @@ function escapeHtml(s) {
     .replace(/'/g, "&#039;");
 }
 
-function isoToMs(iso) {
-  const t = Date.parse(iso || "");
-  return Number.isFinite(t) ? t : 0;
-}
-function withinLastHours(iso, hours) {
-  const ms = isoToMs(iso);
-  if (!ms) return false;
-  return Date.now() - ms <= hours * 3600 * 1000;
-}
 function fmtTime(iso) {
   if (!iso) return "";
   const d = new Date(iso);
   if (isNaN(d.getTime())) return escapeHtml(iso);
   return d.toLocaleString();
 }
-function setNoCache(res) {
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
+
+function isoToMs(iso) {
+  const t = Date.parse(iso || "");
+  return Number.isFinite(t) ? t : 0;
+}
+
+function withinLastHours(iso, hours) {
+  const ms = isoToMs(iso);
+  if (!ms) return false;
+  return Date.now() - ms <= hours * 3600 * 1000;
 }
 
 function buildQueryLink(basePath, current, patch) {
@@ -204,7 +372,6 @@ function buildQueryLink(basePath, current, patch) {
   return u.pathname + (u.search ? `?${u.search}` : "");
 }
 
-// ========= Optional: verify Meta webhook signature =========
 function isValidSignature(req) {
   if (!APP_SECRET) return true;
   const sig = req.get("x-hub-signature-256");
@@ -228,42 +395,11 @@ function getTags(text) {
   const t = (text || "").toLowerCase();
   const tags = [];
 
-  if (/(track|tracking|deliver|delivery|ups|fedex|dhl|usps|shipment|物流|派送|签收|运单|快递)/i.test(t)) {
-    tags.push("logistics");
-  }
-  if (/(warranty|broken|issue|problem|fault|defect|return|replace|refund|not work|doesn't work|坏|故障|问题|退货|换货|退款)/i.test(t)) {
-    tags.push("after_sales");
-  }
-  if (/(price|quote|quotation|invoice|pay|payment|discount|availability|lead time|报价|价格|发票|付款|折扣|有货|交期)/i.test(t)) {
-    tags.push("pre_sales");
-  }
-  return tags;
-}
+  if (/(track|tracking|deliver|delivery|ups|fedex|dhl|usps|shipment|物流|派送|签收|运单|快递)/i.test(t)) tags.push("logistics");
+  if (/(warranty|broken|issue|problem|fault|defect|return|replace|refund|not work|doesn't work|坏|故障|问题|退货|换货|退款)/i.test(t)) tags.push("after_sales");
+  if (/(price|quote|quotation|invoice|pay|payment|discount|availability|lead time|报价|价格|发票|付款|折扣|有货|交期)/i.test(t)) tags.push("pre_sales");
 
-// ========= Unread State =========
-// logs/state/<wa_id>.json => { last_seen_incoming_at: "ISO" }
-function statePath(waId) {
-  return path.join(stateDir, `${safeFileName(waId)}.json`);
-}
-function readState(waId) {
-  try {
-    const p = statePath(waId);
-    if (!fs.existsSync(p)) return { last_seen_incoming_at: null };
-    const raw = fs.readFileSync(p, "utf8");
-    const obj = JSON.parse(raw);
-    return { last_seen_incoming_at: obj?.last_seen_incoming_at || null };
-  } catch (_) {
-    return { last_seen_incoming_at: null };
-  }
-}
-function writeState(waId, patch) {
-  try {
-    const cur = readState(waId);
-    const next = { ...cur, ...patch };
-    fs.writeFileSync(statePath(waId), JSON.stringify(next, null, 2), "utf8");
-  } catch (e) {
-    console.error("❌ writeState error:", e);
-  }
+  return tags;
 }
 
 // ========= Media helpers =========
@@ -281,6 +417,7 @@ function extFromMime(mime) {
   if (m.includes("application/pdf")) return "pdf";
   return "bin";
 }
+
 function guessMimeByExt(filename) {
   const f = (filename || "").toLowerCase();
   if (f.endsWith(".jpg") || f.endsWith(".jpeg")) return "image/jpeg";
@@ -295,6 +432,7 @@ function guessMimeByExt(filename) {
   if (f.endsWith(".pdf")) return "application/pdf";
   return "application/octet-stream";
 }
+
 function classifyMediaType(mimeType) {
   const m = (mimeType || "").toLowerCase();
   if (m.startsWith("image/")) return "image";
@@ -308,32 +446,33 @@ function mediaLocalDirForWaId(waId) {
   ensureDir(dir);
   return dir;
 }
+
 function mediaOriginalPath(waId, filename) {
   return `/media/original/${encodeURIComponent(waId)}/${encodeURIComponent(filename)}`;
 }
+
 function mediaThumbPath(waId, filename) {
   return `/media/thumb/${encodeURIComponent(waId)}/${encodeURIComponent(filename)}`;
 }
 
-async function ensureImageThumb(srcPath, thumbPath) {
+async function ensureImageThumb(srcPath, thumbAbs) {
   if (!sharp) return false;
-  if (fs.existsSync(thumbPath)) return true;
-  ensureDir(path.dirname(thumbPath));
+  if (fs.existsSync(thumbAbs)) return true;
+  ensureDir(path.dirname(thumbAbs));
 
   await sharp(srcPath)
     .resize({ width: 520, height: 520, fit: "inside", withoutEnlargement: true })
     .webp({ quality: 78 })
-    .toFile(thumbPath);
+    .toFile(thumbAbs);
 
   return true;
 }
 
-// ========= WhatsApp Graph helpers =========
+// download incoming media by media_id -> save to logs/media/<wa_id>/<media_id>.<ext>
 async function downloadIncomingMedia(waId, mediaId) {
-  if (!WA_TOKEN) throw new Error("Missing WA_TOKEN");
   if (!mediaId) return null;
 
-  // 1) media meta
+  // 1) get media URL + mime
   const metaResp = await fetch(`https://graph.facebook.com/v25.0/${mediaId}`, {
     headers: { Authorization: `Bearer ${WA_TOKEN}` },
   });
@@ -344,7 +483,7 @@ async function downloadIncomingMedia(waId, mediaId) {
   const mime = meta?.mime_type || null;
   if (!url) throw new Error("Media meta missing url");
 
-  // 2) download binary
+  // 2) download bytes
   const binResp = await fetch(url, { headers: { Authorization: `Bearer ${WA_TOKEN}` } });
   if (!binResp.ok) {
     const t = await binResp.text().catch(() => "");
@@ -359,19 +498,31 @@ async function downloadIncomingMedia(waId, mediaId) {
 
   if (!fs.existsSync(abs)) fs.writeFileSync(abs, buf);
 
+  // thumb
+  let thumbUrl = null;
+  if (sharp && (mime || "").toLowerCase().startsWith("image/")) {
+    const stem = fileName.replace(/\.[^.]+$/, "");
+    const thumbAbs = path.join(thumbsDir, safeFileName(waId), `${stem}.webp`);
+    try {
+      await ensureImageThumb(abs, thumbAbs);
+      thumbUrl = mediaThumbPath(waId, fileName);
+    } catch (e) {
+      // fallback to original
+      thumbUrl = null;
+    }
+  }
+
   return {
-    filename: fileName,
-    abs,
+    media_id: mediaId,
     mime_type: mime,
-    original_url: mediaOriginalPath(waId, fileName),
-    thumb_url: mediaThumbPath(waId, fileName),
+    local_file: abs,
+    local_original_url: mediaOriginalPath(waId, fileName),
+    local_thumb_url: thumbUrl,
   };
 }
 
+// upload outgoing media file -> return media id
 async function uploadMediaToWhatsApp(filePath, mimeType) {
-  if (!WA_TOKEN) throw new Error("Missing WA_TOKEN");
-  if (!PHONE_NUMBER_ID) throw new Error("Missing PHONE_NUMBER_ID");
-
   const buf = fs.readFileSync(filePath);
   const name = path.basename(filePath);
 
@@ -385,113 +536,45 @@ async function uploadMediaToWhatsApp(filePath, mimeType) {
     headers: { Authorization: `Bearer ${WA_TOKEN}` },
     body: form,
   });
+
   const data = await r.json();
   if (!r.ok) throw new Error(`Upload media failed: ${JSON.stringify(data)}`);
   return data?.id || null;
 }
 
-// ========= DB =========
-const pool = DATABASE_URL
-  ? new Pool({
-      connectionString: DATABASE_URL,
-      ssl: { rejectUnauthorized: false }, // Railway 常见需要
-    })
-  : null;
-
-async function dbInit() {
-  if (!pool) return;
-  await pool.query(`SELECT 1;`);
-
-  // ✅ create table with the EXISTING schema (conversation_id/msg_type/media_url/wa_message_id)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id BIGSERIAL PRIMARY KEY,
-      conversation_id TEXT NOT NULL,
-      direction TEXT NOT NULL,
-      msg_type TEXT,
-      text TEXT,
-      media_url TEXT,
-      wa_message_id TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-  `);
-}
-
-async function insertMessage({
-  conversation_id,
-  direction,
-  msg_type,
-  text,
-  media_url,
-  wa_message_id,
-  created_at_iso,
-}) {
-  if (!pool) return;
-  await pool.query(
-    `
-    INSERT INTO messages (conversation_id, direction, msg_type, text, media_url, wa_message_id, created_at)
-    VALUES ($1,$2,$3,$4,$5,$6, COALESCE($7::timestamptz, NOW()))
-    `,
-    [
-      conversation_id,
-      direction,
-      msg_type || null,
-      text || null,
-      media_url || null,
-      wa_message_id || null,
-      created_at_iso || null,
-    ]
-  );
-}
-
-// ========= Health + Version =========
+// ========= Probes =========
 app.get("/", (req, res) => res.status(200).send("OK"));
 
-app.get("/__version", (req, res) => {
+app.get("/__version", async (req, res) => {
+  let dbOk = false;
+  try {
+    dbOk = await dbPing();
+  } catch (_) {
+    dbOk = false;
+  }
+
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
     marker: "FAST_A_DB_COMPAT_2026-03-02_v1",
     node: process.version,
     has_DATABASE_URL: !!DATABASE_URL,
+    db_ok: dbOk,
     sharp: !!sharp,
   });
 });
 
-// Optional DB init endpoint (protected by basic auth)
+// ========= DB init endpoint =========
 app.get("/__db_init", async (req, res) => {
   try {
     await dbInit();
-app.get("/__db_migrate", async (req, res) => {
-  try {
-    // 1) 先移除外键（不然无法改类型）
-    await pool.query(`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_conversation_id_fkey;`);
-
-    // 2) 再把 conversation_id 改为 TEXT（保留原数据）
-    await pool.query(`
-      ALTER TABLE messages
-      ALTER COLUMN conversation_id TYPE TEXT
-      USING conversation_id::text;
-    `);
     return res.json({ ok: true, ts: new Date().toISOString(), marker: "DB_INIT_OK" });
   } catch (e) {
     console.error("❌ __db_init error:", e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
   }
 });
-app.get("/__db_migrate", async (req, res) => {
-  try {
-    await pool.query(`
-      ALTER TABLE messages
-      ALTER COLUMN conversation_id TYPE TEXT
-      USING conversation_id::text;
-    `);
-    res.json({ ok: true, message: "conversation_id migrated to TEXT" });
-  } catch (e) {
-    console.error("Migration error:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
+
 // ========= Webhook verify =========
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -506,7 +589,7 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// ========= Webhook receive (incoming) =========
+// ========= Webhook receive =========
 app.post("/webhook", (req, res) => {
   res.sendStatus(200);
 
@@ -528,78 +611,95 @@ app.post("/webhook", (req, res) => {
       const msg = value.messages[0];
       const contact = value.contacts?.[0];
 
-      const waId = contact?.wa_id || msg.from || null;
+      const waId = String(contact?.wa_id || msg.from || "").trim();
+      const profileName = contact?.profile?.name || null;
+
       const type = msg.type || "unknown";
 
       let text = null;
       let caption = null;
-      let mediaId = null;
-      let mimeType = null;
+      let media_id = null;
+      let mime_type = null;
+      let local_original_url = null;
+      let local_thumb_url = null;
+      let local_file_path = null;
 
       if (type === "text") {
         text = msg.text?.body ?? null;
       } else if (type === "image") {
-        mediaId = msg.image?.id || null;
-        mimeType = msg.image?.mime_type || null;
+        media_id = msg.image?.id || null;
+        mime_type = msg.image?.mime_type || null;
         caption = msg.image?.caption || null;
       } else if (type === "video") {
-        mediaId = msg.video?.id || null;
-        mimeType = msg.video?.mime_type || null;
+        media_id = msg.video?.id || null;
+        mime_type = msg.video?.mime_type || null;
         caption = msg.video?.caption || null;
       } else if (type === "document") {
-        mediaId = msg.document?.id || null;
-        mimeType = msg.document?.mime_type || null;
+        media_id = msg.document?.id || null;
+        mime_type = msg.document?.mime_type || null;
         caption = msg.document?.caption || msg.document?.filename || null;
       } else if (type === "audio") {
-        mediaId = msg.audio?.id || null;
-        mimeType = msg.audio?.mime_type || null;
+        media_id = msg.audio?.id || null;
+        mime_type = msg.audio?.mime_type || null;
       }
 
-      let media_url = null;
-
-      // download media to disk if exists
-      if (mediaId && waId) {
+      // download media if present
+      if (media_id) {
         try {
-          const dl = await downloadIncomingMedia(waId, mediaId);
-          media_url = dl?.original_url || null;
-          mimeType = dl?.mime_type || mimeType;
+          const dl = await downloadIncomingMedia(waId, media_id);
+          local_original_url = dl?.local_original_url || null;
+          local_thumb_url = dl?.local_thumb_url || null;
+          local_file_path = dl?.local_file || null;
+          mime_type = dl?.mime_type || mime_type;
         } catch (e) {
           console.error("❌ download media failed:", e?.message || e);
         }
       }
 
-      const displayText = text || caption || null;
+      const tags = getTags(text || caption || "");
 
-      // ✅ DB insert using EXISTING schema fields
+      // DB write
+      const conv = await getOrCreateConversation(waId, profileName);
+
       await insertMessage({
-        conversation_id: waId || msg.from,
+        conversation_id: conv.id,
+        wa_id: waId,
         direction: "incoming",
         msg_type: type,
-        text: displayText,
-        media_url,
+        text,
+        caption,
+        tags,
         wa_message_id: msg.id || null,
-        created_at_iso: new Date().toISOString(),
+        timestamp_wa: msg.timestamp || null,
+        media_id,
+        mime_type,
+        local_original_url,
+        local_thumb_url,
+        local_file_path,
       });
 
-      console.log("📝 Saved incoming:", type, waId, mediaId ? `media=${mediaId}` : "");
+      console.log(
+        "📝 Saved incoming:",
+        type,
+        waId,
+        text || caption || "",
+        media_id ? `media=${media_id}` : ""
+      );
     } catch (err) {
       console.error("❌ Webhook error:", err);
     }
   })();
 });
 
-// ========= Media routes (strong cache) =========
-
-// Original file: /media/original/:wa_id/:filename
+// ========= Media routes =========
+// Original: strong cache (file name is stable)
 app.get("/media/original/:wa_id/:filename", (req, res) => {
   try {
     const waId = safeFileName(req.params.wa_id);
     const filename = safeFileName(req.params.filename);
 
     const abs = path.join(mediaDir, waId, filename);
-    const root = path.join(mediaDir, waId);
-
-    if (!abs.startsWith(root)) return res.status(400).send("Bad path");
+    if (!abs.startsWith(path.join(mediaDir, waId))) return res.status(400).send("Bad path");
     if (!fs.existsSync(abs)) return res.status(404).send("Not found");
 
     res.setHeader("Content-Type", guessMimeByExt(filename));
@@ -611,22 +711,22 @@ app.get("/media/original/:wa_id/:filename", (req, res) => {
   }
 });
 
-// Thumb (webp): /media/thumb/:wa_id/:filename
-// - if sharp missing or non-image => fallback to original (302)
+// Thumb: webp + strong cache, fallback to original if sharp missing or not image
 app.get("/media/thumb/:wa_id/:filename", async (req, res) => {
   try {
     const waId = safeFileName(req.params.wa_id);
     const filename = safeFileName(req.params.filename);
 
     const src = path.join(mediaDir, waId, filename);
-    const root = path.join(mediaDir, waId);
-    if (!src.startsWith(root)) return res.status(400).send("Bad path");
+    if (!src.startsWith(path.join(mediaDir, waId))) return res.status(400).send("Bad path");
     if (!fs.existsSync(src)) return res.status(404).send("Not found");
 
     const mime = guessMimeByExt(filename);
-    if (!mime.startsWith("image/") || !sharp) {
-      // fallback to original
-      return res.redirect(302, mediaOriginalPath(waId, filename));
+    if (!sharp || !mime.startsWith("image/")) {
+      // fallback
+      res.setHeader("Content-Type", mime);
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      return res.sendFile(src);
     }
 
     const stem = filename.replace(/\.[^.]+$/, "");
@@ -642,192 +742,137 @@ app.get("/media/thumb/:wa_id/:filename", async (req, res) => {
   }
 });
 
-// ========= Customers API (DB-based) =========
-async function getConversationIds() {
-  if (!pool) return [];
-  const r = await pool.query(`
-    SELECT conversation_id, MAX(created_at) AS last_time
-    FROM messages
-    GROUP BY conversation_id
-    ORDER BY last_time DESC
-    LIMIT 500;
-  `);
-  return r.rows || [];
-}
-
-async function getLastNMessages(conversation_id, n = 400) {
-  if (!pool) return [];
-  const r = await pool.query(
-    `
-    SELECT id, conversation_id, direction, msg_type, text, media_url, wa_message_id, created_at
-    FROM messages
-    WHERE conversation_id = $1
-    ORDER BY created_at DESC
-    LIMIT $2
-    `,
-    [conversation_id, n]
-  );
-  // return newest->oldest; UI needs oldest->newest so reverse when rendering
-  return r.rows || [];
-}
-
+// ========= Customer APIs (DB) =========
 app.get("/customers", async (req, res) => {
   try {
-    if (!pool) return res.status(500).json({ error: "DATABASE_URL not set" });
-
-    const convs = await getConversationIds();
-    const out = [];
-
-    for (const c of convs) {
-      const waId = c.conversation_id;
-      const rows = await getLastNMessages(waId, 400);
-      if (!rows.length) continue;
-
-      const newest = rows[0];
-
-      // tag counts in last 400
-      const tagCounts = {};
-      let lastIncomingAt = null;
-
-      const st = readState(waId);
-      const lastSeenMs = isoToMs(st.last_seen_incoming_at);
-      let unreadCount = 0;
-
-      for (const r of rows) {
-        const tags = getTags(r.text || "");
-        for (const t of tags) tagCounts[t] = (tagCounts[t] || 0) + 1;
-
-        if (r.direction === "incoming") {
-          if (!lastIncomingAt || isoToMs(r.created_at) > isoToMs(lastIncomingAt)) lastIncomingAt = r.created_at;
-          const ms = isoToMs(r.created_at);
-          if (ms && ms > lastSeenMs) unreadCount++;
-        }
-      }
-
-      out.push({
-        wa_id: waId,
-        profile_name: null,
-        last_time: newest.created_at,
-        last_text: newest.text || null,
-        last_type: newest.msg_type || null,
-        last_direction: newest.direction || null,
-        tags: tagCounts,
-        unread_count: unreadCount,
-        last_incoming_at: lastIncomingAt,
-      });
-    }
-
-    res.json({ count: out.length, customers: out });
-  } catch (e) {
-    console.error("❌ /customers error:", e);
-    res.status(500).json({ error: "internal_error" });
-  }
-});
-
-app.get("/customers/:wa_id/messages", async (req, res) => {
-  try {
-    if (!pool) return res.status(500).json({ error: "DATABASE_URL not set" });
-
-    const waId = safeFileName(req.params.wa_id);
-    const limit = Math.min(parseInt(req.query.limit || "300", 10) || 300, 3000);
-
-    const rows = await pool.query(
-      `
-      SELECT id, conversation_id, direction, msg_type, text, media_url, wa_message_id, created_at
-      FROM messages
-      WHERE conversation_id = $1
-      ORDER BY created_at DESC
-      LIMIT $2
-      `,
-      [waId, limit]
-    );
-
-    res.json({ wa_id: waId, count: rows.rows.length, messages: rows.rows });
-  } catch (e) {
-    console.error("❌ /customers/:wa_id/messages error:", e);
-    res.status(500).json({ error: "internal_error" });
-  }
-});
-
-// ========= UI: Customers list (filters: q, unread, recent24, tag) =========
-app.get("/ui", async (req, res) => {
-  try {
-    setNoCache(res);
-    if (!pool) return res.status(500).send("DATABASE_URL not set");
-
     const q = (req.query.q || "").toString().trim().toLowerCase();
     const unreadOnly = (req.query.unread || "").toString() === "1";
     const recent24 = (req.query.recent24 || "").toString() === "1";
     const tag = (req.query.tag || "").toString().trim().toLowerCase();
 
-    const convs = await getConversationIds();
+    const r = await pool.query(`
+      SELECT id, wa_id, profile_name, last_message_at, last_seen_incoming_at
+      FROM conversations
+      ORDER BY COALESCE(last_message_at, updated_at) DESC
+      LIMIT 500
+    `);
 
-    const customers = [];
-    const allTagsSet = new Set();
+    const out = [];
+    for (const c of r.rows) {
+      // last message
+      const lastMsg = await pool.query(
+        `
+        SELECT msg_type, direction, text, caption, created_at, tags, local_original_url, local_thumb_url
+        FROM messages
+        WHERE conversation_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        `,
+        [c.id]
+      );
 
-    for (const c of convs) {
-      const waId = c.conversation_id;
+      const last = lastMsg.rows[0] || null;
 
-      const rows = await getLastNMessages(waId, 400);
-      if (!rows.length) continue;
-
-      const newest = rows[0];
-
-      // compute tags and unread
-      const tagCounts = {};
-      const st = readState(waId);
-      const lastSeenMs = isoToMs(st.last_seen_incoming_at);
-
-      let unreadCount = 0;
-      let lastIncomingAt = null;
-
-      for (const r of rows) {
-        const tags = getTags(r.text || "");
-        for (const t of tags) {
-          tagCounts[t] = (tagCounts[t] || 0) + 1;
-          allTagsSet.add(t);
-        }
-        if (r.direction === "incoming") {
-          const ms = isoToMs(r.created_at);
-          if (ms && ms > lastSeenMs) unreadCount++;
-          if (!lastIncomingAt || ms > isoToMs(lastIncomingAt)) lastIncomingAt = r.created_at;
-        }
-      }
-
-      const summary = {
-        wa_id: waId,
-        profile_name: null,
-        last_time: newest.created_at,
-        last_text: newest.text || null,
-        last_type: newest.msg_type || null,
-        last_direction: newest.direction || null,
-        tags: tagCounts,
-        unread_count: unreadCount,
-        last_incoming_at: lastIncomingAt,
-      };
+      // unread count
+      const unreadCount = await countUnread(c.id);
 
       // filters
-      if (unreadOnly && (summary.unread_count || 0) <= 0) continue;
-      if (recent24 && !withinLastHours(summary.last_time, 24)) continue;
+      if (unreadOnly && unreadCount <= 0) continue;
 
-      const hay = `${summary.wa_id} ${summary.last_text || ""}`.toLowerCase();
+      const lastTimeIso = c.last_message_at ? new Date(c.last_message_at).toISOString() : null;
+      if (recent24 && lastTimeIso && !withinLastHours(lastTimeIso, 24)) continue;
+
+      const lastText = (last?.text || last?.caption || "") + "";
+      const hay = `${c.wa_id} ${c.profile_name || ""} ${lastText}`.toLowerCase();
       if (q && !hay.includes(q)) continue;
 
       if (tag) {
-        const hasTag = (summary.tags && summary.tags[tag]) || 0;
+        const tagsArr = Array.isArray(last?.tags) ? last.tags : (last?.tags || []);
+        const hasTag =
+          Array.isArray(tagsArr) && tagsArr.map((x) => String(x).toLowerCase()).includes(tag);
         if (!hasTag) continue;
       }
 
-      customers.push(summary);
+      out.push({
+        wa_id: c.wa_id,
+        profile_name: c.profile_name,
+        last_time: last?.created_at ? new Date(last.created_at).toISOString() : lastTimeIso,
+        last_text: last?.text || last?.caption || null,
+        last_type: last?.msg_type || null,
+        last_direction: last?.direction || null,
+        unread_count: unreadCount,
+      });
     }
 
-    const allTags = Array.from(allTagsSet).sort();
-    const tagOptions = [
-      `<option value="">All</option>`,
-      ...allTags.map((t) => `<option value="${escapeHtml(t)}" ${t === tag ? "selected" : ""}>${escapeHtml(t)}</option>`),
-    ].join("");
+    return res.json({ count: out.length, customers: out });
+  } catch (e) {
+    console.error("❌ /customers error:", e);
+    return res.status(500).json({ error: "internal_error", detail: e?.message || String(e) });
+  }
+});
 
-    const rowsHtml = customers
+app.get("/customers/:wa_id/messages", async (req, res) => {
+  try {
+    const waId = String(req.params.wa_id || "").trim();
+    const limit = Math.min(parseInt(req.query.limit || "500", 10) || 500, 3000);
+
+    const convR = await pool.query(`SELECT id, wa_id FROM conversations WHERE wa_id = $1`, [waId]);
+    if (convR.rows.length === 0) return res.json({ wa_id: waId, count: 0, messages: [] });
+
+    const convId = convR.rows[0].id;
+
+    const r = await pool.query(
+      `
+      SELECT
+        id,
+        wa_id,
+        direction,
+        msg_type AS type,
+        text,
+        caption,
+        tags,
+        wa_message_id AS message_id,
+        timestamp_wa AS timestamp,
+        media_id,
+        mime_type,
+        local_original_url AS local_media_url,
+        local_thumb_url,
+        created_at
+      FROM messages
+      WHERE conversation_id = $1
+      ORDER BY created_at ASC
+      LIMIT $2
+      `,
+      [convId, limit]
+    );
+
+    return res.json({ wa_id: waId, count: r.rows.length, messages: r.rows });
+  } catch (e) {
+    console.error("❌ /customers/:wa_id/messages error:", e);
+    return res.status(500).json({ error: "internal_error", detail: e?.message || String(e) });
+  }
+});
+
+// ========= UI: Customers list =========
+app.get("/ui", async (req, res) => {
+  try {
+    setNoCache(res);
+
+    const q = (req.query.q || "").toString().trim().toLowerCase();
+    const unreadOnly = (req.query.unread || "").toString() === "1";
+    const recent24 = (req.query.recent24 || "").toString() === "1";
+
+    const data = await fetchCustomersForUi({ q, unreadOnly, recent24 });
+
+    const currentParams = {
+      q: q || "",
+      unread: unreadOnly ? "1" : "",
+      recent24: recent24 ? "1" : "",
+    };
+    const unreadLink = buildQueryLink("/ui", currentParams, { unread: unreadOnly ? "" : "1" });
+    const recentLink = buildQueryLink("/ui", currentParams, { recent24: recent24 ? "" : "1" });
+
+    const rowsHtml = data.customers
       .map((c) => {
         const unreadBadge =
           (c.unread_count || 0) > 0
@@ -838,48 +883,28 @@ app.get("/ui", async (req, res) => {
           ? `<span class="pill ${escapeHtml(c.last_direction)}">${escapeHtml(c.last_direction)}</span>`
           : "";
 
-        const tags = Object.entries(c.tags || {})
-          .map(([k, v]) => `<span class="tag">${escapeHtml(k)}:${v}</span>`)
-          .join(" ");
-
         const preview = escapeHtml(c.last_text || "");
-
         return `
           <tr>
-            <td class="mono">
-              <a href="/ui/customer/${encodeURIComponent(c.wa_id)}">${escapeHtml(c.wa_id)}</a>
-            </td>
+            <td class="mono"><a href="/ui/customer/${encodeURIComponent(c.wa_id)}">${escapeHtml(c.wa_id)}</a></td>
             <td>${escapeHtml(c.profile_name || "")}</td>
             <td>${escapeHtml(fmtTime(c.last_time))}</td>
             <td>${unreadBadge} ${lastDir} <span class="preview">${preview}</span></td>
-            <td>${tags}</td>
           </tr>
         `;
       })
       .join("");
 
-    const currentParams = {
-      q: q || "",
-      unread: unreadOnly ? "1" : "",
-      recent24: recent24 ? "1" : "",
-      tag: tag || "",
-    };
-
-    const unreadLink = buildQueryLink("/ui", currentParams, { unread: unreadOnly ? "" : "1" });
-    const recentLink = buildQueryLink("/ui", currentParams, { recent24: recent24 ? "" : "1" });
-    const clearLink = "/ui";
-
     const html = `<!doctype html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>WhatsApp CS - Customers</title>
   <style>
     :root{
       --bg:#f6f7fb; --card:#ffffff; --text:#111827; --muted:#6b7280; --line:#e5e7eb;
-      --blue:#2563eb; --blue2:#1d4ed8; --green:#10b981; --red:#ef4444;
-      --chip:#f3f4f6;
+      --blue:#2563eb; --blue2:#1d4ed8; --red:#ef4444; --chip:#f3f4f6;
     }
     *{box-sizing:border-box;}
     body{margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:var(--bg); color:var(--text);}
@@ -890,7 +915,7 @@ app.get("/ui", async (req, res) => {
     h2{margin:0; font-size:18px;}
     .muted{color:var(--muted); font-size:13px;}
     .controls{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
-    input, select{padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:var(--card); min-width:240px;}
+    input{padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:var(--card); min-width:280px;}
     button{padding:10px 14px; border:1px solid var(--line); border-radius:12px; background:var(--blue); color:white; cursor:pointer;}
     button:hover{background:var(--blue2);}
     .chip{display:inline-flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid var(--line); border-radius:999px; background:var(--chip);}
@@ -902,7 +927,6 @@ app.get("/ui", async (req, res) => {
     th{background:#f9fafb; color:var(--muted); font-size:12px; letter-spacing:.02em; position:sticky; top:0; z-index:1;}
     tr:hover td{background:#f9fafb;}
     .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;}
-    .tag{display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; margin-right:6px; font-size:12px; color:var(--muted); background:#fafafa;}
     .pill{display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; font-size:12px; margin-right:6px; background:#fafafa; color:var(--muted);}
     .pill.incoming{border-color:#bfdbfe; background:#eff6ff; color:#1d4ed8;}
     .pill.outgoing{border-color:#bbf7d0; background:#ecfdf5; color:#047857;}
@@ -917,7 +941,7 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB compat • Table: messages(conversation_id,msg_type,media_url,wa_message_id,created_at)</div>
+        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1</div>
       </div>
 
       <div class="controls">
@@ -927,12 +951,11 @@ app.get("/ui", async (req, res) => {
       </div>
 
       <form method="get" action="/ui" class="controls">
-        <input name="q" placeholder="Search conversation_id / last text" value="${escapeHtml(q)}" />
-        <select name="tag">${tagOptions}</select>
-        <input type="hidden" name="unread" value="${unreadOnly ? "1" : ""}" />
-        <input type="hidden" name="recent24" value="${recent24 ? "1" : ""}" />
+        <input name="q" placeholder="Search wa_id / name / last text" value="${escapeHtml(q)}"/>
+        <input type="hidden" name="unread" value="${unreadOnly ? "1" : ""}"/>
+        <input type="hidden" name="recent24" value="${recent24 ? "1" : ""}"/>
         <button type="submit">Apply</button>
-        <a class="muted" href="${clearLink}">Clear</a>
+        <a class="muted" href="/ui">Clear</a>
       </form>
     </div>
 
@@ -940,105 +963,157 @@ app.get("/ui", async (req, res) => {
       <table>
         <thead>
           <tr>
-            <th>conversation_id</th>
+            <th>wa_id</th>
             <th>Name</th>
             <th>Last time</th>
             <th>Last message</th>
-            <th>Tags (last 400)</th>
           </tr>
         </thead>
         <tbody>
-          ${rowsHtml || `<tr><td colspan="5" class="muted">No customers found.</td></tr>`}
+          ${rowsHtml || `<tr><td colspan="4" class="muted">No customers found.</td></tr>`}
         </tbody>
       </table>
     </div>
 
-    <div class="footerNote">Version: FAST_A_DB_COMPAT_2026-03-02_v1</div>
+    <div class="footerNote">Tips: open /__db_init once after deploy if needed.</div>
   </div>
 </body>
 </html>`;
 
-    res.status(200).send(html);
+    return res.status(200).send(html);
   } catch (e) {
     console.error("❌ /ui error:", e);
-    res.status(500).send("Internal error");
+    return res.status(500).send("Internal error");
   }
 });
+
+async function fetchCustomersForUi({ q, unreadOnly, recent24 }) {
+  const r = await pool.query(`
+    SELECT id, wa_id, profile_name, last_message_at, last_seen_incoming_at
+    FROM conversations
+    ORDER BY COALESCE(last_message_at, updated_at) DESC
+    LIMIT 500
+  `);
+
+  const customers = [];
+  for (const c of r.rows) {
+    const lastMsg = await pool.query(
+      `
+      SELECT msg_type, direction, text, caption, created_at
+      FROM messages
+      WHERE conversation_id = $1
+      ORDER BY created_at DESC
+      LIMIT 1
+      `,
+      [c.id]
+    );
+    const last = lastMsg.rows[0] || null;
+    const unreadCount = await countUnread(c.id);
+
+    if (unreadOnly && unreadCount <= 0) continue;
+
+    const lastTimeIso = last?.created_at ? new Date(last.created_at).toISOString() : null;
+    if (recent24 && lastTimeIso && !withinLastHours(lastTimeIso, 24)) continue;
+
+    const lastText = (last?.text || last?.caption || "") + "";
+    const hay = `${c.wa_id} ${c.profile_name || ""} ${lastText}`.toLowerCase();
+    if (q && !hay.includes(q)) continue;
+
+    customers.push({
+      wa_id: c.wa_id,
+      profile_name: c.profile_name,
+      last_time: lastTimeIso,
+      last_text: last?.text || last?.caption || null,
+      last_type: last?.msg_type || null,
+      last_direction: last?.direction || null,
+      unread_count: unreadCount,
+    });
+  }
+
+  return { customers };
+}
 
 // ========= UI: Customer chat =========
 app.get("/ui/customer/:wa_id", async (req, res) => {
   try {
     setNoCache(res);
-    if (!pool) return res.status(500).send("DATABASE_URL not set");
 
-    const waId = safeFileName(req.params.wa_id);
-
+    const waId = String(req.params.wa_id || "").trim();
     const q = (req.query.q || "").toString().trim().toLowerCase();
-    const limit = Math.min(parseInt(req.query.limit || "800", 10) || 800, 5000);
+    const limit = Math.min(parseInt(req.query.limit || "800", 10) || 800, 3000);
     const recent24 = (req.query.recent24 || "").toString() === "1";
-    const tag = (req.query.tag || "").toString().trim().toLowerCase();
     const unreadOnly = (req.query.unread || "").toString() === "1";
+    const tag = (req.query.tag || "").toString().trim().toLowerCase();
 
-    const r = await pool.query(
+    const convR = await pool.query(`SELECT id, wa_id, profile_name, last_seen_incoming_at FROM conversations WHERE wa_id = $1`, [waId]);
+    if (convR.rows.length === 0) return res.status(404).send("Conversation not found");
+
+    const conv = convR.rows[0];
+    const convId = conv.id;
+    const lastSeen = conv.last_seen_incoming_at ? new Date(conv.last_seen_incoming_at).toISOString() : null;
+    const lastSeenMs = isoToMs(lastSeen);
+
+    const msgsR = await pool.query(
       `
-      SELECT id, conversation_id, direction, msg_type, text, media_url, wa_message_id, created_at
+      SELECT
+        id,
+        direction,
+        msg_type AS type,
+        text,
+        caption,
+        tags,
+        local_original_url AS local_media_url,
+        local_thumb_url,
+        media_id,
+        mime_type,
+        created_at
       FROM messages
       WHERE conversation_id = $1
-      ORDER BY created_at DESC
+      ORDER BY created_at ASC
       LIMIT $2
       `,
-      [waId, limit]
+      [convId, limit]
     );
 
-    const newestToOldest = r.rows || [];
-    const rows = newestToOldest.slice().reverse(); // oldest -> newest for reading
+    const rows = msgsR.rows;
 
     // tag dropdown
     const tagsSet = new Set();
-    for (const row of newestToOldest) {
-      const tags = getTags(row.text || "");
-      for (const t of tags) tagsSet.add(t);
+    for (const r0 of rows) {
+      const arr = Array.isArray(r0.tags) ? r0.tags : [];
+      for (const t0 of arr) tagsSet.add(String(t0));
     }
     const allTags = Array.from(tagsSet).sort();
 
-    // unread state BEFORE marking read
-    const st = readState(waId);
-    const lastSeenMs = isoToMs(st.last_seen_incoming_at);
-
-    // filter
-    const filtered = rows.filter((row) => {
-      const txt = (row.text || "").toString();
-      const tagsStr = getTags(txt).join(",");
-      const hay = `${txt} ${tagsStr}`.toLowerCase();
+    // filters
+    const filtered = rows.filter((r0) => {
+      const text0 = (r0.text || "").toString();
+      const cap0 = (r0.caption || "").toString();
+      const tags0 = Array.isArray(r0.tags) ? r0.tags.join(",") : "";
+      const hay = `${text0} ${cap0} ${tags0}`.toLowerCase();
 
       if (q && !hay.includes(q)) return false;
-      if (recent24 && !withinLastHours(row.created_at, 24)) return false;
+
+      const timeIso = r0.created_at ? new Date(r0.created_at).toISOString() : null;
+      if (recent24 && timeIso && !withinLastHours(timeIso, 24)) return false;
 
       if (tag) {
-        const has = getTags(txt).map((x) => String(x).toLowerCase()).includes(tag);
+        const arr = Array.isArray(r0.tags) ? r0.tags : [];
+        const has = arr.map((x) => String(x).toLowerCase()).includes(tag);
         if (!has) return false;
       }
 
       if (unreadOnly) {
-        if (row.direction !== "incoming") return false;
-        const ms = isoToMs(row.created_at);
+        if (r0.direction !== "incoming") return false;
+        const ms = isoToMs(timeIso);
         if (!ms || ms <= lastSeenMs) return false;
       }
 
       return true;
     });
 
-    // mark as read when opening page (latest incoming)
-    let latestIncoming = null;
-    for (const row of newestToOldest) {
-      if (row.direction === "incoming" && row.created_at) {
-        latestIncoming = row.created_at;
-        break; // because newestToOldest
-      }
-    }
-    if (latestIncoming && isoToMs(latestIncoming) > lastSeenMs) {
-      writeState(waId, { last_seen_incoming_at: new Date(latestIncoming).toISOString() });
-    }
+    // mark seen when open page
+    await markConversationSeen(waId);
 
     const sentFlag = (req.query.sent || "").toString();
     const errMsg = (req.query.err || "").toString();
@@ -1048,77 +1123,83 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       ? `<div class="alert ok">✅ Sent</div>`
       : "";
 
-    function renderMsgContent(row) {
-      const type = row.msg_type || "";
-      const text = row.text || "";
-      const originalUrl = row.media_url || null;
-      const thumbUrl = originalUrl ? mediaThumbPath(waId, path.basename(originalUrl)) : null; // only works if media_url is our /media/original/... path
+    function renderMsgContent(r0) {
+      const type0 = r0.type || "";
+      const text0 = r0.text || "";
+      const caption0 = r0.caption || "";
+      const originalUrl = r0.local_media_url || null;
+      const thumbUrl = r0.local_thumb_url || null;
 
-      if (type === "text" || !originalUrl) {
-        return `<div class="text">${escapeHtml(text || (type ? `[${type}]` : ""))}</div>`;
+      if (type0 === "text") {
+        return `<div class="text">${escapeHtml(text0)}</div>`;
       }
 
-      // Prefer thumb for images
-      if (type === "image") {
-        const imgSrc = thumbUrl || originalUrl;
+      if (originalUrl) {
+        if (type0 === "image") {
+          const imgSrc = thumbUrl || originalUrl;
+          return `
+            ${caption0 ? `<div class="text">${escapeHtml(caption0)}</div>` : ""}
+            <div class="media">
+              <a href="${originalUrl}" target="_blank" rel="noreferrer">
+                <img src="${imgSrc}" alt="image"/>
+              </a>
+              <div class="mediaActions">
+                <a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a>
+              </div>
+            </div>
+          `;
+        }
+        if (type0 === "video") {
+          return `
+            ${caption0 ? `<div class="text">${escapeHtml(caption0)}</div>` : ""}
+            <div class="media">
+              <video controls src="${originalUrl}" style="max-width:100%; border-radius:12px;"></video>
+              <div class="mediaActions"><a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
+            </div>
+          `;
+        }
+        if (type0 === "audio") {
+          return `
+            <div class="media">
+              <audio controls src="${originalUrl}" style="width:100%;"></audio>
+              <div class="mediaActions"><a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
+            </div>
+          `;
+        }
+        // document
         return `
-          ${text ? `<div class="text">${escapeHtml(text)}</div>` : ""}
+          <div class="text">${escapeHtml(caption0 || "Document")}</div>
           <div class="media">
-            <a href="${originalUrl}" target="_blank" rel="noreferrer">
-              <img src="${imgSrc}" alt="image" />
-            </a>
-            <div class="mediaActions">
-              <a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a>
+            <div class="fileBox">
+              <div class="fileMeta">
+                <div><b>${escapeHtml(type0)}</b></div>
+                <div class="mutedSmall mono">${escapeHtml(r0.mime_type || "")}</div>
+              </div>
+              <a class="btnLink" href="${originalUrl}" target="_blank" rel="noreferrer">Download</a>
             </div>
           </div>
         `;
       }
 
-      if (type === "video") {
-        return `
-          ${text ? `<div class="text">${escapeHtml(text)}</div>` : ""}
-          <div class="media">
-            <video controls src="${originalUrl}" style="max-width:100%; border-radius:12px;"></video>
-            <div class="mediaActions"><a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
-          </div>
-        `;
-      }
-
-      if (type === "audio") {
-        return `
-          ${text ? `<div class="text">${escapeHtml(text)}</div>` : ""}
-          <div class="media">
-            <audio controls src="${originalUrl}" style="width:100%;"></audio>
-            <div class="mediaActions"><a href="${originalUrl}" target="_blank" rel="noreferrer">Open / Download</a></div>
-          </div>
-        `;
-      }
-
-      // document/others
+      // no local file
       return `
-        ${text ? `<div class="text">${escapeHtml(text)}</div>` : ""}
-        <div class="media">
-          <div class="fileBox">
-            <div class="fileMeta">
-              <div><b>${escapeHtml(type || "document")}</b></div>
-              <div class="mutedSmall mono">${escapeHtml(originalUrl)}</div>
-            </div>
-            <a class="btnLink" href="${originalUrl}" target="_blank" rel="noreferrer">Download</a>
-          </div>
-        </div>
+        <div class="text">${escapeHtml(caption0 || text0 || `[${type0}]`)}</div>
+        ${r0.media_id ? `<div class="mutedSmall mono">media_id=${escapeHtml(r0.media_id)}</div>` : ""}
       `;
     }
 
     const bubbles = filtered
-      .map((row) => {
-        const isOut = row.direction === "outgoing";
-        const time = fmtTime(row.created_at);
+      .map((r0) => {
+        const isOut = r0.direction === "outgoing";
+        const timeIso = r0.created_at ? new Date(r0.created_at).toISOString() : "";
+        const time = fmtTime(timeIso);
 
-        const tags = getTags(row.text || "").map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join(" ");
+        const tagsArr = Array.isArray(r0.tags) ? r0.tags : [];
+        const tagsHtml = tagsArr.map((t0) => `<span class="tag">${escapeHtml(t0)}</span>`).join(" ");
 
         let unreadMark = "";
-        if (row.direction === "incoming") {
-          const ms = isoToMs(row.created_at);
+        if (r0.direction === "incoming") {
+          const ms = isoToMs(timeIso);
           if (ms && ms > lastSeenMs) unreadMark = `<span class="dot" title="unread"></span>`;
         }
 
@@ -1128,10 +1209,10 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
               <div class="meta">
                 ${unreadMark}
                 <span class="time">${escapeHtml(time)}</span>
-                <span class="type">${escapeHtml(row.msg_type || "")}</span>
-                ${tags ? `<span class="tags">${tags}</span>` : ""}
+                <span class="type">${escapeHtml(r0.type || "")}</span>
+                ${tagsHtml ? `<span class="tags">${tagsHtml}</span>` : ""}
               </div>
-              ${renderMsgContent(row)}
+              ${renderMsgContent(r0)}
             </div>
           </div>
         `;
@@ -1145,28 +1226,26 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       unread: unreadOnly ? "1" : "",
       limit: String(limit),
     };
-
     const toggleUnreadLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, { unread: unreadOnly ? "" : "1" });
     const toggleRecentLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, { recent24: recent24 ? "" : "1" });
     const clearLink = `/ui/customer/${encodeURIComponent(waId)}`;
 
     const tagOptions = [
       `<option value="">All</option>`,
-      ...allTags.map((t) => `<option value="${escapeHtml(t)}" ${t === tag ? "selected" : ""}>${escapeHtml(t)}</option>`),
+      ...allTags.map((t0) => `<option value="${escapeHtml(t0)}" ${t0.toLowerCase() === tag ? "selected" : ""}>${escapeHtml(t0)}</option>`),
     ].join("");
 
     const html = `<!doctype html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>WhatsApp CS - ${escapeHtml(waId)}</title>
   <style>
     :root{
       --bg:#f6f7fb; --card:#ffffff; --text:#111827; --muted:#6b7280; --line:#e5e7eb;
       --in:#ffffff; --out:#ecfdf5;
-      --blue:#2563eb; --blue2:#1d4ed8; --red:#ef4444;
-      --chip:#f3f4f6;
+      --blue:#2563eb; --blue2:#1d4ed8; --red:#ef4444; --chip:#f3f4f6;
     }
     *{box-sizing:border-box;}
     body{margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:var(--bg); color:var(--text);}
@@ -1209,7 +1288,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
     .alert.ok{border-color:#bbf7d0; background:#ecfdf5; color:#065f46;}
     .alert.err{border-color:#fecaca; background:#fef2f2; color:#991b1b;}
 
-    .reply{margin-top:14px; padding:14px;}
+    .reply{padding:14px; border-top:1px solid var(--line);}
     .replyTop{display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:10px;}
     .row2{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
     .fileHint{font-size:12px; color:var(--muted);}
@@ -1236,11 +1315,11 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
 
       <form method="get" action="/ui/customer/${encodeURIComponent(waId)}" class="controls">
-        <input name="q" placeholder="Search text / tags" value="${escapeHtml(q)}" />
+        <input name="q" placeholder="Search text / tags" value="${escapeHtml(q)}"/>
         <select name="tag">${tagOptions}</select>
-        <input name="limit" type="hidden" value="${escapeHtml(String(limit))}" />
-        <input name="recent24" type="hidden" value="${recent24 ? "1" : ""}" />
-        <input name="unread" type="hidden" value="${unreadOnly ? "1" : ""}" />
+        <input name="limit" type="hidden" value="${escapeHtml(String(limit))}"/>
+        <input name="recent24" type="hidden" value="${recent24 ? "1" : ""}"/>
+        <input name="unread" type="hidden" value="${unreadOnly ? "1" : ""}"/>
         <button type="submit">Apply</button>
         <a class="muted" href="${clearLink}">Clear</a>
       </form>
@@ -1260,14 +1339,14 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
         </div>
 
         <form method="post" action="/send" enctype="multipart/form-data">
-          <input type="hidden" name="to" value="${escapeHtml(waId)}" />
-          <input type="hidden" name="redirect" value="/ui/customer/${encodeURIComponent(waId)}" />
+          <input type="hidden" name="to" value="${escapeHtml(waId)}"/>
+          <input type="hidden" name="redirect" value="/ui/customer/${encodeURIComponent(waId)}"/>
 
           <textarea name="text" rows="3" placeholder="Type reply... (caption for media)"></textarea>
 
           <div class="row2" style="margin-top:10px;">
-            <input type="file" name="file" />
-            <div class="fileHint">Support: image/video/audio/document • Max 25MB (can adjust)</div>
+            <input type="file" name="file"/>
+            <div class="fileHint">Support: image/video/audio/document • Max 25MB</div>
           </div>
 
           <div class="row2" style="margin-top:10px;">
@@ -1283,10 +1362,10 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
 </body>
 </html>`;
 
-    res.status(200).send(html);
+    return res.status(200).send(html);
   } catch (e) {
     console.error("❌ /ui/customer error:", e);
-    res.status(500).send("Internal error");
+    return res.status(500).send("Internal error");
   }
 });
 
@@ -1309,12 +1388,12 @@ app.get("/send", (req, res) => {
     <h2 style="margin:0 0 8px 0;">Send WhatsApp Message</h2>
     <div class="muted">Text + optional file upload</div>
     <form method="post" action="/send" enctype="multipart/form-data" style="margin-top:12px;">
-      <label class="muted">To (conversation_id / wa_id)</label>
-      <input name="to" required />
+      <label class="muted">To (wa_id)</label>
+      <input name="to" required/>
       <label class="muted" style="display:block; margin-top:10px;">Text (or caption for media)</label>
       <textarea name="text" rows="4" placeholder="Type message..."></textarea>
       <label class="muted" style="display:block; margin-top:10px;">File (optional)</label>
-      <input type="file" name="file" />
+      <input type="file" name="file"/>
       <div style="margin-top:12px;">
         <button type="submit">Send</button>
       </div>
@@ -1324,51 +1403,27 @@ app.get("/send", (req, res) => {
 </body></html>`);
 });
 
-// ===== SEND API (outgoing + DB log) =====
+// ===== SEND API =====
 app.post("/send", upload.single("file"), async (req, res) => {
   try {
-    if (!pool) return res.status(500).send("DATABASE_URL not set");
-
     const to = (req.body.to || "").trim();
     const text = (req.body.text || "").trim();
     const redirectTo = (req.body.redirect || "").trim();
 
-    if (!to) {
-      if (redirectTo) {
-        const u = new URL(redirectTo, "http://localhost");
-        u.searchParams.set("err", "Missing to");
-        return res.redirect(u.pathname + u.search);
-      }
-      return res.status(400).send("Missing 'to'");
-    }
-
-    if (!WA_TOKEN) throw new Error("Missing WA_TOKEN");
-    if (!PHONE_NUMBER_ID) throw new Error("Missing PHONE_NUMBER_ID");
+    if (!to) return res.status(400).send("Missing 'to'");
 
     const hasFile = !!req.file;
-    if (!hasFile && !text) {
-      if (redirectTo) {
-        const u = new URL(redirectTo, "http://localhost");
-        u.searchParams.set("err", "Missing text (or upload a file)");
-        return res.redirect(u.pathname + u.search);
-      }
-      return res.status(400).send("Missing 'text' (or upload a file)");
-    }
+    if (!hasFile && !text) return res.status(400).send("Missing 'text' (or upload a file)");
 
+    // build payload
     let payload = null;
     let outType = "text";
     let uploadedMediaId = null;
     let mimeType = null;
     let localOutFile = null;
-    let localMediaUrl = null;
 
     if (!hasFile) {
-      payload = {
-        messaging_product: "whatsapp",
-        to,
-        type: "text",
-        text: { body: text },
-      };
+      payload = { messaging_product: "whatsapp", to, type: "text", text: { body: text } };
       outType = "text";
     } else {
       localOutFile = req.file.path;
@@ -1376,7 +1431,7 @@ app.post("/send", upload.single("file"), async (req, res) => {
       const category = classifyMediaType(mimeType);
 
       uploadedMediaId = await uploadMediaToWhatsApp(localOutFile, mimeType);
-      if (!uploadedMediaId) throw new Error("Upload ok but missing media id");
+      if (!uploadedMediaId) throw new Error("Upload succeeded but missing media id");
 
       outType = category;
 
@@ -1391,25 +1446,11 @@ app.post("/send", upload.single("file"), async (req, res) => {
           messaging_product: "whatsapp",
           to,
           type: "document",
-          document: {
-            id: uploadedMediaId,
-            ...(req.file.originalname ? { filename: req.file.originalname } : {}),
-            ...(text ? { caption: text } : {}),
-          },
+          document: { id: uploadedMediaId, ...(req.file.originalname ? { filename: req.file.originalname } : {}), ...(text ? { caption: text } : {}) },
         };
       }
-
-      // Copy to logs/media/<to>/outgoing__xxx.ext so UI can preview later
-      const waDir = mediaLocalDirForWaId(to);
-      const ext = extFromMime(mimeType);
-      const base = safeFileName(path.basename(localOutFile));
-      const outName = `outgoing__${base}.${ext}`;
-      const dest = path.join(waDir, outName);
-      fs.copyFileSync(localOutFile, dest);
-      localMediaUrl = mediaOriginalPath(to, outName);
     }
 
-    // send
     const url = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
     const r = await fetch(url, {
       method: "POST",
@@ -1417,34 +1458,66 @@ app.post("/send", upload.single("file"), async (req, res) => {
       body: JSON.stringify(payload),
     });
     const data = await r.json();
+    if (!r.ok) throw new Error(`Send failed: ${JSON.stringify(data)}`);
 
-    if (!r.ok) {
-      console.error("❌ Send error:", data);
-      throw new Error("Send failed");
+    // Save outgoing to DB
+    const conv = await getOrCreateConversation(to, null);
+
+    // If media file, keep a copy for preview (ephemeral without volume)
+    let localOriginalUrl = null;
+    let localThumbUrl = null;
+    let localSavedPath = null;
+
+    if (hasFile && localOutFile) {
+      const waDir = mediaLocalDirForWaId(to);
+      const ext = extFromMime(mimeType);
+      const base = safeFileName(path.basename(localOutFile));
+      const outName = `outgoing__${base}.${ext}`;
+      const dest = path.join(waDir, outName);
+
+      fs.copyFileSync(localOutFile, dest);
+      localSavedPath = dest;
+      localOriginalUrl = mediaOriginalPath(to, outName);
+
+      // thumb if image + sharp
+      if (sharp && (mimeType || "").toLowerCase().startsWith("image/")) {
+        const stem = outName.replace(/\.[^.]+$/, "");
+        const thumbAbs = path.join(thumbsDir, safeFileName(to), `${stem}.webp`);
+        try {
+          await ensureImageThumb(dest, thumbAbs);
+          localThumbUrl = mediaThumbPath(to, outName);
+        } catch (_) {
+          localThumbUrl = null;
+        }
+      }
     }
 
-    // DB insert outgoing
-    const msgId = data?.messages?.[0]?.id || null;
     await insertMessage({
-      conversation_id: to,
+      conversation_id: conv.id,
+      wa_id: to,
       direction: "outgoing",
       msg_type: outType,
-      text: hasFile ? (text || null) : text,
-      media_url: hasFile ? localMediaUrl : null,
-      wa_message_id: msgId,
-      created_at_iso: new Date().toISOString(),
+      text: outType === "text" ? text : null,
+      caption: outType !== "text" ? (text || null) : null,
+      tags: getTags(text),
+      wa_message_id: data?.messages?.[0]?.id || null,
+      timestamp_wa: null,
+      media_id: uploadedMediaId,
+      mime_type: mimeType,
+      local_original_url: localOriginalUrl,
+      local_thumb_url: localThumbUrl,
+      local_file_path: localSavedPath,
     });
 
-    // redirect back
     if (redirectTo) {
       const u = new URL(redirectTo, "http://localhost");
       u.searchParams.set("sent", "1");
       return res.redirect(u.pathname + u.search);
     }
 
-    return res.send(`✅ Sent successfully\n\n${JSON.stringify(data, null, 2)}`);
+    return res.send(`✅ Sent\n\n${JSON.stringify(data, null, 2)}`);
   } catch (e) {
-    console.error("❌ /send exception:", e);
+    console.error("❌ /send error:", e);
     const redirectTo = (req.body.redirect || "").trim();
     if (redirectTo) {
       const u = new URL(redirectTo, "http://localhost");
@@ -1458,13 +1531,14 @@ app.post("/send", upload.single("file"), async (req, res) => {
 // ========= Start =========
 (async () => {
   try {
-    if (pool) {
-      await dbInit();
-      console.log("✅ DB connected");
-      console.log("✅ messages table ready (DB COMPAT schema)");
-    }
+    console.log("Starting Container");
+    await dbPing();
+    console.log("✅ DB connected");
+    await dbInit();
+    console.log("✅ messages table ready");
   } catch (e) {
-    console.error("❌ DB init failed:", e?.message || e);
+    console.error("❌ DB init failed:", e);
+    // still start server, but UI/API will error; you can check /__version
   }
 
   app.listen(PORT, () => {
