@@ -22,6 +22,7 @@
 
 require("dotenv").config();
 console.log("✅ LOADED NEW SERVER.JS: 2026-03-02 cache-busted");
+
 const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -161,6 +162,8 @@ async function dbPing() {
 }
 
 
+  
+
 async function dbInit() {
   // ✅ Ensure base tables exist (compatible schema)
   await pool.query(`
@@ -170,6 +173,7 @@ async function dbInit() {
       profile_name TEXT,
       last_message_at TIMESTAMPTZ,
       last_seen_incoming_at TIMESTAMPTZ,
+      last_seen_outgoing_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ DEFAULT now(),
       created_at TIMESTAMPTZ DEFAULT now()
     );
@@ -210,6 +214,9 @@ async function dbInit() {
       END IF;
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='last_seen_incoming_at') THEN
         ALTER TABLE conversations ADD COLUMN last_seen_incoming_at TIMESTAMPTZ;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='last_seen_outgoing_at') THEN
+        ALTER TABLE conversations ADD COLUMN last_seen_outgoing_at TIMESTAMPTZ;
       END IF;
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='updated_at') THEN
         ALTER TABLE conversations ADD COLUMN updated_at TIMESTAMPTZ DEFAULT now();
@@ -254,41 +261,15 @@ async function dbInit() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_id);`);
 
-  // ✅ Ensure uniqueness on conversations.wa_id
+  // ✅ Unique constraint on conversations.wa_id (best effort)
   await pool.query(`
     DO $$
     BEGIN
-      IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint
-        WHERE conname = 'conversations_wa_id_key'
-      ) THEN
-        -- If unique already exists with a different name, this may no-op
-        BEGIN
-          ALTER TABLE conversations ADD CONSTRAINT conversations_wa_id_key UNIQUE (wa_id);
-        EXCEPTION WHEN duplicate_object THEN
-          -- ignore
-        END;
-      END IF;
-    END $$;
-  `);
-}
-
-  
-
-  // lightweight "migration": add missing columns if old table exists with missing fields
-  // (won't fail if already exists)
-  await pool.query(`
-    DO $$
-    BEGIN
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='wa_id') THEN
-        ALTER TABLE messages ADD COLUMN wa_id TEXT;
-      END IF;
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='tags') THEN
-        ALTER TABLE messages ADD COLUMN tags JSONB NOT NULL DEFAULT '[]'::jsonb;
-      END IF;
-      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='local_thumb_url') THEN
-        ALTER TABLE messages ADD COLUMN local_thumb_url TEXT;
-      END IF;
+      BEGIN
+        ALTER TABLE conversations ADD CONSTRAINT conversations_wa_id_key UNIQUE (wa_id);
+      EXCEPTION WHEN duplicate_object THEN
+        -- ignore
+      END;
     END $$;
   `);
 }
@@ -629,7 +610,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "FAST_A_DB_COMPAT_2026-03-02_v1_PATCH_WAID_INDEX",
+    marker: "FAST_A_DB_COMPAT_2026-03-02_v1_PATCH2_DBINIT_CLEAN",
     node: process.version,
     has_DATABASE_URL: !!DATABASE_URL,
     db_ok: dbOk,
@@ -1014,7 +995,7 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH_WAID_INDEX</div>
+        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH2_DBINIT_CLEAN</div>
       </div>
 
       <div class="controls">
@@ -1430,7 +1411,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH_WAID_INDEX</div>
+    <div class="muted" style="margin-top:10px;">Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH2_DBINIT_CLEAN</div>
   </div>
 </body>
 </html>`;
@@ -1629,7 +1610,7 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH_WAID_INDEX");
+    console.log("VERSION MARKER: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH2_DBINIT_CLEAN");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
