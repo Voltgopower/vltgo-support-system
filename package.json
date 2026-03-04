@@ -14,11 +14,7 @@
   "dependencies": {
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
-<<<<<<< HEAD
-    "express-session": "^1.17.3",
-=======
     "express-session": "^1.19.0",
->>>>>>> 0abf7de (Add express-session)
     "multer": "^2.1.0",
     "pg": "^8.19.0",
     "sharp": "^0.34.5"
