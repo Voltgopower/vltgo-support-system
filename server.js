@@ -1314,16 +1314,15 @@ app.get("/ui", async (req, res) => {
       const st = esc((c.status || 'open').toLowerCase());
       const stHtml = '<span class="status '+st+'">'+st+'</span>';
 
-      return `
-        <tr>
-          <td class="mono"><a href="/ui/customer/${encodeURIComponent(c.wa_id)}">${esc(c.wa_id)}</a></td>
-          <td>${esc(c.profile_name || '')}</td>
-          <td>${stHtml}</td>
-          <td>${tagsHtml || '<span class="muted">-</span>'}</td>
-          <td>${esc(fmt(c.last_time))}</td>
-          <td>${unreadBadge} ${lastDir} <span class="preview">${preview}</span></td>
-        </tr>
-      `;
+      return '' +
+        '<tr>' +
+          '<td class="mono"><a href="/ui/customer/'+ encodeURIComponent(c.wa_id) +'">' + esc(c.wa_id) + '</a></td>' +
+          '<td>' + esc(c.profile_name || '') + '</td>' +
+          '<td>' + stHtml + '</td>' +
+          '<td>' + (tagsHtml || '<span class="muted">-</span>') + '</td>' +
+          '<td>' + esc(fmt(c.last_time)) + '</td>' +
+          '<td>' + unreadBadge + ' ' + lastDir + ' <span class="preview">' + preview + '</span></td>' +
+        '</tr>';
     }
 
     async function refreshCustomers({playSound=false}={}){
