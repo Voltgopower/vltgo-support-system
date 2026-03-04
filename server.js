@@ -1,10 +1,17 @@
 /**
- * WhatsApp Webhook Server (FAST A - DB + MEDIA + LIGHT UI) - 2026-03-02
+ * WhatsApp Webhook Server (V2.1 - SESSION + SSE + DB + MEDIA + LIGHT UI) - 2026-03-04
+ *
+ * V2.1 changes vs V2:
+ * - Customer chat page updates incrementally (no full page reload):
+ *   - SSE "new_message" triggers fetch /customers/:wa_id/messages?after=<last_id>
+ *   - Appends new messages to DOM
+ * - Added query param `after` to /customers/:wa_id/messages for incremental fetch
  *
  * Key:
- * - Postgres is the source of truth (messages won't disappear after redeploy)
- * - wa_id stored as TEXT (no integer overflow)
- * - Optional sharp for thumbs (won't crash if missing)
+ * - Postgres is the source of truth
+ * - Cookie + session auth with /login + /logout
+ * - SSE push: /events
+ * - Optional sharp thumbs
  * - /__db_init endpoint creates/updates tables
  *
  * Required ENV:
@@ -15,19 +22,23 @@
  *   UI_PASS=xxxxx
  *   DATABASE_URL=postgresql://...
  *
+ * Recommended ENV:
+ *   SESSION_SECRET=some-long-random-string
+ *
  * Optional:
  *   PORT=8080
  *   APP_SECRET=xxxxx  (Meta webhook signature verify)
  */
 
 require("dotenv").config();
-console.log("✅ LOADED NEW SERVER.JS: 2026-03-02 cache-busted");
+console.log("✅ LOADED SERVER.JS: V2.1 SESSION + SSE + INCREMENTAL UI (2026-03-04)");
 
 const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
+const session = require("express-session");
 const { Pool } = require("pg");
 
 // -------- Optional sharp (do NOT crash if missing) --------
@@ -52,6 +63,7 @@ const UI_USER = process.env.UI_USER;
 const UI_PASS = process.env.UI_PASS;
 
 const DATABASE_URL = process.env.DATABASE_URL;
+const SESSION_SECRET = process.env.SESSION_SECRET || "CHANGE_ME_SESSION_SECRET";
 
 if (!VERIFY_TOKEN) {
   console.error("Missing .env variable: VERIFY_TOKEN");
@@ -69,6 +81,10 @@ if (!DATABASE_URL) {
   console.error("Missing .env variable: DATABASE_URL");
   process.exit(1);
 }
+if (!UI_USER || !UI_PASS) {
+  console.error("Missing .env variable: UI_USER / UI_PASS");
+  process.exit(1);
+}
 
 // ========= Express =========
 const app = express();
@@ -78,48 +94,45 @@ function rawBodySaver(req, res, buf) {
   req.rawBody = buf;
 }
 
-// IMPORTANT: JSON must be before routes (keep raw body for signature check)
 app.use(express.json({ verify: rawBodySaver }));
 app.use(express.urlencoded({ extended: false }));
 
-// ========= Basic Auth =========
-function unauthorized(res) {
-  res.set("WWW-Authenticate", 'Basic realm="WhatsApp CS"');
-  return res.status(401).send("Authentication required");
-}
+// Trust proxy (Railway / reverse proxy) so secure cookies work correctly
+app.set("trust proxy", 1);
 
-function basicAuth(req, res, next) {
-  // allow Meta calls
+// ========= Session Auth (V2.1) =========
+app.use(
+  session({
+    name: "vltgo.sid",
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      maxAge: 1000 * 60 * 60 * 12,
+    },
+  })
+);
+
+function requireAuth(req, res, next) {
+  // allow Meta webhook calls without auth
   if (req.path === "/webhook") return next();
-
-  // allow probes
   if (req.path === "/" || req.path === "/__version") return next();
+  if (req.path === "/login") return next();
 
-  // protect these prefixes
-  const protectedPrefixes = ["/ui", "/customers", "/send", "/media", "/__db_init"];
-  if (!protectedPrefixes.some((p) => req.path.startsWith(p))) return next();
+  if (req.session && req.session.user) return next();
 
-  if (!UI_USER || !UI_PASS) {
-    return res.status(500).send("UI auth not configured on server");
+  const wantsJson = (req.headers.accept || "").includes("application/json");
+  if (wantsJson || req.path.startsWith("/customers") || req.path.startsWith("/send") || req.path === "/events") {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
   }
-
-  const header = req.headers.authorization || "";
-  if (!header.startsWith("Basic ")) return unauthorized(res);
-
-  const b64 = header.slice(6);
-  const decoded = Buffer.from(b64, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  if (idx < 0) return unauthorized(res);
-
-  const user = decoded.slice(0, idx);
-  const pass = decoded.slice(idx + 1);
-
-  if (user !== UI_USER || pass !== UI_PASS) return unauthorized(res);
-  return next();
+  return res.redirect("/login");
 }
-app.use(basicAuth);
+app.use(requireAuth);
 
-// ========= Local dirs (ephemeral on Railway without volume) =========
+// ========= Local dirs =========
 const baseDir = __dirname;
 const logsDir = path.join(baseDir, "logs");
 const mediaDir = path.join(logsDir, "media");
@@ -143,17 +156,13 @@ const upload = multer({
       cb(null, `${ts}__${safe}`);
     },
   }),
-  limits: {
-    fileSize: 25 * 1024 * 1024, // 25MB
-  },
+  limits: { fileSize: 25 * 1024 * 1024 },
 });
 
 // ========= DB =========
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: DATABASE_URL.includes("rlwy") || DATABASE_URL.includes("railway")
-    ? { rejectUnauthorized: false }
-    : undefined,
+  ssl: DATABASE_URL.includes("rlwy") || DATABASE_URL.includes("railway") ? { rejectUnauthorized: false } : undefined,
 });
 
 async function dbPing() {
@@ -161,11 +170,7 @@ async function dbPing() {
   return r.rows?.[0]?.ok === 1;
 }
 
-
-  
-
 async function dbInit() {
-  // ✅ Ensure base tables exist (compatible schema)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS conversations (
       id TEXT PRIMARY KEY,
@@ -198,11 +203,9 @@ async function dbInit() {
     );
   `);
 
-  // ✅ Lightweight migration: add missing columns BEFORE creating indexes
   await pool.query(`
     DO $$
     BEGIN
-      -- conversations
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='wa_id') THEN
         ALTER TABLE conversations ADD COLUMN wa_id TEXT;
       END IF;
@@ -225,7 +228,6 @@ async function dbInit() {
         ALTER TABLE conversations ADD COLUMN created_at TIMESTAMPTZ DEFAULT now();
       END IF;
 
-      -- messages
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='wa_id') THEN
         ALTER TABLE messages ADD COLUMN wa_id TEXT;
       END IF;
@@ -256,35 +258,13 @@ async function dbInit() {
     END $$;
   `);
 
-  // ✅ Ensure conversations.id is never NULL: old code may insert only wa_id.
-  // This trigger auto-fills id from wa_id when id is NULL, preventing NOT NULL/PK violations.
-  await pool.query(`
-    CREATE OR REPLACE FUNCTION public._conv_set_id_from_wa_id()
-    RETURNS trigger AS $$
-    BEGIN
-      IF NEW.id IS NULL THEN
-        NEW.id := NEW.wa_id;
-      END IF;
-      RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-    DROP TRIGGER IF EXISTS trg_conv_set_id_from_wa_id ON public.conversations;
-    CREATE TRIGGER trg_conv_set_id_from_wa_id
-    BEFORE INSERT ON public.conversations
-    FOR EACH ROW
-    EXECUTE FUNCTION public._conv_set_id_from_wa_id();
-  `);
-
-  // ✅ Indexes (after columns exist)
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_id);`);  // ✅ Unique on conversations.wa_id (safe even if old DB already has index/constraint)
-  // Some old schemas already have an index named conversations_wa_id_key, so adding a constraint can fail.
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_wa_id ON messages(wa_id);`);
+
   await pool.query(`
     DO $$
     BEGIN
-      -- If there is already a UNIQUE index named conversations_wa_id_key, do nothing.
       IF EXISTS (
         SELECT 1 FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -295,7 +275,6 @@ async function dbInit() {
         RETURN;
       END IF;
 
-      -- If there is already a UNIQUE constraint on wa_id, do nothing.
       IF EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conrelid = 'public.conversations'::regclass
@@ -305,19 +284,13 @@ async function dbInit() {
         RETURN;
       END IF;
 
-      -- Otherwise create a unique index (safe + enough for ON CONFLICT on unique constraint?)
-      -- NOTE: ON CONFLICT requires a UNIQUE constraint OR a UNIQUE index on the conflict target.
       EXECUTE 'CREATE UNIQUE INDEX conversations_wa_id_key ON public.conversations(wa_id)';
     EXCEPTION
-      WHEN duplicate_table THEN  -- 42P07
-        NULL;
-      WHEN duplicate_object THEN
-        NULL;
+      WHEN duplicate_table THEN NULL;
+      WHEN duplicate_object THEN NULL;
     END $$;
   `);
 
-  // ✅ Compatibility for old schema: conversations.contact_id may exist (often INTEGER + NOT NULL).
-  // We MUST NOT assign wa_id (TEXT) into contact_id (INTEGER). We only relax NOT NULL to prevent insert failures.
   await pool.query(`
     DO $$
     BEGIN
@@ -340,7 +313,6 @@ async function getOrCreateConversation(waId, profileName) {
   const wa_id = String(waId || "").trim();
   if (!wa_id) throw new Error("Missing wa_id");
 
-  // Upsert conversation
   const r = await pool.query(
     `
     INSERT INTO conversations (wa_id, profile_name, updated_at)
@@ -399,11 +371,7 @@ async function insertMessage(row) {
     ]
   );
 
-  // maintain last_message_at
-  await pool.query(
-    `UPDATE conversations SET last_message_at = NOW(), updated_at = NOW() WHERE id = $1`,
-    [conversation_id]
-  );
+  await pool.query(`UPDATE conversations SET last_message_at = NOW(), updated_at = NOW() WHERE id = $1`, [conversation_id]);
 }
 
 async function countUnread(conversationId) {
@@ -495,10 +463,7 @@ function isValidSignature(req) {
 
   const expected =
     "sha256=" +
-    crypto
-      .createHmac("sha256", APP_SECRET)
-      .update(req.rawBody || Buffer.from(""))
-      .digest("hex");
+    crypto.createHmac("sha256", APP_SECRET).update(req.rawBody || Buffer.from("")).digest("hex");
 
   const a = Buffer.from(expected);
   const b = Buffer.from(sig);
@@ -512,11 +477,44 @@ function getTags(text) {
   const tags = [];
 
   if (/(track|tracking|deliver|delivery|ups|fedex|dhl|usps|shipment|物流|派送|签收|运单|快递)/i.test(t)) tags.push("logistics");
-  if (/(warranty|broken|issue|problem|fault|defect|return|replace|refund|not work|doesn't work|坏|故障|问题|退货|换货|退款)/i.test(t)) tags.push("after_sales");
-  if (/(price|quote|quotation|invoice|pay|payment|discount|availability|lead time|报价|价格|发票|付款|折扣|有货|交期)/i.test(t)) tags.push("pre_sales");
+  if (/(warranty|broken|issue|problem|fault|defect|return|replace|refund|not work|doesn't work|坏|故障|问题|退货|换货|退款)/i.test(t))
+    tags.push("after_sales");
+  if (/(price|quote|quotation|invoice|pay|payment|discount|availability|lead time|报价|价格|发票|付款|折扣|有货|交期)/i.test(t))
+    tags.push("pre_sales");
 
   return tags;
 }
+
+// ========= SSE PUSH (V2.1) =========
+const sseClients = new Set();
+function sseBroadcast(event, payload) {
+  const msg = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const c of sseClients) {
+    try {
+      c.res.write(msg);
+    } catch (_) {}
+  }
+}
+
+app.get("/events", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+
+  const client = { res };
+  sseClients.add(client);
+
+  res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, ts: Date.now() })}\n\n`);
+  const hb = setInterval(() => {
+    res.write(`event: ping\ndata: {}\n\n`);
+  }, 25000);
+
+  req.on("close", () => {
+    clearInterval(hb);
+    sseClients.delete(client);
+  });
+});
 
 // ========= Media helpers =========
 function extFromMime(mime) {
@@ -575,20 +573,16 @@ async function ensureImageThumb(srcPath, thumbAbs) {
   if (!sharp) return false;
   if (fs.existsSync(thumbAbs)) return true;
   ensureDir(path.dirname(thumbAbs));
-
   await sharp(srcPath)
     .resize({ width: 520, height: 520, fit: "inside", withoutEnlargement: true })
     .webp({ quality: 78 })
     .toFile(thumbAbs);
-
   return true;
 }
 
-// download incoming media by media_id -> save to logs/media/<wa_id>/<media_id>.<ext>
 async function downloadIncomingMedia(waId, mediaId) {
   if (!mediaId) return null;
 
-  // 1) get media URL + mime
   const metaResp = await fetch(`https://graph.facebook.com/v25.0/${mediaId}`, {
     headers: { Authorization: `Bearer ${WA_TOKEN}` },
   });
@@ -599,7 +593,6 @@ async function downloadIncomingMedia(waId, mediaId) {
   const mime = meta?.mime_type || null;
   if (!url) throw new Error("Media meta missing url");
 
-  // 2) download bytes
   const binResp = await fetch(url, { headers: { Authorization: `Bearer ${WA_TOKEN}` } });
   if (!binResp.ok) {
     const t = await binResp.text().catch(() => "");
@@ -614,7 +607,6 @@ async function downloadIncomingMedia(waId, mediaId) {
 
   if (!fs.existsSync(abs)) fs.writeFileSync(abs, buf);
 
-  // thumb
   let thumbUrl = null;
   if (sharp && (mime || "").toLowerCase().startsWith("image/")) {
     const stem = fileName.replace(/\.[^.]+$/, "");
@@ -623,7 +615,6 @@ async function downloadIncomingMedia(waId, mediaId) {
       await ensureImageThumb(abs, thumbAbs);
       thumbUrl = mediaThumbPath(waId, fileName);
     } catch (e) {
-      // fallback to original
       thumbUrl = null;
     }
   }
@@ -637,7 +628,6 @@ async function downloadIncomingMedia(waId, mediaId) {
   };
 }
 
-// upload outgoing media file -> return media id
 async function uploadMediaToWhatsApp(filePath, mimeType) {
   const buf = fs.readFileSync(filePath);
   const name = path.basename(filePath);
@@ -672,7 +662,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "FAST_A_DB_COMPAT_2026-03-02_v1_PATCH5_ID_FROM_WAID_TRIGGER",
+    marker: "V2.1_SESSION_SSE_DB_MEDIA_2026-03-04",
     node: process.version,
     has_DATABASE_URL: !!DATABASE_URL,
     db_ok: dbOk,
@@ -680,11 +670,71 @@ app.get("/__version", async (req, res) => {
   });
 });
 
+// ========= Login / Logout =========
+app.get("/login", (req, res) => {
+  setNoCache(res);
+  if (req.session?.user) return res.redirect("/ui");
+
+  res.status(200).send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Login - WhatsApp CS</title>
+  <style>
+    body{font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#f6f7fb; margin:0; padding:18px;}
+    .card{max-width:420px; margin:8vh auto 0; background:#fff; border:1px solid #e5e7eb; border-radius:16px; padding:16px; box-shadow:0 10px 30px rgba(17,24,39,.06);}
+    h2{margin:0 0 10px 0; font-size:18px;}
+    .muted{color:#6b7280; font-size:13px;}
+    input{width:100%; padding:10px 12px; border:1px solid #e5e7eb; border-radius:12px; margin-top:8px;}
+    button{width:100%; margin-top:12px; padding:10px 14px; border:1px solid #e5e7eb; border-radius:12px; background:#2563eb; color:#fff; cursor:pointer;}
+    button:hover{background:#1d4ed8;}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>WhatsApp CS Login</h2>
+    <div class="muted">V2.1 Session • ${escapeHtml(new Date().toLocaleString())}</div>
+    <form method="post" action="/login" style="margin-top:12px;">
+      <input name="username" placeholder="Username" autocomplete="username" required />
+      <input name="password" placeholder="Password" type="password" autocomplete="current-password" required />
+      <button type="submit">Login</button>
+    </form>
+  </div>
+</body>
+</html>`);
+});
+
+app.post("/login", (req, res) => {
+  const username = (req.body.username || "").trim();
+  const password = (req.body.password || "").trim();
+
+  if (username === UI_USER && password === UI_PASS) {
+    req.session.user = { username, at: Date.now() };
+    return res.redirect("/ui");
+  }
+
+  setNoCache(res);
+  return res.status(401).send(`<!doctype html><html><body style="font-family:system-ui;background:#f6f7fb;padding:18px;">
+  <div style="max-width:420px;margin:8vh auto;background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px;">
+    <div style="color:#991b1b;">❌ Invalid credentials</div>
+    <p><a href="/login">Back to login</a></p>
+  </div>
+</body></html>`);
+});
+
+app.post("/logout", (req, res) => {
+  req.session.destroy(() => {
+    res.clearCookie("vltgo.sid");
+    return res.redirect("/login");
+  });
+});
+
 // ========= DB init endpoint =========
 app.get("/__db_init", async (req, res) => {
   try {
     await dbInit();
-    return res.json({ ok: true, ts: new Date().toISOString(), marker: "DB_INIT_OK" });
+    return res.json({ ok: true, ts: new Date().toISOString(), marker: "DB_INIT_OK_V2_1" });
   } catch (e) {
     console.error("❌ __db_init error:", e);
     return res.status(500).json({ ok: false, error: e?.message || String(e) });
@@ -759,7 +809,6 @@ app.post("/webhook", (req, res) => {
         mime_type = msg.audio?.mime_type || null;
       }
 
-      // download media if present
       if (media_id) {
         try {
           const dl = await downloadIncomingMedia(waId, media_id);
@@ -774,7 +823,6 @@ app.post("/webhook", (req, res) => {
 
       const tags = getTags(text || caption || "");
 
-      // DB write
       const conv = await getOrCreateConversation(waId, profileName);
 
       await insertMessage({
@@ -794,13 +842,10 @@ app.post("/webhook", (req, res) => {
         local_file_path,
       });
 
-      console.log(
-        "📝 Saved incoming:",
-        type,
-        waId,
-        text || caption || "",
-        media_id ? `media=${media_id}` : ""
-      );
+      // Broadcast realtime event (UI incremental fetch)
+      sseBroadcast("new_message", { wa_id: waId, direction: "incoming", ts: Date.now() });
+
+      console.log("📝 Saved incoming:", type, waId, text || caption || "", media_id ? `media=${media_id}` : "");
     } catch (err) {
       console.error("❌ Webhook error:", err);
     }
@@ -808,7 +853,6 @@ app.post("/webhook", (req, res) => {
 });
 
 // ========= Media routes =========
-// Original: strong cache (file name is stable)
 app.get("/media/original/:wa_id/:filename", (req, res) => {
   try {
     const waId = safeFileName(req.params.wa_id);
@@ -827,7 +871,6 @@ app.get("/media/original/:wa_id/:filename", (req, res) => {
   }
 });
 
-// Thumb: webp + strong cache, fallback to original if sharp missing or not image
 app.get("/media/thumb/:wa_id/:filename", async (req, res) => {
   try {
     const waId = safeFileName(req.params.wa_id);
@@ -839,7 +882,6 @@ app.get("/media/thumb/:wa_id/:filename", async (req, res) => {
 
     const mime = guessMimeByExt(filename);
     if (!sharp || !mime.startsWith("image/")) {
-      // fallback
       res.setHeader("Content-Type", mime);
       res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
       return res.sendFile(src);
@@ -875,7 +917,6 @@ app.get("/customers", async (req, res) => {
 
     const out = [];
     for (const c of r.rows) {
-      // last message
       const lastMsg = await pool.query(
         `
         SELECT msg_type, direction, text, caption, created_at, tags, local_original_url, local_thumb_url
@@ -888,11 +929,8 @@ app.get("/customers", async (req, res) => {
       );
 
       const last = lastMsg.rows[0] || null;
-
-      // unread count
       const unreadCount = await countUnread(c.id);
 
-      // filters
       if (unreadOnly && unreadCount <= 0) continue;
 
       const lastTimeIso = c.last_message_at ? new Date(c.last_message_at).toISOString() : null;
@@ -903,9 +941,8 @@ app.get("/customers", async (req, res) => {
       if (q && !hay.includes(q)) continue;
 
       if (tag) {
-        const tagsArr = Array.isArray(last?.tags) ? last.tags : (last?.tags || []);
-        const hasTag =
-          Array.isArray(tagsArr) && tagsArr.map((x) => String(x).toLowerCase()).includes(tag);
+        const tagsArr = Array.isArray(last?.tags) ? last.tags : last?.tags || [];
+        const hasTag = Array.isArray(tagsArr) && tagsArr.map((x) => String(x).toLowerCase()).includes(tag);
         if (!hasTag) continue;
       }
 
@@ -927,18 +964,20 @@ app.get("/customers", async (req, res) => {
   }
 });
 
+// V2.1: incremental fetch with ?after=<id>
 app.get("/customers/:wa_id/messages", async (req, res) => {
   try {
     const waId = String(req.params.wa_id || "").trim();
     const limit = Math.min(parseInt(req.query.limit || "500", 10) || 500, 3000);
+    const after = (req.query.after || "").toString().trim();
+    const afterId = after ? parseInt(after, 10) : 0;
 
     const convR = await pool.query(`SELECT id, wa_id FROM conversations WHERE wa_id = $1`, [waId]);
     if (convR.rows.length === 0) return res.json({ wa_id: waId, count: 0, messages: [] });
 
     const convId = convR.rows[0].id;
 
-    const r = await pool.query(
-      `
+    let sql = `
       SELECT
         id,
         wa_id,
@@ -956,11 +995,18 @@ app.get("/customers/:wa_id/messages", async (req, res) => {
         created_at
       FROM messages
       WHERE conversation_id = $1
-      ORDER BY created_at ASC
-      LIMIT $2
-      `,
-      [convId, limit]
-    );
+    `;
+    const params = [convId];
+
+    if (afterId && Number.isFinite(afterId) && afterId > 0) {
+      sql += ` AND id > $2 `;
+      params.push(afterId);
+    }
+
+    sql += ` ORDER BY id ASC LIMIT $${params.length + 1} `;
+    params.push(limit);
+
+    const r = await pool.query(sql, params);
 
     return res.json({ wa_id: waId, count: r.rows.length, messages: r.rows });
   } catch (e) {
@@ -980,25 +1026,15 @@ app.get("/ui", async (req, res) => {
 
     const data = await fetchCustomersForUi({ q, unreadOnly, recent24 });
 
-    const currentParams = {
-      q: q || "",
-      unread: unreadOnly ? "1" : "",
-      recent24: recent24 ? "1" : "",
-    };
+    const currentParams = { q: q || "", unread: unreadOnly ? "1" : "", recent24: recent24 ? "1" : "" };
     const unreadLink = buildQueryLink("/ui", currentParams, { unread: unreadOnly ? "" : "1" });
     const recentLink = buildQueryLink("/ui", currentParams, { recent24: recent24 ? "" : "1" });
 
     const rowsHtml = data.customers
       .map((c) => {
         const unreadBadge =
-          (c.unread_count || 0) > 0
-            ? `<span class="badge">${c.unread_count}</span>`
-            : `<span class="badge ghost">0</span>`;
-
-        const lastDir = c.last_direction
-          ? `<span class="pill ${escapeHtml(c.last_direction)}">${escapeHtml(c.last_direction)}</span>`
-          : "";
-
+          (c.unread_count || 0) > 0 ? `<span class="badge">${c.unread_count}</span>` : `<span class="badge ghost">0</span>`;
+        const lastDir = c.last_direction ? `<span class="pill ${escapeHtml(c.last_direction)}">${escapeHtml(c.last_direction)}</span>` : "";
         const preview = escapeHtml(c.last_text || "");
         return `
           <tr>
@@ -1050,6 +1086,9 @@ app.get("/ui", async (req, res) => {
     .badge.ghost{background:#f3f4f6; color:var(--muted); border:1px solid var(--line);}
     .preview{color:#111827;}
     .footerNote{margin-top:10px; color:var(--muted); font-size:12px;}
+    .topRight{display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+    .ghostBtn{padding:10px 14px; border:1px solid var(--line); border-radius:12px; background:#fff; cursor:pointer;}
+    .ghostBtn:hover{background:#f9fafb;}
   </style>
 </head>
 <body>
@@ -1057,13 +1096,18 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH5_ID_FROM_WAID_TRIGGER</div>
+        <div class="muted">DB-backed • Version: V2.1_SESSION_SSE_DB_MEDIA_2026-03-04</div>
       </div>
 
-      <div class="controls">
-        <a href="/send" class="chip"><b>Send Page</b></a>
-        <a href="${unreadLink}" class="chip ${unreadOnly ? "on" : ""}"><b>Unread Only</b></a>
-        <a href="${recentLink}" class="chip ${recent24 ? "on" : ""}"><b>Last 24h</b></a>
+      <div class="topRight">
+        <form method="post" action="/logout">
+          <button class="ghostBtn" type="submit">Logout</button>
+        </form>
+        <div class="controls">
+          <a href="/send" class="chip"><b>Send Page</b></a>
+          <a href="${unreadLink}" class="chip ${unreadOnly ? "on" : ""}"><b>Unread Only</b></a>
+          <a href="${recentLink}" class="chip ${recent24 ? "on" : ""}"><b>Last 24h</b></a>
+        </div>
       </div>
 
       <form method="get" action="/ui" class="controls">
@@ -1091,8 +1135,14 @@ app.get("/ui", async (req, res) => {
       </table>
     </div>
 
-    <div class="footerNote">Tips: open /__db_init once after deploy if needed.</div>
+    <div class="footerNote">V2.1: session login + SSE realtime. Chat page updates incrementally.</div>
   </div>
+
+  <script>
+    // Customers list: simplest + robust is reload on any new message
+    const es = new EventSource("/events");
+    es.addEventListener("new_message", () => location.reload());
+  </script>
 </body>
 </html>`;
 
@@ -1149,7 +1199,7 @@ async function fetchCustomersForUi({ q, unreadOnly, recent24 }) {
   return { customers };
 }
 
-// ========= UI: Customer chat =========
+// ========= UI: Customer chat (V2.1 incremental) =========
 app.get("/ui/customer/:wa_id", async (req, res) => {
   try {
     setNoCache(res);
@@ -1185,7 +1235,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
         created_at
       FROM messages
       WHERE conversation_id = $1
-      ORDER BY created_at ASC
+      ORDER BY id ASC
       LIMIT $2
       `,
       [convId, limit]
@@ -1201,7 +1251,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
     }
     const allTags = Array.from(tagsSet).sort();
 
-    // filters
+    // filters (server-side for first render; incremental fetch will append regardless of filters)
     const filtered = rows.filter((r0) => {
       const text0 = (r0.text || "").toString();
       const cap0 = (r0.caption || "").toString();
@@ -1228,7 +1278,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       return true;
     });
 
-    // mark seen when open page
+    // mark seen
     await markConversationSeen(waId);
 
     const sentFlag = (req.query.sent || "").toString();
@@ -1282,7 +1332,6 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
             </div>
           `;
         }
-        // document
         return `
           <div class="text">${escapeHtml(caption0 || "Document")}</div>
           <div class="media">
@@ -1297,7 +1346,6 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
         `;
       }
 
-      // no local file
       return `
         <div class="text">${escapeHtml(caption0 || text0 || `[${type0}]`)}</div>
         ${r0.media_id ? `<div class="mutedSmall mono">media_id=${escapeHtml(r0.media_id)}</div>` : ""}
@@ -1320,7 +1368,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
         }
 
         return `
-          <div class="row ${isOut ? "right" : "left"}">
+          <div class="row ${isOut ? "right" : "left"}" data-msg-id="${r0.id}">
             <div class="bubble ${isOut ? "out" : "in"}">
               <div class="meta">
                 ${unreadMark}
@@ -1342,13 +1390,19 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       unread: unreadOnly ? "1" : "",
       limit: String(limit),
     };
-    const toggleUnreadLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, { unread: unreadOnly ? "" : "1" });
-    const toggleRecentLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, { recent24: recent24 ? "" : "1" });
+    const toggleUnreadLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, {
+      unread: unreadOnly ? "" : "1",
+    });
+    const toggleRecentLink = buildQueryLink(`/ui/customer/${encodeURIComponent(waId)}`, currentParams, {
+      recent24: recent24 ? "" : "1",
+    });
     const clearLink = `/ui/customer/${encodeURIComponent(waId)}`;
 
     const tagOptions = [
       `<option value="">All</option>`,
-      ...allTags.map((t0) => `<option value="${escapeHtml(t0)}" ${t0.toLowerCase() === tag ? "selected" : ""}>${escapeHtml(t0)}</option>`),
+      ...allTags.map(
+        (t0) => `<option value="${escapeHtml(t0)}" ${t0.toLowerCase() === tag ? "selected" : ""}>${escapeHtml(t0)}</option>`
+      ),
     ].join("");
 
     const html = `<!doctype html>
@@ -1408,6 +1462,9 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
     .replyTop{display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:10px;}
     .row2{display:flex; gap:10px; flex-wrap:wrap; align-items:center;}
     .fileHint{font-size:12px; color:var(--muted);}
+    .topRight{display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+    .ghostBtn{padding:10px 14px; border:1px solid var(--line); border-radius:12px; background:#fff; cursor:pointer;}
+    .ghostBtn:hover{background:#f9fafb;}
   </style>
 </head>
 <body>
@@ -1417,7 +1474,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
         <h2>Customer: <span class="mono">${escapeHtml(waId)}</span></h2>
         <div class="muted">
           <a href="/ui">← Back</a>
-          &nbsp;|&nbsp; Showing ${filtered.length} messages
+          &nbsp;|&nbsp; Showing <span id="msgCount">${filtered.length}</span> messages
           ${q ? ` (q="${escapeHtml(q)}")` : ""}
           ${tag ? ` (tag="${escapeHtml(tag)}")` : ""}
           ${recent24 ? ` (last 24h)` : ""}
@@ -1425,9 +1482,14 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
         </div>
       </div>
 
-      <div class="controls">
-        <a href="${toggleUnreadLink}" class="chip ${unreadOnly ? "on" : ""}"><b>Unread Only</b></a>
-        <a href="${toggleRecentLink}" class="chip ${recent24 ? "on" : ""}"><b>Last 24h</b></a>
+      <div class="topRight">
+        <form method="post" action="/logout">
+          <button class="ghostBtn" type="submit">Logout</button>
+        </form>
+        <div class="controls">
+          <a href="${toggleUnreadLink}" class="chip ${unreadOnly ? "on" : ""}"><b>Unread Only</b></a>
+          <a href="${toggleRecentLink}" class="chip ${recent24 ? "on" : ""}"><b>Last 24h</b></a>
+        </div>
       </div>
 
       <form method="get" action="/ui/customer/${encodeURIComponent(waId)}" class="controls">
@@ -1444,7 +1506,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
     ${notice}
 
     <div class="card">
-      <div class="chat">
+      <div class="chat" id="chat">
         ${bubbles || `<div class="muted">No messages found.</div>`}
       </div>
 
@@ -1473,8 +1535,129 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH5_ID_FROM_WAID_TRIGGER</div>
+    <div class="muted" style="margin-top:10px;">Version: V2.1_SESSION_SSE_DB_MEDIA_2026-03-04</div>
   </div>
+
+  <script>
+    // ===== V2.1 incremental realtime updates =====
+    const WA_ID = "${escapeHtml(waId)}";
+    const es = new EventSource("/events");
+
+    // Track last message id currently rendered
+    function getLastId() {
+      const nodes = document.querySelectorAll('[data-msg-id]');
+      if (!nodes.length) return 0;
+      const last = nodes[nodes.length - 1];
+      const v = parseInt(last.getAttribute('data-msg-id') || "0", 10);
+      return Number.isFinite(v) ? v : 0;
+    }
+
+    // Simple escape for client-render
+    function esc(s) {
+      return String(s ?? "")
+        .replace(/&/g,"&amp;")
+        .replace(/</g,"&lt;")
+        .replace(/>/g,"&gt;")
+        .replace(/"/g,"&quot;")
+        .replace(/'/g,"&#039;");
+    }
+
+    function fmt(ts) {
+      try { return new Date(ts).toLocaleString(); } catch(e) { return String(ts||""); }
+    }
+
+    function renderOne(m) {
+      const isOut = m.direction === "outgoing";
+      const row = document.createElement("div");
+      row.className = "row " + (isOut ? "right" : "left");
+      row.setAttribute("data-msg-id", String(m.id));
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble " + (isOut ? "out" : "in");
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.innerHTML = '<span class="time">' + esc(fmt(m.created_at)) + '</span>' +
+                       '<span class="type">' + esc(m.type || "") + '</span>';
+
+      const content = document.createElement("div");
+
+      if ((m.type || "") === "text") {
+        content.innerHTML = '<div class="text">' + esc(m.text || "") + '</div>';
+      } else if (m.local_media_url) {
+        if (m.type === "image") {
+          const imgSrc = m.local_thumb_url || m.local_media_url;
+          content.innerHTML =
+            (m.caption ? '<div class="text">' + esc(m.caption) + '</div>' : '') +
+            '<div class="media">' +
+              '<a href="' + esc(m.local_media_url) + '" target="_blank" rel="noreferrer">' +
+                '<img src="' + esc(imgSrc) + '" alt="image"/>' +
+              '</a>' +
+              '<div class="mediaActions"><a href="' + esc(m.local_media_url) + '" target="_blank" rel="noreferrer">Open / Download</a></div>' +
+            '</div>';
+        } else if (m.type === "video") {
+          content.innerHTML =
+            (m.caption ? '<div class="text">' + esc(m.caption) + '</div>' : '') +
+            '<div class="media">' +
+              '<video controls src="' + esc(m.local_media_url) + '" style="max-width:100%; border-radius:12px;"></video>' +
+              '<div class="mediaActions"><a href="' + esc(m.local_media_url) + '" target="_blank" rel="noreferrer">Open / Download</a></div>' +
+            '</div>';
+        } else if (m.type === "audio") {
+          content.innerHTML =
+            '<div class="media">' +
+              '<audio controls src="' + esc(m.local_media_url) + '" style="width:100%;"></audio>' +
+              '<div class="mediaActions"><a href="' + esc(m.local_media_url) + '" target="_blank" rel="noreferrer">Open / Download</a></div>' +
+            '</div>';
+        } else {
+          content.innerHTML =
+            '<div class="text">' + esc(m.caption || "Document") + '</div>' +
+            '<div class="media"><div class="fileBox">' +
+              '<div class="fileMeta"><div><b>' + esc(m.type || "document") + '</b></div>' +
+              '<div class="mutedSmall mono">' + esc(m.mime_type || "") + '</div></div>' +
+              '<a class="btnLink" href="' + esc(m.local_media_url) + '" target="_blank" rel="noreferrer">Download</a>' +
+            '</div></div>';
+        }
+      } else {
+        content.innerHTML =
+          '<div class="text">' + esc(m.caption || m.text || ("[" + (m.type||"") + "]")) + '</div>';
+      }
+
+      bubble.appendChild(meta);
+      bubble.appendChild(content);
+      row.appendChild(bubble);
+      return row;
+    }
+
+    async function fetchAndAppendNew() {
+      const lastId = getLastId();
+      const url = '/customers/' + encodeURIComponent(WA_ID) + '/messages?after=' + encodeURIComponent(String(lastId)) + '&limit=300';
+      const r = await fetch(url, { headers: { 'Accept': 'application/json' }});
+      if (!r.ok) return;
+      const data = await r.json();
+      const msgs = (data && data.messages) ? data.messages : [];
+      if (!msgs.length) return;
+
+      const chat = document.getElementById("chat");
+      for (const m of msgs) {
+        chat.appendChild(renderOne(m));
+      }
+
+      const c = document.getElementById("msgCount");
+      if (c) c.textContent = String(parseInt(c.textContent || "0", 10) + msgs.length);
+
+      // auto scroll to bottom if user already near bottom
+      const nearBottom = (window.innerHeight + window.scrollY) >= (document.body.offsetHeight - 180);
+      if (nearBottom) window.scrollTo(0, document.body.scrollHeight);
+    }
+
+    es.addEventListener("new_message", async (e) => {
+      try {
+        const payload = JSON.parse(e.data || "{}");
+        if (payload.wa_id !== WA_ID) return;
+        await fetchAndAppendNew();
+      } catch(err) {}
+    });
+  </script>
 </body>
 </html>`;
 
@@ -1498,11 +1681,22 @@ app.get("/send", (req, res) => {
   button{padding:10px 14px; border:1px solid #e5e7eb; border-radius:12px; background:#2563eb; color:#fff; cursor:pointer;}
   button:hover{background:#1d4ed8;}
   .muted{color:#6b7280; font-size:13px;}
+  .top{display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;}
+  .ghostBtn{padding:10px 14px; border:1px solid #e5e7eb; border-radius:12px; background:#fff; cursor:pointer;}
+  .ghostBtn:hover{background:#f9fafb;}
 </style>
 </head><body>
   <div class="card">
-    <h2 style="margin:0 0 8px 0;">Send WhatsApp Message</h2>
-    <div class="muted">Text + optional file upload</div>
+    <div class="top">
+      <div>
+        <h2 style="margin:0 0 8px 0;">Send WhatsApp Message</h2>
+        <div class="muted">Text + optional file upload • V2.1 Session</div>
+      </div>
+      <form method="post" action="/logout">
+        <button class="ghostBtn" type="submit">Logout</button>
+      </form>
+    </div>
+
     <form method="post" action="/send" enctype="multipart/form-data" style="margin-top:12px;">
       <label class="muted">To (wa_id)</label>
       <input name="to" required/>
@@ -1531,7 +1725,6 @@ app.post("/send", upload.single("file"), async (req, res) => {
     const hasFile = !!req.file;
     if (!hasFile && !text) return res.status(400).send("Missing 'text' (or upload a file)");
 
-    // build payload
     let payload = null;
     let outType = "text";
     let uploadedMediaId = null;
@@ -1576,10 +1769,8 @@ app.post("/send", upload.single("file"), async (req, res) => {
     const data = await r.json();
     if (!r.ok) throw new Error(`Send failed: ${JSON.stringify(data)}`);
 
-    // Save outgoing to DB
     const conv = await getOrCreateConversation(to, null);
 
-    // If media file, keep a copy for preview (ephemeral without volume)
     let localOriginalUrl = null;
     let localThumbUrl = null;
     let localSavedPath = null;
@@ -1595,7 +1786,6 @@ app.post("/send", upload.single("file"), async (req, res) => {
       localSavedPath = dest;
       localOriginalUrl = mediaOriginalPath(to, outName);
 
-      // thumb if image + sharp
       if (sharp && (mimeType || "").toLowerCase().startsWith("image/")) {
         const stem = outName.replace(/\.[^.]+$/, "");
         const thumbAbs = path.join(thumbsDir, safeFileName(to), `${stem}.webp`);
@@ -1625,6 +1815,8 @@ app.post("/send", upload.single("file"), async (req, res) => {
       local_file_path: localSavedPath,
     });
 
+    sseBroadcast("new_message", { wa_id: to, direction: "outgoing", ts: Date.now() });
+
     if (redirectTo) {
       const u = new URL(redirectTo, "http://localhost");
       u.searchParams.set("sent", "1");
@@ -1651,10 +1843,9 @@ app.post("/send", upload.single("file"), async (req, res) => {
     await dbPing();
     console.log("✅ DB connected");
     await dbInit();
-    console.log("✅ messages table ready");
+    console.log("✅ tables ready");
   } catch (e) {
     console.error("❌ DB init failed:", e);
-    // still start server, but UI/API will error; you can check /__version
   }
 
   app.listen(PORT, () => {
@@ -1666,13 +1857,14 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("APP_SECRET SET:", APP_SECRET ? "YES" : "NO");
     console.log("UI_USER SET:", UI_USER ? "YES" : "NO");
     console.log("UI_PASS SET:", UI_PASS ? "YES" : "NO");
+    console.log("SESSION_SECRET SET:", SESSION_SECRET ? "YES" : "NO");
     console.log("WA_TOKEN SET:", WA_TOKEN ? "YES" : "NO");
     console.log("PHONE_NUMBER_ID SET:", PHONE_NUMBER_ID ? "YES" : "NO");
     console.log("DATABASE_URL SET:", !!DATABASE_URL);
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: FAST_A_DB_COMPAT_2026-03-02_v1_PATCH5_ID_FROM_WAID_TRIGGER");
+    console.log("VERSION MARKER: V2.1_SESSION_SSE_DB_MEDIA_2026-03-04");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
