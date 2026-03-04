@@ -28,7 +28,7 @@
  */
 
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V3 STABLE (SESSION + SSE + DB + MEDIA + UNREAD + SEARCH + TAGS + STATUS) (2026-03-04)");
+console.log("✅ LOADED SERVER.JS: V3.0.2 FIXED STABLE (SESSION + SSE + DB + MEDIA + UNREAD + SEARCH + TAGS + STATUS) (2026-03-04)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -1314,15 +1314,16 @@ app.get("/ui", async (req, res) => {
       const st = esc((c.status || 'open').toLowerCase());
       const stHtml = '<span class="status '+st+'">'+st+'</span>';
 
-      return '' +
-        '<tr>' +
-          '<td class="mono"><a href="/ui/customer/'+ encodeURIComponent(c.wa_id) +'">' + esc(c.wa_id) + '</a></td>' +
-          '<td>' + esc(c.profile_name || '') + '</td>' +
-          '<td>' + stHtml + '</td>' +
-          '<td>' + (tagsHtml || '<span class="muted">-</span>') + '</td>' +
-          '<td>' + esc(fmt(c.last_time)) + '</td>' +
-          '<td>' + unreadBadge + ' ' + lastDir + ' <span class="preview">' + preview + '</span></td>' +
-        '</tr>';
+      return `
+        <tr>
+          <td class="mono"><a href="/ui/customer/${encodeURIComponent(c.wa_id)}">${esc(c.wa_id)}</a></td>
+          <td>${esc(c.profile_name || '')}</td>
+          <td>${stHtml}</td>
+          <td>${tagsHtml || '<span class="muted">-</span>'}</td>
+          <td>${esc(fmt(c.last_time))}</td>
+          <td>${unreadBadge} ${lastDir} <span class="preview">${preview}</span></td>
+        </tr>
+      `;
     }
 
     async function refreshCustomers({playSound=false}={}){
