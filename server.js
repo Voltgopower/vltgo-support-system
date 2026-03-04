@@ -1,7 +1,7 @@
 /**
- * WhatsApp Webhook Server (V2.1 - SESSION + SSE + DB + MEDIA + LIGHT UI) - 2026-03-04
+ * WhatsApp Webhook Server (V2.2 - SESSION + SSE + DB + MEDIA + LIGHT UI) - 2026-03-04
  *
- * V2.1 changes vs V2:
+ * V2.2 changes vs V2:
  * - Customer chat page updates incrementally (no full page reload):
  *   - SSE "new_message" triggers fetch /customers/:wa_id/messages?after=<last_id>
  *   - Appends new messages to DOM
@@ -31,7 +31,7 @@
  */
 
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V2.1 SESSION + SSE + INCREMENTAL UI (2026-03-04)");
+console.log("✅ LOADED SERVER.JS: V2.2 SESSION + SSE + INCREMENTAL UI (2026-03-04)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -100,7 +100,7 @@ app.use(express.urlencoded({ extended: false }));
 // Trust proxy (Railway / reverse proxy) so secure cookies work correctly
 app.set("trust proxy", 1);
 
-// ========= Session Auth (V2.1) =========
+// ========= Session Auth (V2.2) =========
 app.use(
   session({
     name: "vltgo.sid",
@@ -485,7 +485,7 @@ function getTags(text) {
   return tags;
 }
 
-// ========= SSE PUSH (V2.1) =========
+// ========= SSE PUSH (V2.2) =========
 const sseClients = new Set();
 function sseBroadcast(event, payload) {
   const msg = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
@@ -662,7 +662,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "V2.1_SESSION_SSE_DB_MEDIA_2026-03-04",
+    marker: "V2.2_SESSION_SSE_DB_MEDIA_2026-03-04",
     node: process.version,
     has_DATABASE_URL: !!DATABASE_URL,
     db_ok: dbOk,
@@ -694,7 +694,7 @@ app.get("/login", (req, res) => {
 <body>
   <div class="card">
     <h2>WhatsApp CS Login</h2>
-    <div class="muted">V2.1 Session • ${escapeHtml(new Date().toLocaleString())}</div>
+    <div class="muted">V2.2 Session • ${escapeHtml(new Date().toLocaleString())}</div>
     <form method="post" action="/login" style="margin-top:12px;">
       <input name="username" placeholder="Username" autocomplete="username" required />
       <input name="password" placeholder="Password" type="password" autocomplete="current-password" required />
@@ -964,7 +964,7 @@ app.get("/customers", async (req, res) => {
   }
 });
 
-// V2.1: incremental fetch with ?after=<id>
+// V2.2: incremental fetch with ?after=<id>
 app.get("/customers/:wa_id/messages", async (req, res) => {
   try {
     const waId = String(req.params.wa_id || "").trim();
@@ -1096,7 +1096,7 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: V2.1_SESSION_SSE_DB_MEDIA_2026-03-04</div>
+        <div class="muted">DB-backed • Version: V2.2_SESSION_SSE_DB_MEDIA_2026-03-04</div>
       </div>
 
       <div class="topRight">
@@ -1135,7 +1135,7 @@ app.get("/ui", async (req, res) => {
       </table>
     </div>
 
-    <div class="footerNote">V2.1: session login + SSE realtime. Chat page updates incrementally.</div>
+    <div class="footerNote">V2.2: session login + SSE realtime. Chat page updates incrementally.</div>
   </div>
 
   <script>
@@ -1199,7 +1199,7 @@ async function fetchCustomersForUi({ q, unreadOnly, recent24 }) {
   return { customers };
 }
 
-// ========= UI: Customer chat (V2.1 incremental) =========
+// ========= UI: Customer chat (V2.2 incremental) =========
 app.get("/ui/customer/:wa_id", async (req, res) => {
   try {
     setNoCache(res);
@@ -1535,11 +1535,11 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: V2.1_SESSION_SSE_DB_MEDIA_2026-03-04</div>
+    <div class="muted" style="margin-top:10px;">Version: V2.2_SESSION_SSE_DB_MEDIA_2026-03-04</div>
   </div>
 
   <script>
-    // ===== V2.1 incremental realtime updates =====
+    // ===== V2.2 incremental realtime updates =====
     const WA_ID = "${escapeHtml(waId)}";
     const es = new EventSource("/events");
 
@@ -1690,7 +1690,7 @@ app.get("/send", (req, res) => {
     <div class="top">
       <div>
         <h2 style="margin:0 0 8px 0;">Send WhatsApp Message</h2>
-        <div class="muted">Text + optional file upload • V2.1 Session</div>
+        <div class="muted">Text + optional file upload • V2.2 Session</div>
       </div>
       <form method="post" action="/logout">
         <button class="ghostBtn" type="submit">Logout</button>
@@ -1864,7 +1864,7 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: V2.1_SESSION_SSE_DB_MEDIA_2026-03-04");
+    console.log("VERSION MARKER: V2.2_SESSION_SSE_DB_MEDIA_2026-03-04");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
