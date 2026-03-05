@@ -550,17 +550,69 @@ async function createTicketOrReopen(wa_id, dept, assignee) {
 }
 
 async function getOrCreateConversation(wa_id, dept) {
-  // Works for both fresh schema and older DBs (some legacy conversations tables do NOT have dept column).
+  // Legacy DB compatibility:
+  // - Some installations have conversations.id as the WhatsApp number (PK), and may not have wa_id column at all.
+  // - Some have wa_id column + serial id.
+  const hasWaId = await columnExists("conversations", "wa_id").catch(()=>false);
   const hasDept = await columnExists("conversations", "dept").catch(()=>false);
   const hasStatus = await columnExists("conversations", "status").catch(()=>false);
+  const hasUpdated = await columnExists("conversations", "updated_at").catch(()=>false);
+  const hasLastMsgAt = await columnExists("conversations", "last_message_at").catch(()=>false);
 
-  // helpers build WHERE/INSERT dynamically
+  const wid = String(wa_id);
+
+  // Helper to "touch" a conversation row if we can
+  async function touchById(idVal) {
+    if (hasUpdated || hasLastMsgAt) {
+      const sets = [];
+      const params = [idVal];
+      if (hasUpdated) sets.push("updated_at=NOW()");
+      if (hasLastMsgAt) sets.push("last_message_at=NOW()");
+      await pool.query("UPDATE conversations SET " + sets.join(", ") + " WHERE id=$1", params).catch(()=>{});
+    }
+  }
+
+  // --- Case A: legacy table where id is the wa_id (no wa_id column) ---
+  if (!hasWaId) {
+    // 1) Try select existing
+    try {
+      const r = await pool.query("SELECT id FROM conversations WHERE id=$1 LIMIT 1", [wid]);
+      if (r.rows.length) {
+        await touchById(r.rows[0].id);
+        return r.rows[0].id;
+      }
+    } catch (_) {}
+
+    // 2) Upsert by PK (id)
+    // Use ON CONFLICT to avoid duplicate key when webhook retries
+    const cols = ["id"];
+    const vals = ["$1"];
+    const params = [wid];
+
+    // Only add optional columns if they exist (avoid 'column does not exist')
+    if (hasStatus) { cols.push("status"); vals.push("'open'"); }
+    if (hasUpdated) { cols.push("updated_at"); vals.push("NOW()"); }
+    if (hasLastMsgAt) { cols.push("last_message_at"); vals.push("NOW()"); }
+
+    const insertSql =
+      "INSERT INTO conversations(" + cols.join(",") + ") VALUES(" + vals.join(",") + ") " +
+      "ON CONFLICT (id) DO UPDATE SET " + (hasUpdated || hasLastMsgAt ? [
+        hasUpdated ? "updated_at=NOW()" : null,
+        hasLastMsgAt ? "last_message_at=NOW()" : null
+      ].filter(Boolean).join(", ") : "id=EXCLUDED.id") +
+      " RETURNING id";
+    const ins = await pool.query(insertSql, params);
+    return ins.rows[0].id;
+  }
+
+  // --- Case B: normal table with wa_id column ---
+  // Build dynamic where clauses
   const whereDept = hasDept ? " AND COALESCE(dept,'')=$2 " : "";
-  const paramsOpen = hasDept ? [String(wa_id), String(dept||'')] : [String(wa_id)];
+  const paramsOpen = hasDept ? [wid, String(dept||'')] : [wid];
   const statusClauseOpen = hasStatus ? " AND COALESCE(status,'open') IN ('open','pending') " : "";
   const statusClauseClosed = hasStatus ? " AND COALESCE(status,'open')='closed' " : "";
 
-  // Find an open/pending conversation first
+  // Find an open/pending conversation
   try {
     const r = await pool.query(
       "SELECT id FROM conversations WHERE wa_id=$1" + whereDept + statusClauseOpen +
@@ -570,7 +622,7 @@ async function getOrCreateConversation(wa_id, dept) {
     if (r.rows.length) return r.rows[0].id;
   } catch (_) {}
 
-  // Reopen latest closed conversation if exists (if status column exists)
+  // Reopen latest closed conversation if status exists
   if (hasStatus) {
     try {
       const r = await pool.query(
@@ -580,39 +632,35 @@ async function getOrCreateConversation(wa_id, dept) {
       );
       if (r.rows.length) {
         const id = r.rows[0].id;
-        await pool.query("UPDATE conversations SET status='open', updated_at=NOW(), last_message_at=NOW() WHERE id=$1", [id]);
+        await pool.query("UPDATE conversations SET status='open', updated_at=NOW(), last_message_at=NOW() WHERE id=$1", [id]).catch(()=>{});
         return id;
       }
     } catch (_) {}
   }
 
-  // Create new conversation
+  // Create new conversation (use ON CONFLICT if unique on wa_id exists; otherwise plain insert)
   if (hasDept && hasStatus) {
     const ins = await pool.query(
       "INSERT INTO conversations(wa_id, dept, status, last_message_at, unread_count) VALUES($1,$2,'open',NOW(),0) RETURNING id",
-      [String(wa_id), String(dept||'')]
+      [wid, String(dept||'')]
     );
     return ins.rows[0].id;
   }
   if (hasDept && !hasStatus) {
     const ins = await pool.query(
       "INSERT INTO conversations(wa_id, dept, last_message_at, unread_count) VALUES($1,$2,NOW(),0) RETURNING id",
-      [String(wa_id), String(dept||'')]
+      [wid, String(dept||'')]
     );
     return ins.rows[0].id;
   }
   if (!hasDept && hasStatus) {
     const ins = await pool.query(
       "INSERT INTO conversations(wa_id, status, last_message_at, unread_count) VALUES($1,'open',NOW(),0) RETURNING id",
-      [String(wa_id)]
+      [wid]
     );
     return ins.rows[0].id;
   }
-  // minimal legacy table: only wa_id (+ timestamps maybe)
-  const ins = await pool.query(
-    "INSERT INTO conversations(wa_id) VALUES($1) RETURNING id",
-    [String(wa_id)]
-  );
+  const ins = await pool.query("INSERT INTO conversations(wa_id) VALUES($1) RETURNING id", [wid]);
   return ins.rows[0].id;
 }
 
@@ -871,7 +919,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.5 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.6 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1455,7 +1503,7 @@ app.get("/health", async (req, res) => { try { await dbPing(); res.json({ ok: tr
   console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.0.5.1");
+  console.log("VERSION MARKER: V4.7.0.6.1");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
