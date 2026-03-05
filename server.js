@@ -28,7 +28,7 @@
  */
 
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.0 STABLE (2026-03-04)");
+console.log("✅ LOADED SERVER.JS: Voltgo Support System V4.1 (Pre-Sales / After-Sales Routing) (2026-03-04)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -56,8 +56,74 @@ const APP_SECRET = process.env.APP_SECRET || null;
 const WA_TOKEN = process.env.WA_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
+// ======= Dept routing (Pre-sales / After-sales) =======
+const PRESALES_ASSIGNEE = process.env.PRESALES_ASSIGNEE || "presales";
+const AFTERSALES_ASSIGNEE = process.env.AFTERSALES_ASSIGNEE || "aftersales";
+const ROUTING_MENU_TEXT =
+  process.env.ROUTING_MENU_TEXT ||
+  "Hi! Please choose:\n1) Pre-Sales (Quote / Order)\n2) After-Sales (Tech / Warranty)\nReply with 1 or 2.";
+
+function normalizeText(s) { return String(s || "").trim(); }
+
+function detectDeptChoice(s) {
+  const raw = normalizeText(s);
+  if (!raw) return null;
+  const low = raw.toLowerCase();
+
+  if (raw === "1" || low === "presales" || low === "pre-sales" || low === "sales" || low.includes("售前")) return "presales";
+  if (raw === "2" || low === "aftersales" || low === "after-sales" || low === "support" || low.includes("售后")) return "aftersales";
+
+  if (low.includes("price") || low.includes("quote") || low.includes("wholesale") || low.includes("dealer") || low.includes("buy")) return "presales";
+  if (low.includes("warranty") || low.includes("problem") || low.includes("issue") || low.includes("broken") || low.includes("bms") || low.includes("install") || low.includes("return")) return "aftersales";
+
+  return null;
+}
+
+function deptToAssignee(dept) {
+  if (dept === "presales") return PRESALES_ASSIGNEE;
+  if (dept === "aftersales") return AFTERSALES_ASSIGNEE;
+  return "";
+}
+
+
 const UI_USER = process.env.UI_USER;
 const UI_PASS = process.env.UI_PASS;
+
+const UI_USERS_RAW = process.env.UI_USERS || "";
+function parseUiUsers(raw) {
+  const map = {};
+  if (!raw) return map;
+  // Allow JSON: {"admin":"pass","presales":"p1","aftersales":"p2"}
+  try {
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj === "object") {
+      for (const [k, v] of Object.entries(obj)) {
+        if (k && v) map[String(k).trim()] = String(v);
+      }
+      return map;
+    }
+  } catch {}
+  // Allow CSV: admin:pass,presales:p1,aftersales:p2
+  for (const part of String(raw).split(",")) {
+    const p = part.trim();
+    if (!p) continue;
+    const i = p.indexOf(":");
+    if (i <= 0) continue;
+    const u = p.slice(0, i).trim();
+    const pw = p.slice(i + 1).trim();
+    if (u && pw) map[u] = pw;
+  }
+  return map;
+}
+const UI_USERS = parseUiUsers(UI_USERS_RAW);
+
+function checkCredentials(username, password) {
+  if (!username || !password) return false;
+  if (UI_USERS && UI_USERS[username] && UI_USERS[username] === password) return true;
+  if (UI_USER && UI_PASS && username === UI_USER && password === UI_PASS) return true;
+  return false;
+}
+
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const SESSION_SECRET = process.env.SESSION_SECRET || "CHANGE_ME_SESSION_SECRET";
@@ -320,7 +386,7 @@ async function getOrCreateConversation(waId, profileName) {
     DO UPDATE SET
       profile_name = COALESCE(EXCLUDED.profile_name, conversations.profile_name),
       updated_at = NOW()
-    RETURNING id, wa_id, profile_name, tags, status, last_seen_incoming_at;
+    RETURNING id, wa_id, profile_name, tags, status, last_seen_incoming_at, note, assigned_to;
     `,
     [wa_id, profileName || null]
   );
@@ -679,6 +745,23 @@ async function downloadIncomingMedia(waId, mediaId) {
   };
 }
 
+
+async function sendWhatsAppText(to, bodyText) {
+  const toNum = String(to || "").trim();
+  const body = String(bodyText || "").trim();
+  if (!toNum || !body) return;
+
+  const payload = { messaging_product: "whatsapp", to: toNum, type: "text", text: { body } };
+  const url = `https://graph.facebook.com/v25.0/${PHONE_NUMBER_ID}/messages`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${WA_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) console.warn("❌ sendWhatsAppText failed:", r.status, data);
+}
+
 async function uploadMediaToWhatsApp(filePath, mimeType) {
   const buf = fs.readFileSync(filePath);
   const name = path.basename(filePath);
@@ -714,7 +797,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "V4_STABLE_2026-03-04",
+    marker: "V4_1_STABLE_2026-03-04",
     node: process.version,
     db_ok: dbOk,
     sharp: !!sharp,
@@ -760,7 +843,7 @@ app.post("/login", (req, res) => {
   const username = (req.body.username || "").trim();
   const password = (req.body.password || "").trim();
 
-  if (username === UI_USER && password === UI_PASS) {
+  if (checkCredentials(username, password)) {
     req.session.user = { username, at: Date.now() };
     return res.redirect("/ui");
   }
@@ -875,6 +958,32 @@ app.post("/webhook", (req, res) => {
       const autoTags = getAutoTags(text || caption || "");
       const conv = await getOrCreateConversation(waId, profileName);
 
+      // ===== Dept routing (first inbound only & not assigned) =====
+      try {
+        const routeText = (text || caption || "").toString();
+        const dept = detectDeptChoice(routeText);
+        const currentAssigned = (conv.assigned_to || "").toString().trim();
+
+        const cntR = await pool.query(`SELECT COUNT(*)::int AS n FROM messages WHERE conversation_id = $1`, [conv.id]);
+        const msgCount = Number(cntR.rows?.[0]?.n || 0);
+
+        if (msgCount === 0 && !currentAssigned) {
+          if (dept) {
+            const assignee = deptToAssignee(dept);
+            if (assignee) {
+              await setConversationAssignee(waId, assignee);
+              try { await addConversationTag(waId, dept); } catch {}
+            }
+          } else {
+            await sendWhatsAppText(waId, ROUTING_MENU_TEXT);
+          }
+        }
+      } catch (e) {
+        console.warn("routing error:", e?.message || e);
+      }
+
+
+
       await insertMessage({
         conversation_id: conv.id,
         wa_id: waId,
@@ -964,6 +1073,11 @@ app.get("/customers", async (req, res) => {
     const recent24 = (req.query.recent24 || "").toString() === "1";
     const ctag = (req.query.ctag || "").toString().trim().toLowerCase();
     const status = (req.query.status || "").toString().trim().toLowerCase();
+    let assigneeQ = (req.query.assignee || "").toString().trim();
+    if (assigneeQ.toLowerCase() === "mine") {
+      assigneeQ = (req.session.user && req.session.user.username) ? String(req.session.user.username) : "";
+    }
+
 
     const validStatus = status ? ["open", "waiting", "closed"].includes(status) : true;
     if (!validStatus) return res.status(400).json({ ok: false, error: "invalid status" });
@@ -987,6 +1101,11 @@ app.get("/customers", async (req, res) => {
           AND ($1::text = '' OR c.status = $1)
           AND ($2::text = '' OR EXISTS (
             SELECT 1 FROM jsonb_array_elements_text(c.tags) t WHERE lower(t) = $2
+          ))
+          AND ($3::text = '' OR (
+            lower($3::text) = 'unassigned' AND COALESCE(c.assigned_to,'') = ''
+          ) OR (
+            lower($3::text) <> 'unassigned' AND c.assigned_to = $3
           ))
       ),
       lastmsg AS (
@@ -1264,7 +1383,7 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: V4_STABLE_2026-03-04</div>
+        <div class="muted">DB-backed • Version: V4_1_STABLE_2026-03-04</div>
       </div>
 
       <div class="topRight">
@@ -1294,6 +1413,13 @@ app.get("/ui", async (req, res) => {
           <option value="waiting" ${status==="waiting"?"selected":""}>waiting</option>
           <option value="closed" ${status==="closed"?"selected":""}>closed</option>
         </select>
+        <select name="assignee">
+          <option value="" ${assignee===""?"selected":""}>All assignees</option>
+          <option value="mine" ${assignee==="mine"?"selected":""}>Mine</option>
+          <option value="unassigned" ${assignee==="unassigned"?"selected":""}>Unassigned</option>
+          <option value="${escapeHtml(PRESALES_ASSIGNEE)}" ${assignee===PRESALES_ASSIGNEE?"selected":""}>Pre-Sales</option>
+          <option value="${escapeHtml(AFTERSALES_ASSIGNEE)}" ${assignee===AFTERSALES_ASSIGNEE?"selected":""}>After-Sales</option>
+        </select>
         <button type="submit">Apply</button>
         <a class="muted" href="/ui">Clear</a>
       </form>
@@ -1319,7 +1445,7 @@ app.get("/ui", async (req, res) => {
       </table>
     </div>
 
-    <div class="footerNote">V4: realtime + unread + search + tags + status + assignee + notes.</div>
+    <div class="footerNote">V4.1: dept routing + multi-agent login + assignee filter + notes + tags + realtime.</div>
   </div>
 
   <script>
@@ -1826,7 +1952,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: V4_STABLE_2026-03-04</div>
+    <div class="muted" style="margin-top:10px;">Version: V4_1_STABLE_2026-03-04</div>
   </div>
 
   <script>
@@ -2267,7 +2393,7 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: V4_STABLE_2026-03-04");
+    console.log("VERSION MARKER: V4_1_STABLE_2026-03-04");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
