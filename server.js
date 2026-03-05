@@ -258,6 +258,16 @@ await addColumnIfMissing("messages", "msg_type", "msg_type TEXT DEFAULT 'text'")
   await addColumnIfMissing("messages", "thumb_path", "thumb_path TEXT");
   await addColumnIfMissing("messages", "wa_message_id", "wa_message_id TEXT");
   await addColumnIfMissing("messages", "created_at", "created_at TIMESTAMP DEFAULT NOW()");
+  // conversations table compatibility (legacy V4.6 DBs may have a minimal conversations table)
+  try { await pool.query("CREATE TABLE IF NOT EXISTS conversations (id BIGSERIAL PRIMARY KEY, wa_id TEXT NOT NULL, created_at TIMESTAMP DEFAULT NOW())"); } catch (_) {}
+  await addColumnIfMissing("conversations", "wa_id", "wa_id TEXT");
+  await addColumnIfMissing("conversations", "dept", "dept TEXT");
+  await addColumnIfMissing("conversations", "status", "status TEXT DEFAULT 'open'");
+  await addColumnIfMissing("conversations", "created_at", "created_at TIMESTAMP DEFAULT NOW()");
+  await addColumnIfMissing("conversations", "updated_at", "updated_at TIMESTAMP DEFAULT NOW()");
+  await addColumnIfMissing("conversations", "last_message_at", "last_message_at TIMESTAMP");
+  await addColumnIfMissing("conversations", "last_message", "last_message TEXT");
+  await addColumnIfMissing("conversations", "unread_count", "unread_count INT DEFAULT 0");
 
   await pool.query(
     "UPDATE tickets SET dept = CASE " +
@@ -540,31 +550,68 @@ async function createTicketOrReopen(wa_id, dept, assignee) {
 }
 
 async function getOrCreateConversation(wa_id, dept) {
-  // Works for both fresh schema and older DBs that require conversation_id on messages.
+  // Works for both fresh schema and older DBs (some legacy conversations tables do NOT have dept column).
+  const hasDept = await columnExists("conversations", "dept").catch(()=>false);
+  const hasStatus = await columnExists("conversations", "status").catch(()=>false);
+
+  // helpers build WHERE/INSERT dynamically
+  const whereDept = hasDept ? " AND COALESCE(dept,'')=$2 " : "";
+  const paramsOpen = hasDept ? [String(wa_id), String(dept||'')] : [String(wa_id)];
+  const statusClauseOpen = hasStatus ? " AND COALESCE(status,'open') IN ('open','pending') " : "";
+  const statusClauseClosed = hasStatus ? " AND COALESCE(status,'open')='closed' " : "";
+
   // Find an open/pending conversation first
   try {
     const r = await pool.query(
-      "SELECT id FROM conversations WHERE wa_id=$1 AND COALESCE(dept,'')=$2 AND COALESCE(status,'open') IN ('open','pending') ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1",
-      [String(wa_id), String(dept||'')]
+      "SELECT id FROM conversations WHERE wa_id=$1" + whereDept + statusClauseOpen +
+      " ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1",
+      paramsOpen
     );
     if (r.rows.length) return r.rows[0].id;
   } catch (_) {}
-  // Reopen latest closed conversation if exists
-  try {
-    const r = await pool.query(
-      "SELECT id FROM conversations WHERE wa_id=$1 AND COALESCE(dept,'')=$2 AND COALESCE(status,'open')='closed' ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1",
+
+  // Reopen latest closed conversation if exists (if status column exists)
+  if (hasStatus) {
+    try {
+      const r = await pool.query(
+        "SELECT id FROM conversations WHERE wa_id=$1" + whereDept + statusClauseClosed +
+        " ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1",
+        paramsOpen
+      );
+      if (r.rows.length) {
+        const id = r.rows[0].id;
+        await pool.query("UPDATE conversations SET status='open', updated_at=NOW(), last_message_at=NOW() WHERE id=$1", [id]);
+        return id;
+      }
+    } catch (_) {}
+  }
+
+  // Create new conversation
+  if (hasDept && hasStatus) {
+    const ins = await pool.query(
+      "INSERT INTO conversations(wa_id, dept, status, last_message_at, unread_count) VALUES($1,$2,'open',NOW(),0) RETURNING id",
       [String(wa_id), String(dept||'')]
     );
-    if (r.rows.length) {
-      const id = r.rows[0].id;
-      await pool.query("UPDATE conversations SET status='open', updated_at=NOW(), last_message_at=NOW() WHERE id=$1", [id]);
-      return id;
-    }
-  } catch (_) {}
-  // Create new
+    return ins.rows[0].id;
+  }
+  if (hasDept && !hasStatus) {
+    const ins = await pool.query(
+      "INSERT INTO conversations(wa_id, dept, last_message_at, unread_count) VALUES($1,$2,NOW(),0) RETURNING id",
+      [String(wa_id), String(dept||'')]
+    );
+    return ins.rows[0].id;
+  }
+  if (!hasDept && hasStatus) {
+    const ins = await pool.query(
+      "INSERT INTO conversations(wa_id, status, last_message_at, unread_count) VALUES($1,'open',NOW(),0) RETURNING id",
+      [String(wa_id)]
+    );
+    return ins.rows[0].id;
+  }
+  // minimal legacy table: only wa_id (+ timestamps maybe)
   const ins = await pool.query(
-    "INSERT INTO conversations(wa_id, dept, status, last_message_at, unread_count) VALUES($1,$2,'open',NOW(),0) RETURNING id",
-    [String(wa_id), String(dept||'')]
+    "INSERT INTO conversations(wa_id) VALUES($1) RETURNING id",
+    [String(wa_id)]
   );
   return ins.rows[0].id;
 }
@@ -824,7 +871,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.4 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.5 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1408,7 +1455,7 @@ app.get("/health", async (req, res) => { try { await dbPing(); res.json({ ok: tr
   console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.0.4.1");
+  console.log("VERSION MARKER: V4.7.0.5.1");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
