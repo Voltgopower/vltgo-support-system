@@ -28,7 +28,7 @@
  */
 
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V3.0.2 FIXED STABLE (SESSION + SSE + DB + MEDIA + UNREAD + SEARCH + TAGS + STATUS) (2026-03-04)");
+console.log("✅ LOADED SERVER.JS: V4.0 STABLE (2026-03-04)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -243,6 +243,13 @@ async function dbInit() {
         ALTER TABLE conversations ADD COLUMN created_at TIMESTAMPTZ DEFAULT now();
       END IF;
 
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='note') THEN
+        ALTER TABLE conversations ADD COLUMN note TEXT;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='conversations' AND column_name='assigned_to') THEN
+        ALTER TABLE conversations ADD COLUMN assigned_to TEXT;
+      END IF;
+
       IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='messages' AND column_name='wa_id') THEN
         ALTER TABLE messages ADD COLUMN wa_id TEXT;
       END IF;
@@ -396,6 +403,21 @@ async function setConversationStatus(waId, status) {
   const ok = ["open", "waiting", "closed"].includes(s);
   if (!ok) throw new Error("Invalid status. Use: open / waiting / closed");
   await pool.query(`UPDATE conversations SET status = $2, updated_at = NOW() WHERE wa_id = $1`, [String(waId), s]);
+}
+
+
+async function setConversationNote(waId, note) {
+  await pool.query(
+    `UPDATE conversations SET note = $2, updated_at = now() WHERE wa_id = $1`,
+    [waId, note || ""]
+  );
+}
+
+async function setConversationAssignee(waId, assignee) {
+  await pool.query(
+    `UPDATE conversations SET assigned_to = $2, updated_at = now() WHERE wa_id = $1`,
+    [waId, assignee || ""]
+  );
 }
 
 async function addConversationTag(waId, tag) {
@@ -692,7 +714,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "V3_STABLE_2026-03-04",
+    marker: "V4_STABLE_2026-03-04",
     node: process.version,
     db_ok: dbOk,
     sharp: !!sharp,
@@ -957,7 +979,9 @@ app.get("/customers", async (req, res) => {
           c.tags AS conv_tags,
           c.status,
           c.last_message_at,
-          c.last_seen_incoming_at
+          c.last_seen_incoming_at,
+          c.note,
+          c.assigned_to
         FROM conversations c
         WHERE 1=1
           AND ($1::text = '' OR c.status = $1)
@@ -995,7 +1019,9 @@ app.get("/customers", async (req, res) => {
         l.last_text,
         l.msg_type AS last_type,
         l.direction AS last_direction,
-        COALESCE(u.unread_count, 0) AS unread_count
+        COALESCE(u.unread_count, 0) AS unread_count,
+        b.note,
+        b.assigned_to
       FROM base b
       LEFT JOIN lastmsg l ON l.conversation_id = b.id
       LEFT JOIN unread u ON u.conversation_id = b.id
@@ -1017,6 +1043,8 @@ app.get("/customers", async (req, res) => {
       last_type: x.last_type || null,
       last_direction: x.last_direction || null,
       unread_count: Number(x.unread_count || 0),
+      note: x.note || '',
+      assigned_to: x.assigned_to || '',
     }));
 
     // Additional filters that depend on last message time/content
@@ -1128,6 +1156,33 @@ app.post("/customers/:wa_id/status", async (req, res) => {
   }
 });
 
+// Conversation note APIs
+app.post("/customers/:wa_id/note", async (req, res) => {
+  try {
+    const waId = String(req.params.wa_id || "").trim();
+    const note = String(req.body.note || "");
+    await setConversationNote(waId, note);
+    sseBroadcast("conv_update", { wa_id: waId, ts: Date.now() });
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+// Conversation assignee APIs
+app.post("/customers/:wa_id/assign", async (req, res) => {
+  try {
+    const waId = String(req.params.wa_id || "").trim();
+    const assignee = String(req.body.assignee || "");
+    await setConversationAssignee(waId, assignee);
+    sseBroadcast("conv_update", { wa_id: waId, ts: Date.now() });
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(400).json({ ok: false, error: e?.message || String(e) });
+  }
+});
+
+
 // ========= UI: Customers list =========
 app.get("/ui", async (req, res) => {
   try {
@@ -1191,6 +1246,9 @@ app.get("/ui", async (req, res) => {
     .status.waiting{border-color:#fde68a; background:#fffbeb; color:#b45309;}
     .status.closed{border-color:#e5e7eb; background:#f3f4f6; color:#6b7280;}
     .pill{display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; font-size:12px; margin-right:6px; background:#fafafa; color:var(--muted);}
+    .pill.assignee{background:#eef2ff;color:#1e3a8a;border:1px solid #c7d2fe;}
+    .pill.user{background:#f3f4f6;color:#111827;border:1px solid #e5e7eb;}
+    .note{display:inline-block;max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom;}
     .pill.incoming{border-color:#bfdbfe; background:#eff6ff; color:#1d4ed8;}
     .pill.outgoing{border-color:#bbf7d0; background:#ecfdf5; color:#047857;}
     .preview{color:#111827;}
@@ -1206,12 +1264,14 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: V3_STABLE_2026-03-04</div>
+        <div class="muted">DB-backed • Version: V4_STABLE_2026-03-04</div>
       </div>
 
       <div class="topRight">
         <div class="soundWrap">
           <label class="muted"><input id="soundToggle" type="checkbox" checked/> Sound</label>
+          <span class="pill user" style="margin-left:8px;">👤 ${escapeHtml((req.session.user && req.session.user.username) ? req.session.user.username : "")}</span>
+          <span class="pill user" title="Logged in user">👤 ${escapeHtml((req.session.user && req.session.user.username) ? req.session.user.username : "")}</span>
         </div>
         <form method="post" action="/logout" onsubmit="return confirm(\'Logout now?\');">
           <button class="chip" type="submit"><b>🚪 Logout</b></button>
@@ -1247,6 +1307,8 @@ app.get("/ui", async (req, res) => {
             <th>Name</th>
             <th>Status</th>
             <th>Conv tags</th>
+            <th>Assignee</th>
+            <th>Note</th>
             <th>Last time</th>
             <th>Last message</th>
           </tr>
@@ -1257,7 +1319,7 @@ app.get("/ui", async (req, res) => {
       </table>
     </div>
 
-    <div class="footerNote">V3: realtime + unread pinned + search + tags + status.</div>
+    <div class="footerNote">V4: realtime + unread + search + tags + status + assignee + notes.</div>
   </div>
 
   <script>
@@ -1321,12 +1383,23 @@ app.get("/ui", async (req, res) => {
       const st = esc((c.status || 'open').toLowerCase());
       const stHtml = '<span class="status '+st+'">'+st+'</span>';
 
+      const aRaw = (c.assigned_to || '').toString();
+      const aHtml = aRaw ? '<span class="pill assignee">'+esc(aRaw)+'</span>' : '<span class="muted">-</span>';
+
+      const noteRaw = (c.note || '').toString();
+      const noteShort = noteRaw.length > 24 ? (noteRaw.slice(0,24) + '…') : noteRaw;
+      const noteHtml = noteRaw
+        ? '<span class="note" title="'+esc(noteRaw)+'">'+esc(noteShort)+'</span>'
+        : '<span class="muted">-</span>';
+
       return '' +
         '<tr>' +
           '<td class="mono"><a href="/ui/customer/' + encodeURIComponent(c.wa_id) + '">' + esc(c.wa_id) + '</a></td>' +
           '<td>' + esc(c.profile_name || '') + '</td>' +
           '<td>' + stHtml + '</td>' +
           '<td>' + (tagsHtml || '<span class="muted">-</span>') + '</td>' +
+          '<td>' + aHtml + '</td>' +
+          '<td>' + noteHtml + '</td>' +
           '<td>' + esc(fmt(c.last_time)) + '</td>' +
           '<td>' + unreadBadge + ' ' + lastDir + ' <span class="preview">' + preview + '</span></td>' +
         '</tr>';
@@ -1389,7 +1462,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
     const tag = (req.query.tag || "").toString().trim().toLowerCase();
 
     const convR = await pool.query(
-      `SELECT id, wa_id, profile_name, tags AS conv_tags, status, last_seen_incoming_at FROM conversations WHERE wa_id = $1`,
+      `SELECT id, wa_id, profile_name, tags AS conv_tags, status, last_seen_incoming_at, note, assigned_to FROM conversations WHERE wa_id = $1`,
       [waId]
     );
     if (convR.rows.length === 0) return res.status(404).send("Conversation not found");
@@ -1677,6 +1750,18 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
           <b>Conversation tags:</b> <span id="ctags">${convTagsHtml || '<span class="muted">-</span>'}</span>
         </div>
       </div>
+        <div class="muted" style="margin-top:6px;">
+          <b>Assignee:</b>
+          <input id="assigneeInp" style="width:180px;padding:6px 8px;border:1px solid var(--line);border-radius:10px;" value="${escapeHtml((conv.assigned_to||''))}" placeholder="e.g. admin"/>
+          <button id="assignBtn" type="button">Save</button>
+        </div>
+        <div class="muted" style="margin-top:6px;">
+          <b>Note:</b><br/>
+          <textarea id="noteInp" rows="3" style="width:420px;max-width:90vw;padding:8px;border:1px solid var(--line);border-radius:12px;">${escapeHtml((conv.note||''))}</textarea><br/>
+          <button id="noteBtn" type="button">Save Note</button>
+          <span id="noteSaved" class="muted" style="margin-left:8px;"></span>
+        </div>
+
 
       <div class="topRight">
         <div class="soundWrap">
@@ -1741,7 +1826,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: V3_STABLE_2026-03-04</div>
+    <div class="muted" style="margin-top:10px;">Version: V4_STABLE_2026-03-04</div>
   </div>
 
   <script>
@@ -1939,6 +2024,42 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
         alert('❌ Failed: ' + t);
       }
     });
+    // Assignee + Note
+    const assigneeInp = document.getElementById('assigneeInp');
+    const assignBtn = document.getElementById('assignBtn');
+    const noteInp = document.getElementById('noteInp');
+    const noteBtn = document.getElementById('noteBtn');
+    const noteSaved = document.getElementById('noteSaved');
+
+    async function postJson(url, body){
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(body || {})
+      });
+      const j = await r.json().catch(()=>({}));
+      if(!r.ok || j.ok === false) throw new Error(j.error || ('HTTP '+r.status));
+      return j;
+    }
+
+    assignBtn.addEventListener('click', async () => {
+      try{
+        assignBtn.disabled = true;
+        await postJson('/customers/${encodeURIComponent(waId)}/assign', { assignee: assigneeInp.value || '' });
+      }catch(e){ alert('Assign failed: ' + e.message); }
+      finally{ assignBtn.disabled = false; }
+    });
+
+    noteBtn.addEventListener('click', async () => {
+      try{
+        noteBtn.disabled = true;
+        await postJson('/customers/${encodeURIComponent(waId)}/note', { note: noteInp.value || '' });
+        noteSaved.textContent = 'Saved ✓';
+        setTimeout(()=>{ noteSaved.textContent=''; }, 1200);
+      }catch(e){ alert('Save note failed: ' + e.message); }
+      finally{ noteBtn.disabled = false; }
+    });
+
   </script>
 </body>
 </html>`;
@@ -2146,7 +2267,7 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: V3_STABLE_2026-03-04");
+    console.log("VERSION MARKER: V4_STABLE_2026-03-04");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
