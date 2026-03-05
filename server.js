@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.0.1_WEBHOOK_HOTFIX (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.0.8_WEBHOOK_HOTFIX (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -794,6 +794,12 @@ async function downloadInboundMedia(kind, m, wa_id) {
 app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
   const rawBody = req.body;
   try {
+    const ct = req.get("content-type") || "";
+    const typ = rawBody === null ? "null" : Array.isArray(rawBody) ? "array" : Buffer.isBuffer(rawBody) ? "buffer" : typeof rawBody;
+    console.log("📩 WEBHOOK HIT V4.7.0.8", { ct, typ, len: Buffer.isBuffer(rawBody) ? rawBody.length : undefined, t: new Date().toISOString() });
+  } catch (_) {}
+
+  try {
     // IMPORTANT:
     // If app.use(express.json()) runs before this route, req.body may already be an Object.
     // So we must support Buffer | string | object safely.
@@ -818,6 +824,7 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
     const profileName = contacts?.[0]?.profile?.name || "";
 
     const messages = value?.messages || [];
+    try { console.log('📨 WEBHOOK PARSED', { msgs: messages.length, hasContacts: (value?.contacts||[]).length, field: change?.field, t: new Date().toISOString() }); } catch (_) {}
     if (!messages.length) return res.json({ ok: true });
 
     for (const m of messages) {
@@ -914,12 +921,12 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.7 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.8 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
 
-app.get("/login", (req, res) => res.status(200).send(renderLogin()));
+app.get("/login", (req, res) => { res.set("Cache-Control","no-store"); return res.status(200).send(renderLogin()); });
 app.post("/login", (req, res) => {
   const u = String(req.body.username || "").trim();
   const p = String(req.body.password || "").trim();
@@ -1153,7 +1160,7 @@ app.post("/api/ticket-notes/add", requireAuth, async (req, res) => {
 });
 
 // -------- UI Dashboard --------
-app.get("/ui", requireAuth, (req, res) => {
+app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
   const user = getUser(req);
   res.send(`<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Voltgo Support System</title>
@@ -1202,7 +1209,7 @@ button.ghost:hover{background:#f1f5f9}
 </style></head>
 <body>
 <div class="top"><div><div class="brand">Voltgo Support System</div>
-<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.0.1</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
+<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.0.8</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
 <div class="meta">Strict Isolation: ${STRICT_AGENT_VIEW ? "ON" : "OFF"}</div></div>
 
 <div class="wrap">
@@ -1479,6 +1486,24 @@ loadTickets();
 
 app.get("/", (req, res) => res.redirect("/ui"));
 app.get("/health", async (req, res) => { try { await dbPing(); res.json({ ok: true }); } catch { res.status(500).json({ ok: false }); } });
+app.get("/version", (req, res) => {
+  res.set("Cache-Control","no-store");
+  res.json({
+    ok: true,
+    version: "V4.7.0.8",
+    node: process.version,
+    railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
+    railwayService: process.env.RAILWAY_SERVICE_NAME || null,
+    time: new Date().toISOString()
+  });
+});
+
+// Quick sanity endpoint to confirm your service is reachable
+app.get("/debug/ping", (req, res) => {
+  res.set("Cache-Control","no-store");
+  res.send("pong V4.7.0.8 " + new Date().toISOString());
+});
+
 
 // Boot init + listen
 (async () => {
@@ -1498,7 +1523,7 @@ app.get("/health", async (req, res) => { try { await dbPing(); res.json({ ok: tr
   console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.0.7.1");
+  console.log("VERSION MARKER: V4.7.0.8.1");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
