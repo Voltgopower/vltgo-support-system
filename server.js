@@ -28,7 +28,7 @@
  */
 
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: Voltgo Support System V4.1 (Pre-Sales / After-Sales Routing) (2026-03-04)");
+console.log("✅ LOADED SERVER.JS: Voltgo Support System V4.1.2 (UI assignee hotfix) (2026-03-04)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -797,7 +797,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "V4_1_STABLE_2026-03-04",
+    marker: "V4_1_2_STABLE_2026-03-04",
     node: process.version,
     db_ok: dbOk,
     sharp: !!sharp,
@@ -1313,6 +1313,7 @@ app.get("/ui", async (req, res) => {
     const recent24 = (req.query.recent24 || "").toString() === "1";
     const ctag = (req.query.ctag || "").toString().trim().toLowerCase();
     const status = (req.query.status || "").toString().trim().toLowerCase();
+    const assignee = (req.query.assignee || "").toString().trim();
 
     const currentParams = {
       q: q || "",
@@ -1385,7 +1386,7 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: V4_1_STABLE_2026-03-04</div>
+        <div class="muted">DB-backed • Version: V4_1_2_STABLE_2026-03-04</div>
       </div>
 
       <div class="topRight">
@@ -1954,7 +1955,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: V4_1_STABLE_2026-03-04</div>
+    <div class="muted" style="margin-top:10px;">Version: V4_1_2_STABLE_2026-03-04</div>
   </div>
 
   <script>
@@ -2395,7 +2396,7 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: V4_1_STABLE_2026-03-04");
+    console.log("VERSION MARKER: V4_1_2_STABLE_2026-03-04");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
