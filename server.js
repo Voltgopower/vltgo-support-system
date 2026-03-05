@@ -28,7 +28,7 @@
  */
 
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: Voltgo Support System V4.1.2 (UI assignee hotfix) (2026-03-04)");
+console.log("✅ LOADED SERVER.JS: Voltgo Support System V4.1.4 (UI assignee hotfix) (2026-03-04)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -116,6 +116,40 @@ function parseUiUsers(raw) {
   return map;
 }
 const UI_USERS = parseUiUsers(UI_USERS_RAW);
+
+const STRICT_AGENT_VIEW = String(process.env.STRICT_AGENT_VIEW || "").toLowerCase() === "1"
+  || String(process.env.STRICT_AGENT_VIEW || "").toLowerCase() === "true"
+  || String(process.env.STRICT_AGENT_VIEW || "").toLowerCase() === "yes";
+
+// Optional: comma-separated admin usernames (in addition to UI_USER)
+const ADMIN_USERS = String(process.env.ADMIN_USERS || "").split(",").map(s=>s.trim()).filter(Boolean);
+
+function getSessionUsername(req){
+  return (req && req.session && req.session.user && req.session.user.username) ? String(req.session.user.username) : "";
+}
+
+function isAdminUser(username){
+  if (!username) return false;
+  if (UI_USER && username === String(UI_USER)) return true;
+  if (username === "admin") return true;
+  return ADMIN_USERS.includes(username);
+}
+
+async function assertConversationAccess(req, waId){
+  if (!STRICT_AGENT_VIEW) return;
+  const username = getSessionUsername(req);
+  if (!username) return;
+  if (isAdminUser(username)) return;
+  // allow unassigned or assigned to self
+  const r = await pool.query("SELECT COALESCE(assigned_to,'') AS assigned_to FROM conversations WHERE wa_id=$1 LIMIT 1", [waId]);
+  if (r.rowCount === 0) return; // no conversation yet
+  const assigned = String(r.rows[0].assigned_to || "");
+  if (assigned && assigned !== username) {
+    const err = new Error("forbidden");
+    err.statusCode = 403;
+    throw err;
+  }
+}
 
 function checkCredentials(username, password) {
   if (!username || !password) return false;
@@ -797,7 +831,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "V4_1_3_STABLE_2026-03-04",
+    marker: "V4_1_4_STABLE_2026-03-04",
     node: process.version,
     db_ok: dbOk,
     sharp: !!sharp,
@@ -1073,10 +1107,22 @@ app.get("/customers", async (req, res) => {
     const recent24 = (req.query.recent24 || "").toString() === "1";
     const ctag = (req.query.ctag || "").toString().trim().toLowerCase();
     const status = (req.query.status || "").toString().trim().toLowerCase();
-    const assignee = (req.query.assignee || "").toString().trim();
+    let assignee = (req.query.assignee || "").toString().trim();
+    const __username = getSessionUsername(req);
+    const __strictView = STRICT_AGENT_VIEW && __username && !isAdminUser(__username);
+    if (__strictView && !assignee) assignee = "mine";
     let assigneeQ = (req.query.assignee || "").toString().trim();
     if (assigneeQ.toLowerCase() === "mine") {
-      assigneeQ = (req.session.user && req.session.user.username) ? String(req.session.user.username) : "";
+      assigneeQ = getSessionUsername(req);
+    }
+
+    // Strict isolation: non-admin can only see (unassigned OR assigned_to = self)
+    if (STRICT_AGENT_VIEW) {
+      const u = getSessionUsername(req);
+      if (u && !isAdminUser(u)) {
+        // Ignore requested assignee filter; enforce self+unassigned view
+        assigneeQ = `__SELF__:${u}`;
+      }
     }
 
 
@@ -1103,11 +1149,17 @@ app.get("/customers", async (req, res) => {
           AND ($2::text = '' OR EXISTS (
             SELECT 1 FROM jsonb_array_elements_text(c.tags) t WHERE lower(t) = $2
           ))
-          AND ($3::text = '' OR (
-            lower($3::text) = 'unassigned' AND COALESCE(c.assigned_to,'') = ''
-          ) OR (
-            lower($3::text) <> 'unassigned' AND c.assigned_to = $3
-          ))
+          AND (
+            $3::text = '' OR (
+              lower($3::text) = 'unassigned' AND COALESCE(c.assigned_to,'') = ''
+            ) OR (
+              $3::text LIKE '__SELF__:%' AND (
+                COALESCE(c.assigned_to,'') = '' OR c.assigned_to = split_part($3::text,':',2)
+              )
+            ) OR (
+              lower($3::text) <> 'unassigned' AND $3::text NOT LIKE '__SELF__:%' AND c.assigned_to = $3
+            )
+          )
       ),
       lastmsg AS (
         SELECT DISTINCT ON (m.conversation_id)
@@ -1192,6 +1244,7 @@ app.get("/customers", async (req, res) => {
 app.get("/customers/:wa_id/messages", async (req, res) => {
   try {
     const waId = String(req.params.wa_id || "").trim();
+    await assertConversationAccess(req, waId);
     const limit = Math.min(parseInt(req.query.limit || "500", 10) || 500, 3000);
     const after = (req.query.after || "").toString().trim();
     const afterId = after ? parseInt(after, 10) : 0;
@@ -1243,6 +1296,7 @@ app.get("/customers/:wa_id/messages", async (req, res) => {
 app.post("/customers/:wa_id/ctag/add", async (req, res) => {
   try {
     const waId = String(req.params.wa_id || "").trim();
+    await assertConversationAccess(req, waId);
     const tag = String(req.body.tag || "").trim().toLowerCase();
     await addConversationTag(waId, tag);
     sseBroadcast("conv_update", { wa_id: waId, ts: Date.now() });
@@ -1254,6 +1308,7 @@ app.post("/customers/:wa_id/ctag/add", async (req, res) => {
 app.post("/customers/:wa_id/ctag/remove", async (req, res) => {
   try {
     const waId = String(req.params.wa_id || "").trim();
+    await assertConversationAccess(req, waId);
     const tag = String(req.body.tag || "").trim().toLowerCase();
     await removeConversationTag(waId, tag);
     sseBroadcast("conv_update", { wa_id: waId, ts: Date.now() });
@@ -1267,6 +1322,7 @@ app.post("/customers/:wa_id/ctag/remove", async (req, res) => {
 app.post("/customers/:wa_id/status", async (req, res) => {
   try {
     const waId = String(req.params.wa_id || "").trim();
+    await assertConversationAccess(req, waId);
     const status = String(req.body.status || "").trim().toLowerCase();
     await setConversationStatus(waId, status);
     sseBroadcast("conv_update", { wa_id: waId, ts: Date.now() });
@@ -1280,6 +1336,7 @@ app.post("/customers/:wa_id/status", async (req, res) => {
 app.post("/customers/:wa_id/note", async (req, res) => {
   try {
     const waId = String(req.params.wa_id || "").trim();
+    await assertConversationAccess(req, waId);
     const note = String(req.body.note || "");
     await setConversationNote(waId, note);
     sseBroadcast("conv_update", { wa_id: waId, ts: Date.now() });
@@ -1293,6 +1350,7 @@ app.post("/customers/:wa_id/note", async (req, res) => {
 app.post("/customers/:wa_id/assign", async (req, res) => {
   try {
     const waId = String(req.params.wa_id || "").trim();
+    await assertConversationAccess(req, waId);
     const assignee = String(req.body.assignee || "");
     await setConversationAssignee(waId, assignee);
     sseBroadcast("conv_update", { wa_id: waId, ts: Date.now() });
@@ -1386,7 +1444,7 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: V4_1_3_STABLE_2026-03-04</div>
+        <div class="muted">DB-backed • Version: V4_1_4_STABLE_2026-03-04</div>
       </div>
 
       <div class="topRight">
@@ -1417,11 +1475,11 @@ app.get("/ui", async (req, res) => {
           <option value="closed" ${status==="closed"?"selected":""}>closed</option>
         </select>
         <select name="assignee">
-          <option value="" ${assignee===""?"selected":""}>All assignees</option>
+          ${__strictView ? "" : `<option value="" ${assignee===""?"selected":""}>All assignees</option>`}
           <option value="mine" ${assignee==="mine"?"selected":""}>Mine</option>
           <option value="unassigned" ${assignee==="unassigned"?"selected":""}>Unassigned</option>
-          <option value="${escapeHtml(PRESALES_ASSIGNEE)}" ${assignee===PRESALES_ASSIGNEE?"selected":""}>Pre-Sales</option>
-          <option value="${escapeHtml(AFTERSALES_ASSIGNEE)}" ${assignee===AFTERSALES_ASSIGNEE?"selected":""}>After-Sales</option>
+          ${__strictView ? "" : `<option value="${escapeHtml(PRESALES_ASSIGNEE)}" ${assignee===PRESALES_ASSIGNEE?"selected":""}>Pre-Sales</option>`}
+          ${__strictView ? "" : `<option value="${escapeHtml(AFTERSALES_ASSIGNEE)}" ${assignee===AFTERSALES_ASSIGNEE?"selected":""}>After-Sales</option>`}
         </select>
         <button type="submit">Apply</button>
         <a class="muted" href="/ui">Clear</a>
@@ -1584,6 +1642,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
     setNoCache(res);
 
     const waId = String(req.params.wa_id || "").trim();
+    await assertConversationAccess(req, waId);
     const q = (req.query.q || "").toString().trim().toLowerCase();
     const limit = Math.min(parseInt(req.query.limit || "800", 10) || 800, 3000);
     const recent24 = (req.query.recent24 || "").toString() === "1";
@@ -1955,7 +2014,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: V4_1_3_STABLE_2026-03-04</div>
+    <div class="muted" style="margin-top:10px;">Version: V4_1_4_STABLE_2026-03-04</div>
   </div>
 
   <script>
@@ -2396,7 +2455,7 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: V4_1_3_STABLE_2026-03-04");
+    console.log("VERSION MARKER: V4_1_4_STABLE_2026-03-04");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
