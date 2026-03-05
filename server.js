@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.1.0_WEBHOOK_HOTFIX (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.1.1_WEBHOOK_HOTFIX (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -157,6 +157,13 @@ async function detectSchema() {
     SCHEMA.tickets_has_conversation_id = await columnExists("tickets", "conversation_id");
   } catch (_) {}
   console.log("🧩 Schema detect:", SCHEMA);
+
+// Determine tickets department column name (legacy DBs may use 'department' instead of 'dept')
+async function getTicketsDeptColumn() {
+  if (await columnExists("tickets", "dept").catch(()=>false)) return "dept";
+  if (await columnExists("tickets", "department").catch(()=>false)) return "department";
+  return "dept";
+}
 }
 
 async function addColumnIfMissing(table, column, ddl) {
@@ -288,6 +295,9 @@ await addColumnIfMissing("messages", "msg_type", "msg_type TEXT DEFAULT 'text'")
   try { await pool.query("ALTER TABLE tickets ADD CONSTRAINT tickets_dept_check CHECK (dept IN ('presales','aftersales'));"); } catch (_) {}
   try { await pool.query("ALTER TABLE tickets ADD CONSTRAINT tickets_status_check CHECK (status IN ('open','pending','closed'));"); } catch (_) {}
   try { await pool.query("ALTER TABLE messages ADD CONSTRAINT messages_direction_check CHECK (direction IN ('incoming','outgoing'));"); } catch (_) {}
+  await addColumnIfMissing("tickets", "dept", "dept TEXT");
+  await addColumnIfMissing("tickets", "department", "department TEXT");
+
 }
 
 async function ensureSessionTable() {
@@ -535,18 +545,54 @@ async function setCustomerNameIfEmpty(wa_id, name) {
   await pool.query("UPDATE customers SET name=$2, updated_at=NOW() WHERE wa_id=$1 AND (name IS NULL OR name='')", [String(wa_id), n.slice(0, 120)]);
 }
 async function createTicketOrReopen(wa_id, dept, assignee) {
-  const q = await pool.query("SELECT id FROM tickets WHERE wa_id=$1 AND dept=$2 AND status IN ('open','pending') ORDER BY id DESC LIMIT 1", [String(wa_id), String(dept)]);
-  if (q.rows.length) return q.rows[0].id;
+  const wa = String(wa_id);
+  const d = (dept && String(dept).trim()) ? String(dept).trim() : "presales";
+  const deptCol = await getTicketsDeptColumn();
 
-  const closed = await pool.query("SELECT id FROM tickets WHERE wa_id=$1 AND dept=$2 AND status='closed' ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1", [String(wa_id), String(dept)]);
-  if (closed.rows.length) {
-    const id = closed.rows[0].id;
-    await pool.query("UPDATE tickets SET status='open', updated_at=NOW(), last_message_at=NOW() WHERE id=$1", [id]);
-    return id;
+  // 1) Try find an existing open/pending ticket for this wa_id and dept
+  try {
+    const q = `SELECT id FROM tickets WHERE wa_id=$1 AND ${deptCol}=$2 AND status IN ('open','pending') ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1`;
+    const r = await pool.query(q, [wa, d]);
+    if (r.rows.length) return r.rows[0].id;
+  } catch (_) {}
+
+  // 2) Reopen latest closed ticket if exists
+  try {
+    const q = `SELECT id FROM tickets WHERE wa_id=$1 AND ${deptCol}=$2 AND status='closed' ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1`;
+    const r = await pool.query(q, [wa, d]);
+    if (r.rows.length) {
+      const id = r.rows[0].id;
+      await pool.query("UPDATE tickets SET status='open', updated_at=NOW() WHERE id=$1", [id]).catch(()=>{});
+      return id;
+    }
+  } catch (_) {}
+
+  // 3) Create new ticket
+  const hasAssignee = await columnExists("tickets", "assignee").catch(()=>false);
+  const hasTags = await columnExists("tickets", "tags").catch(()=>false);
+
+  if (hasAssignee && hasTags) {
+    const q = `INSERT INTO tickets(wa_id, ${deptCol}, status, created_at, updated_at, unread_count, assignee, tags)
+               VALUES($1,$2,'open',NOW(),NOW(),0,$3,COALESCE($4, ARRAY[]::text[])) RETURNING id`;
+    const r = await pool.query(q, [wa, d, assignee || null, null]);
+    return r.rows[0].id;
   }
-
-  const ins = await pool.query("INSERT INTO tickets(wa_id, dept, status, assignee, last_message_at, unread_count) VALUES($1,$2,'open',$3,NOW(),0) RETURNING id", [String(wa_id), String(dept), assignee || null]);
-  return ins.rows[0].id;
+  if (hasAssignee && !hasTags) {
+    const q = `INSERT INTO tickets(wa_id, ${deptCol}, status, created_at, updated_at, unread_count, assignee)
+               VALUES($1,$2,'open',NOW(),NOW(),0,$3) RETURNING id`;
+    const r = await pool.query(q, [wa, d, assignee || null]);
+    return r.rows[0].id;
+  }
+  if (!hasAssignee && hasTags) {
+    const q = `INSERT INTO tickets(wa_id, ${deptCol}, status, created_at, updated_at, unread_count, tags)
+               VALUES($1,$2,'open',NOW(),NOW(),0,COALESCE($3, ARRAY[]::text[])) RETURNING id`;
+    const r = await pool.query(q, [wa, d, null]);
+    return r.rows[0].id;
+  }
+  const q = `INSERT INTO tickets(wa_id, ${deptCol}, status, created_at, updated_at, unread_count)
+             VALUES($1,$2,'open',NOW(),NOW(),0) RETURNING id`;
+  const r = await pool.query(q, [wa, d]);
+  return r.rows[0].id;
 }
 
 async function getOrCreateConversation(wa_id, dept) {
@@ -970,7 +1016,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.1.0 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.1.1 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1258,7 +1304,7 @@ button.ghost:hover{background:#f1f5f9}
 </style></head>
 <body>
 <div class="top"><div><div class="brand">Voltgo Support System</div>
-<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.1.0</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
+<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.1.1</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
 <div class="meta">Strict Isolation: ${STRICT_AGENT_VIEW ? "ON" : "OFF"}</div></div>
 
 <div class="wrap">
@@ -1539,7 +1585,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.7.1.0",
+    version: "V4.7.1.1",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1550,7 +1596,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.7.1.0 " + new Date().toISOString());
+  res.send("pong V4.7.1.1 " + new Date().toISOString());
 });
 
 
@@ -1569,12 +1615,12 @@ app.get("/debug/ping", (req, res) => {
     console.error("❌ DB init failed:", e);
   }
   console.log("=================================");
-  const APP_VERSION = "V4.7.1.0";
+  const APP_VERSION = "V4.7.1.1";
 
 console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.1.0");
+  console.log("VERSION MARKER: V4.7.1.1");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
