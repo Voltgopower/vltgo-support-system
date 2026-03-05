@@ -1,35 +1,19 @@
 #!/usr/bin/env node
 /**
- * Voltgo Support System V4.5 (Railway Stable)
- * - DB-backed (Postgres)
- * - Multi-agent UI login (UI_USERS=presales:111111,aftersales:222222)
- * - Dept routing: presales / aftersales
- *   - AI routing optional (OPENAI_API_KEY) with fallback menu 1/2 when unknown
- * - Strict isolation (STRICT_AGENT_VIEW=1): agents only see their dept
- * - Customers (name + notes) + Tickets + Messages
- * - Realtime UI via SSE (auto push)
+ * Voltgo Support System V4.5.1 (Railway Stable Hotfix)
+ * Fixes: JS template-string quoting issue that caused SyntaxError at runtime.
  *
- * Required .env variables (Railway Variables or local .env):
- *   VERIFY_TOKEN=voltgo_webhook_verify
- *   WA_TOKEN=... (Meta permanent/system user token)
- *   PHONE_NUMBER_ID=...
- *   DATABASE_URL=postgresql://...
- *   SESSION_SECRET=...
- *
- * Optional:
- *   UI_USERS=presales:111111,aftersales:222222   (if not set, falls back to UI_USER/UI_PASS)
- *   UI_USER=admin
- *   UI_PASS=voltgo123
- *   PRESALES_ASSIGNEE=presales
- *   AFTERSALES_ASSIGNEE=aftersales
- *   STRICT_AGENT_VIEW=1
- *   OPENAI_API_KEY=...   (enables AI routing)
- *   OPENAI_MODEL=gpt-4o-mini
- *   APP_SECRET=... (Meta webhook signature verify; optional)
+ * Features:
+ * - Postgres DB: customers / tickets / messages
+ * - Multi-agent login: UI_USERS=presales:111111,aftersales:222222
+ * - Presales/Aftersales routing: keyword + optional AI + fallback menu 1/2
+ * - Strict isolation: STRICT_AGENT_VIEW=1 (agents only see own dept)
+ * - Customer name + notes
+ * - Ticket UI + realtime SSE
  */
 
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.5_STABLE_RAILWAY (2026-03-04)");
+console.log("✅ LOADED SERVER.JS: V4.5.1_STABLE_RAILWAY (2026-03-04)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -52,7 +36,7 @@ if (process.env.OPENAI_API_KEY) {
   }
 }
 
-// Optional sharp (thumbnails)
+// Optional sharp
 let sharp = null;
 try {
   sharp = require("sharp");
@@ -68,7 +52,7 @@ app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 
-// ------------------------ ENV helpers ------------------------
+// -------- env helpers --------
 function requireEnv(name) {
   const v = process.env[name];
   if (!v) {
@@ -91,7 +75,7 @@ const AFTERSALES_ASSIGNEE = process.env.AFTERSALES_ASSIGNEE || "aftersales";
 const STRICT_AGENT_VIEW = String(process.env.STRICT_AGENT_VIEW || "1") === "1";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-// ------------------------ Session ------------------------
+// -------- session --------
 app.use(
   session({
     secret: SESSION_SECRET,
@@ -100,13 +84,13 @@ app.use(
     cookie: {
       httpOnly: true,
       sameSite: "lax",
-      secure: false, // Railway terminates TLS; this is ok behind proxy
+      secure: false,
       maxAge: 1000 * 60 * 60 * 24 * 7
     }
   })
 );
 
-// ------------------------ Upload dirs ------------------------
+// -------- upload dirs --------
 const LOGS_DIR = path.join(process.cwd(), "logs");
 const UPLOADS_DIR = path.join(LOGS_DIR, "uploads");
 const MEDIA_DIR = path.join(LOGS_DIR, "media");
@@ -114,26 +98,17 @@ const THUMBS_DIR = path.join(MEDIA_DIR, "__thumbs");
 for (const d of [LOGS_DIR, UPLOADS_DIR, MEDIA_DIR, THUMBS_DIR]) {
   try { fs.mkdirSync(d, { recursive: true }); } catch (_) {}
 }
+const upload = multer({ dest: UPLOADS_DIR, limits: { fileSize: 25 * 1024 * 1024 } });
 
-const upload = multer({
-  dest: UPLOADS_DIR,
-  limits: { fileSize: 25 * 1024 * 1024 }
-});
-
-// ------------------------ DB ------------------------
+// -------- DB --------
 const pool = new Pool({ connectionString: DATABASE_URL });
 
 async function dbPing() {
   const c = await pool.connect();
-  try {
-    await c.query("SELECT 1");
-  } finally {
-    c.release();
-  }
+  try { await c.query("SELECT 1"); } finally { c.release(); }
 }
 
 async function ensureTables() {
-  // Customers: stable entity per wa_id
   await pool.query(`
     CREATE TABLE IF NOT EXISTS customers (
       wa_id TEXT PRIMARY KEY,
@@ -144,7 +119,6 @@ async function ensureTables() {
     );
   `);
 
-  // Tickets: can have multiple tickets per customer
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tickets (
       id BIGSERIAL PRIMARY KEY,
@@ -161,7 +135,6 @@ async function ensureTables() {
     );
   `);
 
-  // Messages: attach to ticket
   await pool.query(`
     CREATE TABLE IF NOT EXISTS messages (
       id BIGSERIAL PRIMARY KEY,
@@ -178,16 +151,12 @@ async function ensureTables() {
     );
   `);
 
-  // quick indexes
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_tickets_wa_id ON tickets(wa_id);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_tickets_dept ON tickets(dept);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_ticket_id ON messages(ticket_id);`);
 }
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
+function nowIso() { return new Date().toISOString(); }
 function esc(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
@@ -197,9 +166,8 @@ function esc(s) {
     .replace(/'/g, "&#39;");
 }
 
-// ------------------------ Auth / Users ------------------------
+// -------- auth/users --------
 function parseUiUsers() {
-  // UI_USERS=presales:111111,aftersales:222222
   const raw = (process.env.UI_USERS || "").trim();
   const map = {};
   if (!raw) return null;
@@ -213,20 +181,15 @@ function parseUiUsers() {
   });
   return Object.keys(map).length ? map : null;
 }
-
 const UI_USERS_MAP = parseUiUsers();
 
-function getUserFromSession(req) {
-  if (req.session && req.session.user) return req.session.user;
-  return null;
+function getUser(req) {
+  return (req.session && req.session.user) ? req.session.user : null;
 }
-
 function requireAuth(req, res, next) {
-  const u = getUserFromSession(req);
-  if (!u) return res.redirect("/login");
+  if (!getUser(req)) return res.redirect("/login");
   return next();
 }
-
 function userDept(username) {
   if (!username) return null;
   if (username === PRESALES_ASSIGNEE) return "presales";
@@ -234,7 +197,7 @@ function userDept(username) {
   return null;
 }
 
-// ------------------------ SSE (Realtime UI) ------------------------
+// -------- SSE --------
 const sseClients = new Set(); // { res, user }
 function sseSend(type, payload) {
   const data = JSON.stringify({ type, payload, ts: nowIso() });
@@ -245,37 +208,25 @@ function sseSend(type, payload) {
     } catch (_) {}
   }
 }
-
 app.get("/sse", requireAuth, (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
-  const user = getUserFromSession(req);
-  const client = { res, user };
+  const client = { res, user: getUser(req) };
   sseClients.add(client);
   res.write("event: hello\n");
-  res.write("data: " + JSON.stringify({ ok: true, user, ts: nowIso() }) + "\n\n");
-  req.on("close", () => {
-    sseClients.delete(client);
-  });
+  res.write("data: " + JSON.stringify({ ok: true, user: client.user, ts: nowIso() }) + "\n\n");
+  req.on("close", () => sseClients.delete(client));
 });
 
-// ------------------------ WhatsApp helpers ------------------------
+// -------- WhatsApp send --------
 async function waSendText(toWaId, text) {
   const url = "https://graph.facebook.com/v20.0/" + encodeURIComponent(PHONE_NUMBER_ID) + "/messages";
-  const body = {
-    messaging_product: "whatsapp",
-    to: String(toWaId),
-    type: "text",
-    text: { body: String(text) }
-  };
+  const body = { messaging_product: "whatsapp", to: String(toWaId), type: "text", text: { body: String(text) } };
   const resp = await fetch(url, {
     method: "POST",
-    headers: {
-      "Authorization": "Bearer " + WA_TOKEN,
-      "Content-Type": "application/json"
-    },
+    headers: { "Authorization": "Bearer " + WA_TOKEN, "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
   const json = await resp.json().catch(() => ({}));
@@ -296,19 +247,17 @@ function verifyAppSecret(req, rawBody) {
   return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
 }
 
-// ------------------------ Routing logic ------------------------
+// -------- routing --------
 const ROUTE_HINTS = {
-  presales: ["price", "quote", "cost", "wholesale", "dealer", "buy", "order", "discount", "lead"],
-  aftersales: ["support", "warranty", "broken", "issue", "problem", "return", "rma", "bms", "charge", "charging", "fault", "help"]
+  presales: ["price","quote","cost","wholesale","dealer","buy","order","discount","lead"],
+  aftersales: ["support","warranty","broken","issue","problem","return","rma","bms","charge","charging","fault","help"]
 };
-
 function keywordRoute(text) {
   const t = String(text || "").toLowerCase();
   for (const w of ROUTE_HINTS.presales) if (t.includes(w)) return "presales";
   for (const w of ROUTE_HINTS.aftersales) if (t.includes(w)) return "aftersales";
   return "unknown";
 }
-
 async function aiRoute(text) {
   if (!openai) return "unknown";
   const msg = String(text || "").slice(0, 1200);
@@ -331,47 +280,38 @@ async function aiRoute(text) {
     if (out.includes("aftersales")) return "aftersales";
     return "unknown";
   } catch (e) {
-    console.warn("⚠️ aiRoute failed; fallback to keyword/menu", e?.message || e);
+    console.warn("⚠️ aiRoute failed; fallback", e?.message || e);
     return "unknown";
   }
 }
 
 async function ensureCustomer(wa_id) {
-  await pool.query(
-    "INSERT INTO customers(wa_id) VALUES($1) ON CONFLICT (wa_id) DO NOTHING",
-    [String(wa_id)]
-  );
+  await pool.query("INSERT INTO customers(wa_id) VALUES($1) ON CONFLICT (wa_id) DO NOTHING", [String(wa_id)]);
 }
-
 async function createTicketIfNeeded(wa_id, dept, assignee) {
-  // If there is an open ticket for same wa_id+dept, reuse it.
   const q = await pool.query(
     "SELECT id FROM tickets WHERE wa_id=$1 AND dept=$2 AND status IN ('open','pending') ORDER BY id DESC LIMIT 1",
     [String(wa_id), String(dept)]
   );
   if (q.rows.length) return q.rows[0].id;
-
   const ins = await pool.query(
     "INSERT INTO tickets(wa_id, dept, status, assignee, last_message_at, unread_count) VALUES($1,$2,'open',$3,NOW(),0) RETURNING id",
     [String(wa_id), String(dept), assignee || null]
   );
   return ins.rows[0].id;
 }
-
 async function bumpTicketOnIncoming(ticket_id, text) {
   await pool.query(
     "UPDATE tickets SET last_message_at=NOW(), last_message=$2, unread_count=unread_count+1, updated_at=NOW() WHERE id=$1",
     [ticket_id, String(text || "").slice(0, 600)]
   );
 }
-
 async function bumpTicketOnOutgoing(ticket_id, text) {
   await pool.query(
     "UPDATE tickets SET last_message_at=NOW(), last_message=$2, updated_at=NOW() WHERE id=$1",
     [ticket_id, String(text || "").slice(0, 600)]
   );
 }
-
 async function insertMessage({ ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id }) {
   await pool.query(
     "INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
@@ -389,116 +329,89 @@ async function insertMessage({ ticket_id, wa_id, direction, msg_type, text, capt
   );
 }
 
-// ------------------------ Webhook (Verify + Receive) ------------------------
+// -------- webhook verify/receive --------
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === VERIFY_TOKEN) {
-    return res.status(200).send(challenge);
-  }
+  if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
   return res.sendStatus(403);
 });
 
-app.post(
-  "/webhook",
-  express.raw({ type: "*/*" }),
-  async (req, res) => {
-    const rawBody = req.body;
-    try {
-      if (!verifyAppSecret(req, rawBody)) {
-        return res.status(403).send("bad signature");
+app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
+  const rawBody = req.body;
+  try {
+    if (!verifyAppSecret(req, rawBody)) return res.status(403).send("bad signature");
+
+    const body = JSON.parse(rawBody.toString("utf8"));
+    const entry = body.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const messages = value?.messages || [];
+    if (!messages.length) return res.json({ ok: true });
+
+    for (const m of messages) {
+      const wa_id = m.from;
+      const wa_message_id = m.id;
+      const type = m.type;
+
+      let text = "";
+      if (type === "text") text = m.text?.body || "";
+      else if (type === "button") text = m.button?.text || "";
+      else if (type === "interactive") {
+        text = m.interactive?.button_reply?.title || m.interactive?.list_reply?.title || "";
+      } else {
+        text = "[non-text message]";
       }
 
-      const body = JSON.parse(rawBody.toString("utf8"));
+      await ensureCustomer(wa_id);
 
-      const entry = body.entry?.[0];
-      const change = entry?.changes?.[0];
-      const value = change?.value;
-      const messages = value?.messages || [];
-      if (!messages.length) return res.json({ ok: true });
-
-      for (const m of messages) {
-        const wa_id = m.from;
-        const wa_message_id = m.id;
-        const type = m.type;
-
-        let text = "";
-        if (type === "text") text = m.text?.body || "";
-        else if (type === "button") text = m.button?.text || "";
-        else if (type === "interactive") {
-          // e.g. list reply
-          text = m.interactive?.button_reply?.title || m.interactive?.list_reply?.title || "";
+      let dept = null;
+      const trimmed = String(text || "").trim();
+      if (trimmed === "1" || /^sales$/i.test(trimmed) || /^presales$/i.test(trimmed) || /^price$/i.test(trimmed)) {
+        dept = "presales";
+      } else if (trimmed === "2" || /^support$/i.test(trimmed) || /^aftersales$/i.test(trimmed)) {
+        dept = "aftersales";
+      } else {
+        const latest = await pool.query(
+          "SELECT id, dept FROM tickets WHERE wa_id=$1 AND status IN ('open','pending') ORDER BY updated_at DESC LIMIT 1",
+          [String(wa_id)]
+        );
+        if (latest.rows.length) {
+          dept = latest.rows[0].dept;
         } else {
-          text = "[non-text message]";
-        }
-
-        await ensureCustomer(wa_id);
-
-        // Dept selection logic:
-        // 1) If message is "1" or "2" -> explicit dept.
-        // 2) Else if existing open/pending ticket exists in either dept, reuse the most recently updated ticket
-        //    (but STRICT isolation still applies to agents in UI).
-        // 3) Else try AI routing; if unknown -> ask menu.
-        let dept = null;
-
-        const trimmed = String(text || "").trim();
-        if (trimmed === "1" || /^sales$/i.test(trimmed) || /^presales$/i.test(trimmed) || /^price$/i.test(trimmed)) {
-          dept = "presales";
-        } else if (trimmed === "2" || /^support$/i.test(trimmed) || /^aftersales$/i.test(trimmed)) {
-          dept = "aftersales";
-        } else {
-          // check latest open ticket
-          const latest = await pool.query(
-            "SELECT id, dept FROM tickets WHERE wa_id=$1 AND status IN ('open','pending') ORDER BY updated_at DESC LIMIT 1",
-            [String(wa_id)]
-          );
-          if (latest.rows.length) {
-            dept = latest.rows[0].dept;
-          } else {
-            // route
-            let r = keywordRoute(text);
-            if (r === "unknown") r = await aiRoute(text);
-            if (r === "unknown") {
-              await waSendText(
-                wa_id,
-                "Hi! To connect you faster, please choose:\n1️⃣ Sales (price/quote)\n2️⃣ Support (warranty/issue)"
-              );
-              continue;
-            }
-            dept = r;
+          let r = keywordRoute(text);
+          if (r === "unknown") r = await aiRoute(text);
+          if (r === "unknown") {
+            await waSendText(
+              wa_id,
+              "Hi! To connect you faster, please choose:\n1️⃣ Sales (price/quote)\n2️⃣ Support (warranty/issue)"
+            );
+            continue;
           }
+          dept = r;
         }
-
-        const assignee = dept === "presales" ? PRESALES_ASSIGNEE : AFTERSALES_ASSIGNEE;
-        const ticket_id = await createTicketIfNeeded(wa_id, dept, assignee);
-
-        await insertMessage({
-          ticket_id,
-          wa_id,
-          direction: "incoming",
-          msg_type: "text",
-          text,
-          wa_message_id
-        });
-
-        await bumpTicketOnIncoming(ticket_id, text);
-
-        sseSend("message", { wa_id, ticket_id, dept, direction: "incoming", text });
-        sseSend("tickets", { changed: true });
-        sseSend("customers", { changed: true });
       }
 
-      return res.json({ ok: true });
+      const assignee = dept === "presales" ? PRESALES_ASSIGNEE : AFTERSALES_ASSIGNEE;
+      const ticket_id = await createTicketIfNeeded(wa_id, dept, assignee);
 
-    } catch (e) {
-      console.error("❌ webhook error:", e);
-      return res.status(200).json({ ok: true });
+      await insertMessage({ ticket_id, wa_id, direction: "incoming", msg_type: "text", text, wa_message_id });
+      await bumpTicketOnIncoming(ticket_id, text);
+
+      sseSend("message", { wa_id, ticket_id, dept, direction: "incoming", text });
+      sseSend("tickets", { changed: true });
+      sseSend("customers", { changed: true });
     }
-  }
-);
 
-// ------------------------ UI: Login/Logout ------------------------
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("❌ webhook error:", e);
+    return res.status(200).json({ ok: true });
+  }
+});
+
+// -------- UI login/logout --------
 function renderLogin(errMsg) {
   const hint = errMsg ? "<div class='err'>" + esc(errMsg) + "</div>" : "";
   return (
@@ -522,73 +435,62 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#7f93ad'>Version: V4.5 • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#7f93ad'>Version: V4.5.1 • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
 
-app.get("/login", (req, res) => {
-  res.status(200).send(renderLogin());
-});
+app.get("/login", (req, res) => res.status(200).send(renderLogin()));
 
 app.post("/login", (req, res) => {
   const u = String(req.body.username || "").trim();
   const p = String(req.body.password || "").trim();
-
   let ok = false;
-  if (UI_USERS_MAP) {
-    ok = UI_USERS_MAP[u] && UI_USERS_MAP[u] === p;
-  } else {
-    ok = u === UI_USER_FALLBACK && p === UI_PASS_FALLBACK;
-  }
+
+  if (UI_USERS_MAP) ok = UI_USERS_MAP[u] && UI_USERS_MAP[u] === p;
+  else ok = u === UI_USER_FALLBACK && p === UI_PASS_FALLBACK;
 
   if (!ok) return res.status(401).send(renderLogin("Invalid username or password"));
-
   req.session.user = u;
   req.session.save(() => res.redirect("/ui"));
 });
 
-app.get("/logout", (req, res) => {
-  req.session.destroy(() => res.redirect("/login"));
-});
+app.get("/logout", (req, res) => req.session.destroy(() => res.redirect("/login")));
 
-// ------------------------ API: Customers/Tickets/Messages ------------------------
-function applyIsolationFilter(req, baseWhere, params) {
-  const u = getUserFromSession(req);
-  const dept = userDept(u);
-
+// -------- isolation filter --------
+function applyIsolation(req, baseWhere, params) {
   if (!STRICT_AGENT_VIEW) return { where: baseWhere, params };
 
+  const u = getUser(req);
+  const dept = userDept(u);
   if (dept === "presales" || dept === "aftersales") {
-    const clause = (baseWhere ? (baseWhere + " AND ") : "") + "t.dept = $" + (params.length + 1);
+    const clause = (baseWhere ? baseWhere + " AND " : "") + "t.dept = $" + (params.length + 1);
     return { where: clause, params: params.concat([dept]) };
   }
-  // Unknown user => no dept => show nothing
-  const clause = (baseWhere ? (baseWhere + " AND ") : "") + "1=0";
+  const clause = (baseWhere ? baseWhere + " AND " : "") + "1=0";
   return { where: clause, params };
 }
 
-// Customers list (aggregated across tickets)
+// -------- API --------
 app.get("/api/customers", requireAuth, async (req, res) => {
   try {
     const q = String(req.query.q || "").trim();
     const unreadOnly = String(req.query.unread || "0") === "1";
-
     let where = "";
     let params = [];
 
     if (q) {
       params.push("%" + q + "%");
-      where = "(c.wa_id ILIKE $" + params.length + " OR COALESCE(c.name,'') ILIKE $" + params.length + " OR COALESCE(c.notes,'') ILIKE $" + params.length + " OR COALESCE(t.last_message,'') ILIKE $" + params.length + ")";
+      where =
+        "(c.wa_id ILIKE $" + params.length +
+        " OR COALESCE(c.name,'') ILIKE $" + params.length +
+        " OR COALESCE(c.notes,'') ILIKE $" + params.length +
+        " OR COALESCE(t.last_message,'') ILIKE $" + params.length + ")";
     }
-    if (unreadOnly) {
-      where = (where ? where + " AND " : "") + "t.unread_count > 0";
-    }
+    if (unreadOnly) where = (where ? where + " AND " : "") + "t.unread_count > 0";
 
-    // Isolation via tickets alias t
-    const iso = applyIsolationFilter(req, where, params);
-    where = iso.where;
-    params = iso.params;
+    const iso = applyIsolation(req, where, params);
+    where = iso.where; params = iso.params;
 
     const sql =
       "SELECT c.wa_id, COALESCE(c.name,'') AS name, COALESCE(c.notes,'') AS notes," +
@@ -612,7 +514,6 @@ app.get("/api/customers", requireAuth, async (req, res) => {
   }
 });
 
-// Customer profile
 app.get("/api/customer/:wa_id", requireAuth, async (req, res) => {
   try {
     const wa_id = String(req.params.wa_id);
@@ -624,7 +525,6 @@ app.get("/api/customer/:wa_id", requireAuth, async (req, res) => {
   }
 });
 
-// Update name/notes
 app.post("/api/customer/:wa_id", requireAuth, async (req, res) => {
   try {
     const wa_id = String(req.params.wa_id);
@@ -643,12 +543,11 @@ app.post("/api/customer/:wa_id", requireAuth, async (req, res) => {
   }
 });
 
-// Tickets list
 app.get("/api/tickets", requireAuth, async (req, res) => {
   try {
     const q = String(req.query.q || "").trim();
-    const status = String(req.query.status || "").trim(); // open/pending/closed
-    const dept = String(req.query.dept || "").trim();     // presales/aftersales
+    const status = String(req.query.status || "").trim();
+    const dept = String(req.query.dept || "").trim();
     const unreadOnly = String(req.query.unread || "0") === "1";
 
     let where = "";
@@ -656,23 +555,23 @@ app.get("/api/tickets", requireAuth, async (req, res) => {
 
     if (q) {
       params.push("%" + q + "%");
-      where = "(t.wa_id ILIKE $" + params.length + " OR COALESCE(c.name,'') ILIKE $" + params.length + " OR COALESCE(t.last_message,'') ILIKE $" + params.length + ")";
+      where =
+        "(t.wa_id ILIKE $" + params.length +
+        " OR COALESCE(c.name,'') ILIKE $" + params.length +
+        " OR COALESCE(t.last_message,'') ILIKE $" + params.length + ")";
     }
-    if (status && (status === "open" || status === "pending" || status === "closed")) {
+    if (status && ["open","pending","closed"].includes(status)) {
       params.push(status);
       where = (where ? where + " AND " : "") + "t.status = $" + params.length;
     }
-    if (dept && (dept === "presales" || dept === "aftersales")) {
+    if (dept && ["presales","aftersales"].includes(dept)) {
       params.push(dept);
       where = (where ? where + " AND " : "") + "t.dept = $" + params.length;
     }
-    if (unreadOnly) {
-      where = (where ? where + " AND " : "") + "t.unread_count > 0";
-    }
+    if (unreadOnly) where = (where ? where + " AND " : "") + "t.unread_count > 0";
 
-    const iso = applyIsolationFilter(req, where, params);
-    where = iso.where;
-    params = iso.params;
+    const iso = applyIsolation(req, where, params);
+    where = iso.where; params = iso.params;
 
     const sql =
       "SELECT t.id, t.wa_id, t.dept, t.status, COALESCE(t.assignee,'') AS assignee," +
@@ -692,17 +591,12 @@ app.get("/api/tickets", requireAuth, async (req, res) => {
   }
 });
 
-// Ticket messages
 app.get("/api/ticket/:id/messages", requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
-    // isolation: ensure ticket visible to user
     const base = "t.id=$1";
-    const iso = applyIsolationFilter(req, base, [id]);
-    const check = await pool.query(
-      "SELECT t.id FROM tickets t WHERE " + iso.where + " LIMIT 1",
-      iso.params
-    );
+    const iso = applyIsolation(req, base, [id]);
+    const check = await pool.query("SELECT t.id FROM tickets t WHERE " + iso.where + " LIMIT 1", iso.params);
     if (!check.rows.length) return res.status(404).json({ ok: false, error: "ticket not found" });
 
     const r = await pool.query(
@@ -710,7 +604,6 @@ app.get("/api/ticket/:id/messages", requireAuth, async (req, res) => {
       [id]
     );
 
-    // mark read
     await pool.query("UPDATE tickets SET unread_count=0 WHERE id=$1", [id]);
     sseSend("tickets", { changed: true });
 
@@ -721,36 +614,22 @@ app.get("/api/ticket/:id/messages", requireAuth, async (req, res) => {
   }
 });
 
-// Send message from UI
 app.post("/api/ticket/:id/send", requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const text = String(req.body.text || "").trim();
     if (!text) return res.status(400).json({ ok: false, error: "empty" });
 
-    // isolation check + get wa_id
     const base = "t.id=$1";
-    const iso = applyIsolationFilter(req, base, [id]);
-    const t = await pool.query(
-      "SELECT t.id, t.wa_id, t.dept FROM tickets t WHERE " + iso.where + " LIMIT 1",
-      iso.params
-    );
+    const iso = applyIsolation(req, base, [id]);
+    const t = await pool.query("SELECT t.id, t.wa_id, t.dept FROM tickets t WHERE " + iso.where + " LIMIT 1", iso.params);
     if (!t.rows.length) return res.status(404).json({ ok: false, error: "ticket not found" });
 
     const wa_id = t.rows[0].wa_id;
-
     const waResp = await waSendText(wa_id, text);
     const wa_message_id = waResp?.messages?.[0]?.id || null;
 
-    await insertMessage({
-      ticket_id: id,
-      wa_id,
-      direction: "outgoing",
-      msg_type: "text",
-      text,
-      wa_message_id
-    });
-
+    await insertMessage({ ticket_id: id, wa_id, direction: "outgoing", msg_type: "text", text, wa_message_id });
     await bumpTicketOnOutgoing(id, text);
 
     sseSend("message", { wa_id, ticket_id: id, direction: "outgoing", text });
@@ -764,20 +643,15 @@ app.post("/api/ticket/:id/send", requireAuth, async (req, res) => {
   }
 });
 
-// Change ticket status
 app.post("/api/ticket/:id/status", requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const status = String(req.body.status || "").trim();
-    if (!["open", "pending", "closed"].includes(status)) {
-      return res.status(400).json({ ok: false, error: "bad status" });
-    }
+    if (!["open","pending","closed"].includes(status)) return res.status(400).json({ ok: false, error: "bad status" });
+
     const base = "t.id=$1";
-    const iso = applyIsolationFilter(req, base, [id]);
-    const upd = await pool.query(
-      "UPDATE tickets t SET status=$2, updated_at=NOW() WHERE " + iso.where,
-      iso.params.concat([status])
-    );
+    const iso = applyIsolation(req, base, [id]);
+    const upd = await pool.query("UPDATE tickets t SET status=$2, updated_at=NOW() WHERE " + iso.where, iso.params.concat([status]));
     sseSend("tickets", { changed: true });
     res.json({ ok: true, updated: upd.rowCount });
   } catch (e) {
@@ -785,7 +659,7 @@ app.post("/api/ticket/:id/status", requireAuth, async (req, res) => {
   }
 });
 
-// ------------------------ UI HTML ------------------------
+// -------- UI HTML --------
 function layout(title, user, bodyHtml, extraHead) {
   const head = extraHead || "";
   return (
@@ -808,7 +682,7 @@ function layout(title, user, bodyHtml, extraHead) {
     "input{min-width:280px}" +
     "table{width:100%;border-collapse:separate;border-spacing:0}" +
     "th,td{padding:14px 16px;border-bottom:1px solid #eef2f8;font-size:14px;vertical-align:middle}" +
-    "th{color:#6b7a90;font-weight:800;text-transform:none;letter-spacing:.2px}" +
+    "th{color:#6b7a90;font-weight:800;letter-spacing:.2px}" +
     "tr:hover td{background:#fbfcfe}" +
     "a{color:#2563eb;text-decoration:none;font-weight:800}" +
     ".badge{display:inline-flex;align-items:center;gap:8px;border:1px solid #e3e8f2;border-radius:999px;padding:8px 12px;background:#fff;color:#0b1220;font-weight:800}" +
@@ -838,7 +712,7 @@ function layout(title, user, bodyHtml, extraHead) {
     "</head><body>" +
     "<div class='top'>" +
     "<div><div class='brand'>" + esc(title) + "</div>" +
-    "<div class='sub'>DB-backed • Version: V4_5_STABLE_2026-03-04 • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</div></div>" +
+    "<div class='sub'>DB-backed • Version: V4.5.1 • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</div></div>" +
     "<div class='right'><span class='muted'>" + esc(user || "") + "</span>" +
     "<a class='pill ghost' href='/logout'>Logout</a></div></div>" +
     "<div class='wrap'>" + bodyHtml + "</div>" +
@@ -849,120 +723,126 @@ function layout(title, user, bodyHtml, extraHead) {
 function uiIndexPage(user) {
   const body =
     "<div class='tabs'>" +
-    "<button class='tab active' id='tabCustomers'>Customers</button>" +
-    "<button class='tab' id='tabTickets'>Tickets</button>" +
+      "<button class='tab active' id='tabCustomers'>Customers</button>" +
+      "<button class='tab' id='tabTickets'>Tickets</button>" +
     "</div>" +
+
     "<div class='panel' id='panelCustomers'>" +
-    "<div class='toolbar'>" +
-    "<input id='qCustomers' placeholder='Search wa_id / name / notes / last message'/>" +
-    "<label class='badge gray'><input type='checkbox' id='unreadCustomers' style='margin-right:8px'/>Unread only</label>" +
-    "<button class='pill primary' id='applyCustomers'>Apply</button>" +
-    "<button class='pill' id='clearCustomers'>Clear</button>" +
+      "<div class='toolbar'>" +
+        "<input id='qCustomers' placeholder='Search wa_id / name / notes / last message'/>" +
+        "<label class='badge gray'><input type='checkbox' id='unreadCustomers' style='margin-right:8px'/>Unread only</label>" +
+        "<button class='pill primary' id='applyCustomers'>Apply</button>" +
+        "<button class='pill' id='clearCustomers'>Clear</button>" +
+      "</div>" +
+      "<div style='overflow:auto'>" +
+        "<table><thead><tr>" +
+          "<th style='width:190px'>wa_id</th><th style='width:220px'>Name</th><th style='width:90px'>Open</th><th style='width:90px'>Tickets</th><th style='width:200px'>Last time</th><th>Last message</th>" +
+        "</tr></thead><tbody id='customersTbody'>" +
+          "<tr><td colspan='6' class='muted'>Loading...</td></tr>" +
+        "</tbody></table>" +
+      "</div>" +
     "</div>" +
-    "<div style='overflow:auto'>" +
-    "<table><thead><tr>" +
-    "<th style='width:190px'>wa_id</th><th style='width:220px'>Name</th><th style='width:90px'>Open</th><th style='width:90px'>Tickets</th><th style='width:200px'>Last time</th><th>Last message</th>" +
-    "</tr></thead><tbody id='customersTbody'>" +
-    "<tr><td colspan='6' class='muted'>Loading...</td></tr>" +
-    "</tbody></table>" +
-    "</div></div>" +
 
     "<div class='panel' id='panelTickets' style='display:none'>" +
-    "<div class='toolbar'>" +
-    "<input id='qTickets' placeholder='Search wa_id / name / last message'/>" +
-    "<select id='deptTickets'><option value=''>All depts</option><option value='presales'>presales</option><option value='aftersales'>aftersales</option></select>" +
-    "<select id='statusTickets'><option value=''>All status</option><option value='open'>open</option><option value='pending'>pending</option><option value='closed'>closed</option></select>" +
-    "<label class='badge gray'><input type='checkbox' id='unreadTickets' style='margin-right:8px'/>Unread only</label>" +
-    "<button class='pill primary' id='applyTickets'>Apply</button>" +
-    "<button class='pill' id='clearTickets'>Clear</button>" +
+      "<div class='toolbar'>" +
+        "<input id='qTickets' placeholder='Search wa_id / name / last message'/>" +
+        "<select id='deptTickets'><option value=''>All depts</option><option value='presales'>presales</option><option value='aftersales'>aftersales</option></select>" +
+        "<select id='statusTickets'><option value=''>All status</option><option value='open'>open</option><option value='pending'>pending</option><option value='closed'>closed</option></select>" +
+        "<label class='badge gray'><input type='checkbox' id='unreadTickets' style='margin-right:8px'/>Unread only</label>" +
+        "<button class='pill primary' id='applyTickets'>Apply</button>" +
+        "<button class='pill' id='clearTickets'>Clear</button>" +
+      "</div>" +
+      "<div style='overflow:auto'>" +
+        "<table><thead><tr>" +
+          "<th style='width:90px'>Ticket</th><th style='width:180px'>wa_id</th><th style='width:140px'>Name</th><th style='width:110px'>Dept</th><th style='width:110px'>Status</th><th style='width:110px'>Unread</th><th style='width:200px'>Last time</th><th>Last message</th>" +
+        "</tr></thead><tbody id='ticketsTbody'>" +
+          "<tr><td colspan='8' class='muted'>Loading...</td></tr>" +
+        "</tbody></table>" +
+      "</div>" +
     "</div>" +
-    "<div style='overflow:auto'>" +
-    "<table><thead><tr>" +
-    "<th style='width:90px'>Ticket</th><th style='width:180px'>wa_id</th><th style='width:140px'>Name</th><th style='width:110px'>Dept</th><th style='width:110px'>Status</th><th style='width:110px'>Unread</th><th style='width:200px'>Last time</th><th>Last message</th>" +
-    "</tr></thead><tbody id='ticketsTbody'>" +
-    "<tr><td colspan='8' class='muted'>Loading...</td></tr>" +
-    "</tbody></table>" +
-    "</div></div>" +
 
     "<script>" +
-    "const $=s=>document.querySelector(s);" +
-    "function fmt(ts){ if(!ts) return ''; try{return new Date(ts).toLocaleString();}catch(e){return ts;} }" +
+      "const $=s=>document.querySelector(s);" +
+      "function fmt(ts){ if(!ts) return ''; try{return new Date(ts).toLocaleString();}catch(e){return ts;} }" +
 
-    "function setTab(name){ " +
-      "if(name==='customers'){ $('#tabCustomers').classList.add('active'); $('#tabTickets').classList.remove('active'); $('#panelCustomers').style.display='block'; $('#panelTickets').style.display='none'; }" +
-      "else{ $('#tabTickets').classList.add('active'); $('#tabCustomers').classList.remove('active'); $('#panelTickets').style.display='block'; $('#panelCustomers').style.display='none'; }" +
-    "}" +
-    "$('#tabCustomers').onclick=()=>setTab('customers');" +
-    "$('#tabTickets').onclick=()=>setTab('tickets');" +
-
-    "async function loadCustomers(){ " +
-      "const q=encodeURIComponent($('#qCustomers').value||'');" +
-      "const unread=$('#unreadCustomers').checked?'1':'0';" +
-      "const r=await fetch('/api/customers?q='+q+'&unread='+unread);" +
-      "const j=await r.json();" +
-      "const tb=$('#customersTbody');" +
-      "tb.innerHTML='';" +
-      "if(!j.ok){ tb.innerHTML='<tr><td colspan=6 class=muted>Error</td></tr>'; return; }" +
-      "if(!j.rows.length){ tb.innerHTML='<tr><td colspan=6 class=muted>No customers</td></tr>'; return; }" +
-      "for(const c of j.rows){ " +
-        "const name = c.name ? c.name : ('Customer ' + c.wa_id);" +
-        "const open = Number(c.open_tickets||0);" +
-        "const tickets = Number(c.tickets||0);" +
-        "const last = fmt(c.last_time);" +
-        "const msg = (c.last_message||'');" +
-        "tb.insertAdjacentHTML('beforeend', " +
-          "`<tr>`+" +
-          "`<td><a href='/ui/customer/${encodeURIComponent(c.wa_id)}'>${c.wa_id}</a></td>`+" +
-          "`<td>${name}</td>`+" +
-          "`<td><span class='badge ${open>0?'green':'gray'}'>${open}</span></td>`+" +
-          "`<td><span class='badge gray'>${tickets}</span></td>`+" +
-          "`<td>${last}</td>`+" +
-          "`<td>${msg}</td>`+" +
-          "`</tr>`" +
-        ");" +
+      "function setTab(name){" +
+        "if(name==='customers'){" +
+          "$('#tabCustomers').classList.add('active');$('#tabTickets').classList.remove('active');" +
+          "$('#panelCustomers').style.display='block';$('#panelTickets').style.display='none';" +
+        "}else{" +
+          "$('#tabTickets').classList.add('active');$('#tabCustomers').classList.remove('active');" +
+          "$('#panelTickets').style.display='block';$('#panelCustomers').style.display='none';" +
+        "}" +
       "}" +
-    "}" +
+      "$('#tabCustomers').onclick=()=>setTab('customers');" +
+      "$('#tabTickets').onclick=()=>setTab('tickets');" +
 
-    "async function loadTickets(){ " +
-      "const q=encodeURIComponent($('#qTickets').value||'');" +
-      "const dept=encodeURIComponent($('#deptTickets').value||'');" +
-      "const status=encodeURIComponent($('#statusTickets').value||'');" +
-      "const unread=$('#unreadTickets').checked?'1':'0';" +
-      "const r=await fetch('/api/tickets?q='+q+'&dept='+dept+'&status='+status+'&unread='+unread);" +
-      "const j=await r.json();" +
-      "const tb=$('#ticketsTbody');" +
-      "tb.innerHTML='';" +
-      "if(!j.ok){ tb.innerHTML='<tr><td colspan=8 class=muted>Error</td></tr>'; return; }" +
-      "if(!j.rows.length){ tb.innerHTML='<tr><td colspan=8 class=muted>No tickets yet</td></tr>'; return; }" +
-      "for(const t of j.rows){ " +
-        "const name = t.name ? t.name : ('Customer ' + t.wa_id);" +
-        "const last = fmt(t.last_message_at);" +
-        "const msg = (t.last_message||'');" +
-        "tb.insertAdjacentHTML('beforeend', " +
-          "`<tr>`+" +
-          "`<td><a href='/ui/ticket/${t.id}'>#${t.id}</a></td>`+" +
-          "`<td><a href='/ui/customer/${encodeURIComponent(t.wa_id)}'>${t.wa_id}</a></td>`+" +
-          "`<td>${name}</td>`+" +
-          "`<td><span class='badge gray'>${t.dept}</span></td>`+" +
-          "`<td><span class='badge ${t.status==='open'?'green':'gray'}'>${t.status}</span></td>`+" +
-          "`<td><span class='badge gray'>${t.unread_count}</span></td>`+" +
-          "`<td>${last}</td>`+" +
-          "`<td>${msg}</td>`+" +
-          "`</tr>`" +
-        ");" +
+      "async function loadCustomers(){" +
+        "const q=encodeURIComponent($('#qCustomers').value||'');" +
+        "const unread=$('#unreadCustomers').checked?'1':'0';" +
+        "const r=await fetch('/api/customers?q='+q+'&unread='+unread);" +
+        "const j=await r.json();" +
+        "const tb=$('#customersTbody');tb.innerHTML='';" +
+        "if(!j.ok){tb.innerHTML='<tr><td colspan=6 class=muted>Error</td></tr>';return;}" +
+        "if(!j.rows.length){tb.innerHTML='<tr><td colspan=6 class=muted>No customers</td></tr>';return;}" +
+        "for(const c of j.rows){" +
+          "const name=c.name?c.name:('Customer '+c.wa_id);" +
+          "const open=Number(c.open_tickets||0);" +
+          "const tickets=Number(c.tickets||0);" +
+          "const last=fmt(c.last_time);" +
+          "const msg=(c.last_message||'');" +
+          "tb.insertAdjacentHTML('beforeend'," +
+            "`<tr>`+" +
+            "`<td><a href='/ui/customer/${encodeURIComponent(c.wa_id)}'>${c.wa_id}</a></td>`+" +
+            "`<td>${name}</td>`+" +
+            "`<td><span class='badge ${open>0?'green':'gray'}'>${open}</span></td>`+" +
+            "`<td><span class='badge gray'>${tickets}</span></td>`+" +
+            "`<td>${last}</td>`+" +
+            "`<td>${msg}</td>`+" +
+            "`</tr>`" +
+          ");" +
+        "}" +
       "}" +
-    "}" +
 
-    "$('#applyCustomers').onclick=loadCustomers;" +
-    "$('#clearCustomers').onclick=()=>{ $('#qCustomers').value=''; $('#unreadCustomers').checked=false; loadCustomers(); };" +
-    "$('#applyTickets').onclick=loadTickets;" +
-    "$('#clearTickets').onclick=()=>{ $('#qTickets').value=''; $('#deptTickets').value=''; $('#statusTickets').value=''; $('#unreadTickets').checked=false; loadTickets(); };" +
+      "async function loadTickets(){" +
+        "const q=encodeURIComponent($('#qTickets').value||'');" +
+        "const dept=encodeURIComponent($('#deptTickets').value||'');" +
+        "const status=encodeURIComponent($('#statusTickets').value||'');" +
+        "const unread=$('#unreadTickets').checked?'1':'0';" +
+        "const r=await fetch('/api/tickets?q='+q+'&dept='+dept+'&status='+status+'&unread='+unread);" +
+        "const j=await r.json();" +
+        "const tb=$('#ticketsTbody');tb.innerHTML='';" +
+        "if(!j.ok){tb.innerHTML='<tr><td colspan=8 class=muted>Error</td></tr>';return;}" +
+        "if(!j.rows.length){tb.innerHTML='<tr><td colspan=8 class=muted>No tickets yet</td></tr>';return;}" +
+        "for(const t of j.rows){" +
+          "const name=t.name?t.name:('Customer '+t.wa_id);" +
+          "const last=fmt(t.last_message_at);" +
+          "const msg=(t.last_message||'');" +
+          "tb.insertAdjacentHTML('beforeend'," +
+            "`<tr>`+" +
+            "`<td><a href='/ui/ticket/${t.id}'>#${t.id}</a></td>`+" +
+            "`<td><a href='/ui/customer/${encodeURIComponent(t.wa_id)}'>${t.wa_id}</a></td>`+" +
+            "`<td>${name}</td>`+" +
+            "`<td><span class='badge gray'>${t.dept}</span></td>`+" +
+            "`<td><span class='badge ${t.status==='open'?'green':'gray'}'>${t.status}</span></td>`+" +
+            "`<td><span class='badge gray'>${t.unread_count}</span></td>`+" +
+            "`<td>${last}</td>`+" +
+            "`<td>${msg}</td>`+" +
+            "`</tr>`" +
+          ");" +
+        "}" +
+      "}" +
 
-    "loadCustomers(); loadTickets();" +
+      "$('#applyCustomers').onclick=loadCustomers;" +
+      "$('#clearCustomers').onclick=()=>{$('#qCustomers').value='';$('#unreadCustomers').checked=false;loadCustomers();};" +
+      "$('#applyTickets').onclick=loadTickets;" +
+      "$('#clearTickets').onclick=()=>{$('#qTickets').value='';$('#deptTickets').value='';$('#statusTickets').value='';$('#unreadTickets').checked=false;loadTickets();};" +
 
-    "const es=new EventSource('/sse');" +
-    "es.addEventListener('customers', ()=>{ if($('#panelCustomers').style.display!=='none') loadCustomers(); });" +
-    "es.addEventListener('tickets', ()=>{ if($('#panelTickets').style.display!=='none') loadTickets(); });" +
+      "loadCustomers();loadTickets();" +
+
+      "const es=new EventSource('/sse');" +
+      "es.addEventListener('customers',()=>{if($('#panelCustomers').style.display!=='none')loadCustomers();});" +
+      "es.addEventListener('tickets',()=>{if($('#panelTickets').style.display!=='none')loadTickets();});" +
     "</script>";
 
   return layout("Customers", user, body, "");
@@ -971,8 +851,8 @@ function uiIndexPage(user) {
 function uiCustomerPage(user, wa_id) {
   const body =
     "<div class='tabs'>" +
-    "<a class='tab' href='/ui'>Back</a>" +
-    "<a class='tab active' href='/ui/customer/" + esc(wa_id) + "'>Customer</a>" +
+      "<a class='tab' href='/ui'>Back</a>" +
+      "<a class='tab active' href='/ui/customer/" + esc(wa_id) + "'>Customer</a>" +
     "</div>" +
     "<div class='grid'>" +
       "<div class='card'>" +
@@ -995,35 +875,37 @@ function uiCustomerPage(user, wa_id) {
       "</div>" +
     "</div>" +
     "<script>" +
-    "const $=s=>document.querySelector(s);" +
-    "async function load(){ " +
-      "let r=await fetch('/api/customer/" + encodeURIComponent(wa_id) + "'); let j=await r.json();" +
-      "if(j.ok){ $('#name').value=j.customer.name||''; $('#notes').value=j.customer.notes||''; }" +
-      "r=await fetch('/api/tickets?q=' + encodeURIComponent('" + wa_id + "')); j=await r.json();" +
-      "if(j.ok){ " +
-        "const rows=j.rows.filter(x=>x.wa_id==='" + wa_id + "');" +
-        "if(!rows.length){ $('#tickets').innerHTML='No tickets yet'; return; }" +
-        "let html='<table><thead><tr><th>Ticket</th><th>Dept</th><th>Status</th><th>Unread</th><th>Last</th></tr></thead><tbody>';"+
-        "for(const t of rows){ html+=`<tr><td><a href="/ui/ticket/${t.id}">#${t.id}</a></td><td>${t.dept}</td><td>${t.status}</td><td>${t.unread_count}</td><td>${new Date(t.last_message_at||Date.now()).toLocaleString()}</td></tr>`; }"+
-        "html+='</tbody></table>'; $('#tickets').innerHTML=html;" +
-      "} }" +
-    "}" +
-    "$('#save').onclick=async()=>{ " +
-      "const body={name:$('#name').value, notes:$('#notes').value};" +
-      "const r=await fetch('/api/customer/" + encodeURIComponent(wa_id) + "',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});" +
-      "const j=await r.json(); $('#msg').textContent = j.ok ? 'Saved' : ('Error: '+(j.error||''));" +
-    "};" +
-    "load();" +
+      "const $=s=>document.querySelector(s);" +
+      "async function load(){" +
+        "let r=await fetch('/api/customer/" + encodeURIComponent(wa_id) + "');let j=await r.json();" +
+        "if(j.ok){$('#name').value=j.customer.name||'';$('#notes').value=j.customer.notes||'';}" +
+        "r=await fetch('/api/tickets?q=' + encodeURIComponent('" + wa_id + "'));j=await r.json();" +
+        "if(j.ok){" +
+          "const rows=j.rows.filter(x=>x.wa_id==='" + wa_id + "');" +
+          "if(!rows.length){$('#tickets').innerHTML='No tickets yet';return;}" +
+          "let html='<table><thead><tr><th>Ticket</th><th>Dept</th><th>Status</th><th>Unread</th><th>Last</th></tr></thead><tbody>';"+
+          "for(const t of rows){" +
+            "const last=new Date(t.last_message_at||Date.now()).toLocaleString();" +
+            "html+=`<tr><td><a href='/ui/ticket/${t.id}'>#${t.id}</a></td><td>${t.dept}</td><td>${t.status}</td><td>${t.unread_count}</td><td>${last}</td></tr>`;" +
+          "}" +
+          "html+='</tbody></table>';$('#tickets').innerHTML=html;" +
+        "}" +
+      "}" +
+      "$('#save').onclick=async()=>{" +
+        "const body={name:$('#name').value,notes:$('#notes').value};" +
+        "const r=await fetch('/api/customer/" + encodeURIComponent(wa_id) + "',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});" +
+        "const j=await r.json();$('#msg').textContent=j.ok?'Saved':('Error: '+(j.error||''));" +
+      "};" +
+      "load();" +
     "</script>";
-
   return layout("Customer", user, body, "");
 }
 
 function uiTicketPage(user, ticketId) {
   const body =
     "<div class='tabs'>" +
-    "<a class='tab' href='/ui'>Back</a>" +
-    "<a class='tab active' href='/ui/ticket/" + esc(ticketId) + "'>Ticket #" + esc(ticketId) + "</a>" +
+      "<a class='tab' href='/ui'>Back</a>" +
+      "<a class='tab active' href='/ui/ticket/" + esc(ticketId) + "'>Ticket #" + esc(ticketId) + "</a>" +
     "</div>" +
     "<div class='grid'>" +
       "<div class='card'>" +
@@ -1050,53 +932,54 @@ function uiTicketPage(user, ticketId) {
       "</div>" +
     "</div>" +
     "<script>" +
-    "const $=s=>document.querySelector(s);" +
-    "const ticketId=" + JSON.stringify(Number(ticketId)) + ";" +
-    "function escHtml(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}" +
-    "function render(rows){ const el=$('#msgs'); el.innerHTML=''; if(!rows.length){ el.innerHTML='<div class=muted>No messages</div>'; return; }" +
-      "for(const m of rows){ const dir=m.direction==='outgoing'?'out':'in'; const txt=escHtml(m.text||m.caption||''); const ts=new Date(m.created_at).toLocaleString();" +
-        "el.insertAdjacentHTML('beforeend', `<div class=" + '"msg ${dir}"' + "><div class=" + '"bubble"' + "><div>${txt}</div><div class=" + '"meta"' + ">${ts}</div></div></div>`);" +
+      "const $=s=>document.querySelector(s);" +
+      "const ticketId=" + JSON.stringify(Number(ticketId)) + ";" +
+      "function escHtml(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}" +
+      "function render(rows){" +
+        "const el=$('#msgs');el.innerHTML='';" +
+        "if(!rows.length){el.innerHTML='<div class=muted>No messages</div>';return;}" +
+        "for(const m of rows){" +
+          "const dir=m.direction==='outgoing'?'out':'in';" +
+          "const txt=escHtml(m.text||m.caption||'');" +
+          "const ts=new Date(m.created_at).toLocaleString();" +
+          "el.insertAdjacentHTML('beforeend',`<div class='msg ${dir}'><div class='bubble'><div>${txt}</div><div class='meta'>${ts}</div></div></div>`);" +
+        "}" +
+        "el.scrollTop=el.scrollHeight;" +
       "}" +
-      "el.scrollTop=el.scrollHeight;" +
-    "}" +
-    "async function load(){ const r=await fetch('/api/ticket/'+ticketId+'/messages'); const j=await r.json(); if(j.ok){ render(j.rows); } else { $('#msgs').innerHTML='<div class=muted>Error loading</div>'; } }" +
-    "$('#send').onclick=async()=>{ const text=$('#text').value.trim(); if(!text) return; $('#text').value=''; const r=await fetch('/api/ticket/'+ticketId+'/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})}); const j=await r.json(); if(!j.ok){ $('#info').textContent='Send failed: '+(j.error||''); } else { $('#info').textContent='Sent'; } setTimeout(()=>$('#info').textContent='',1200); load(); };" +
-    "document.querySelectorAll('[data-status]').forEach(btn=>{ btn.onclick=async()=>{ const st=btn.getAttribute('data-status'); const r=await fetch('/api/ticket/'+ticketId+'/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:st})}); const j=await r.json(); $('#info').textContent=j.ok?'Updated':'Error'; setTimeout(()=>$('#info').textContent='',1200); }; });" +
-    "load();" +
-    "const es=new EventSource('/sse'); es.addEventListener('message', (ev)=>{ try{ const j=JSON.parse(ev.data).payload; if(j.ticket_id===ticketId){ load(); } }catch(e){} });" +
+      "async function load(){" +
+        "const r=await fetch('/api/ticket/'+ticketId+'/messages');const j=await r.json();" +
+        "if(j.ok){render(j.rows);}else{$('#msgs').innerHTML='<div class=muted>Error loading</div>';}" +
+      "}" +
+      "$('#send').onclick=async()=>{" +
+        "const text=$('#text').value.trim();if(!text)return;$('#text').value='';" +
+        "const r=await fetch('/api/ticket/'+ticketId+'/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});" +
+        "const j=await r.json();$('#info').textContent=j.ok?'Sent':('Send failed: '+(j.error||''));" +
+        "setTimeout(()=>$('#info').textContent='',1200);load();" +
+      "};" +
+      "document.querySelectorAll('[data-status]').forEach(btn=>{" +
+        "btn.onclick=async()=>{" +
+          "const st=btn.getAttribute('data-status');" +
+          "const r=await fetch('/api/ticket/'+ticketId+'/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:st})});" +
+          "const j=await r.json();$('#info').textContent=j.ok?'Updated':'Error';setTimeout(()=>$('#info').textContent='',1200);" +
+        "};" +
+      "});" +
+      "load();" +
+      "const es=new EventSource('/sse');" +
+      "es.addEventListener('message',(ev)=>{try{const j=JSON.parse(ev.data).payload;if(j.ticket_id===ticketId){load();}}catch(e){}});" +
     "</script>";
-
   return layout("Ticket", user, body, "");
 }
 
-// UI routes
-app.get("/ui", requireAuth, (req, res) => {
-  try {
-    const user = getUserFromSession(req);
-    res.status(200).send(uiIndexPage(user));
-  } catch (e) {
-    console.error("❌ /ui error:", e);
-    res.status(500).send("UI error");
-  }
-});
+app.get("/ui", requireAuth, (req, res) => res.status(200).send(uiIndexPage(getUser(req))));
+app.get("/ui/customer/:wa_id", requireAuth, (req, res) => res.status(200).send(uiCustomerPage(getUser(req), String(req.params.wa_id))));
+app.get("/ui/ticket/:id", requireAuth, (req, res) => res.status(200).send(uiTicketPage(getUser(req), String(req.params.id))));
 
-app.get("/ui/customer/:wa_id", requireAuth, (req, res) => {
-  const user = getUserFromSession(req);
-  res.status(200).send(uiCustomerPage(user, String(req.params.wa_id)));
-});
-
-app.get("/ui/ticket/:id", requireAuth, (req, res) => {
-  const user = getUserFromSession(req);
-  res.status(200).send(uiTicketPage(user, String(req.params.id)));
-});
-
-// ------------------------ Health ------------------------
 app.get("/", (req, res) => res.redirect("/ui"));
 app.get("/health", async (req, res) => {
-  try { await dbPing(); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false }); }
+  try { await dbPing(); res.json({ ok: true }); } catch { res.status(500).json({ ok: false }); }
 });
 
-// ------------------------ Boot ------------------------
+// -------- boot --------
 (async () => {
   try {
     await dbPing();
@@ -1114,16 +997,12 @@ app.get("/health", async (req, res) => {
   console.log("VERIFY_TOKEN SET:", !!process.env.VERIFY_TOKEN ? "YES" : "NO");
   console.log("APP_SECRET SET:", !!process.env.APP_SECRET ? "YES" : "NO");
   console.log("UI_USERS SET:", !!process.env.UI_USERS ? "YES" : "NO");
-  console.log("UI_USER SET:", !!process.env.UI_USER ? "YES" : "NO");
-  console.log("UI_PASS SET:", !!process.env.UI_PASS ? "YES" : "NO");
   console.log("SESSION_SECRET SET:", !!process.env.SESSION_SECRET ? "YES" : "NO");
   console.log("OPENAI_API_KEY SET:", !!process.env.OPENAI_API_KEY ? "YES" : "NO");
   console.log("WA_TOKEN SET:", !!process.env.WA_TOKEN ? "YES" : "NO");
   console.log("PHONE_NUMBER_ID SET:", !!process.env.PHONE_NUMBER_ID ? "YES" : "NO");
   console.log("DATABASE_URL SET:", !!process.env.DATABASE_URL ? "true" : "false");
-  console.log("MEDIA DIR:", MEDIA_DIR);
-  console.log("UPLOADS DIR:", UPLOADS_DIR);
-  console.log("VERSION MARKER: V4_5_STABLE_2026-03-04");
+  console.log("VERSION MARKER: V4.5.1");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("=================================");
 
