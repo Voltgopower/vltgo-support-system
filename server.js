@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.1.3_WEBHOOK_HOTFIX (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.1.4_WEBHOOK_HOTFIX (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -1016,7 +1016,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.1.3 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.1.4 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1107,15 +1107,47 @@ app.get("/api/messages", requireAuth, async (req, res) => {
     const ticketId = Number(req.query.ticket_id || 0);
     if (!ticketId) return res.status(400).json({ ok: false, error: "ticket_id required" });
     if (!(await canAccessTicket(req, ticketId))) return res.status(403).json({ ok: false, error: "forbidden" });
-    const r = await pool.query(
-      "SELECT id, direction, msg_type, COALESCE(text,'') AS text, COALESCE(caption,'') AS caption, COALESCE(media_path,'') AS media_path, COALESCE(thumb_path,'') AS thumb_path, wa_message_id, created_at FROM messages WHERE ticket_id=$1 ORDER BY id ASC LIMIT 2500",
-      [ticketId]
-    );
-    res.json({ ok: true, rows: r.rows });
+
+    const hasTicketId = await columnExists("messages", "ticket_id").catch(()=>false);
+    const hasConversationId = await columnExists("messages", "conversation_id").catch(()=>false);
+
+    if (hasTicketId) {
+      const r = await pool.query(
+        "SELECT id, direction, msg_type, COALESCE(text,'') AS text, COALESCE(caption,'') AS caption, COALESCE(media_path,'') AS media_path, COALESCE(thumb_path,'') AS thumb_path, wa_message_id, created_at " +
+        "FROM messages WHERE ticket_id=$1 ORDER BY id ASC LIMIT 2500",
+        [ticketId]
+      );
+      return res.json({ ok: true, rows: r.rows });
+    }
+
+    if (hasConversationId) {
+      // Legacy schema: messages are linked by conversation_id (often equals wa_id)
+      const t = await pool.query(
+        "SELECT wa_id, " +
+        (await columnExists("tickets","conversation_id").catch(()=>false) ? "conversation_id " : "NULL::bigint AS conversation_id ") +
+        "FROM tickets WHERE id=$1 LIMIT 1",
+        [ticketId]
+      );
+      if (!t.rows.length) return res.json({ ok: true, rows: [] });
+      const wa_id = String(t.rows[0].wa_id || "");
+      const cid = t.rows[0].conversation_id ? String(t.rows[0].conversation_id) : wa_id;
+
+      const r = await pool.query(
+        "SELECT id, direction, msg_type, COALESCE(text,'') AS text, COALESCE(caption,'') AS caption, COALESCE(media_path,'') AS media_path, COALESCE(thumb_path,'') AS thumb_path, wa_message_id, created_at " +
+        "FROM messages WHERE conversation_id=$1 ORDER BY id ASC LIMIT 2500",
+        [cid]
+      );
+      return res.json({ ok: true, rows: r.rows });
+    }
+
+    // Fallback: return empty if schema unknown
+    return res.json({ ok: true, rows: [] });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
+
+
 
 app.post("/api/tickets/mark-read", requireAuth, async (req, res) => {
   try {
@@ -1304,7 +1336,7 @@ button.ghost:hover{background:#f1f5f9}
 </style></head>
 <body>
 <div class="top"><div><div class="brand">Voltgo Support System</div>
-<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.1.3</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
+<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.1.4</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
 <div class="meta">Strict Isolation: ${STRICT_AGENT_VIEW ? "ON" : "OFF"}</div></div>
 
 <div class="wrap">
@@ -1585,7 +1617,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.7.1.3",
+    version: "V4.7.1.4",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1596,7 +1628,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.7.1.3 " + new Date().toISOString());
+  res.send("pong V4.7.1.4 " + new Date().toISOString());
 });
 
 
@@ -1615,12 +1647,12 @@ app.get("/debug/ping", (req, res) => {
     console.error("❌ DB init failed:", e);
   }
   console.log("=================================");
-  const APP_VERSION = "V4.7.1.3";
+  const APP_VERSION = "V4.7.1.4";
 
 console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.1.3");
+  console.log("VERSION MARKER: V4.7.1.4");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
