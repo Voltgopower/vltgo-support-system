@@ -1073,6 +1073,7 @@ app.get("/customers", async (req, res) => {
     const recent24 = (req.query.recent24 || "").toString() === "1";
     const ctag = (req.query.ctag || "").toString().trim().toLowerCase();
     const status = (req.query.status || "").toString().trim().toLowerCase();
+    const assignee = (req.query.assignee || "").toString().trim();
     let assigneeQ = (req.query.assignee || "").toString().trim();
     if (assigneeQ.toLowerCase() === "mine") {
       assigneeQ = (req.session.user && req.session.user.username) ? String(req.session.user.username) : "";
@@ -1319,6 +1320,7 @@ app.get("/ui", async (req, res) => {
       recent24: recent24 ? "1" : "",
       ctag: ctag || "",
       status: status || "",
+      assignee: assignee || "",
     };
 
     const unreadLink = buildQueryLink("/ui", currentParams, { unread: unreadOnly ? "" : "1" });
