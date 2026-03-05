@@ -131,6 +131,34 @@ async function columnExists(table, column) {
   return r.rows.length > 0;
 }
 
+// ---- schema compatibility flags (support older V4.6 DB) ----
+let SCHEMA = {
+  messages_has_conversation_id: false,
+  tickets_has_conversation_id: false,
+  has_conversations_table: false
+};
+
+async function tableExists(table) {
+  const r = await pool.query(
+    "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=$1 LIMIT 1",
+    [table]
+  );
+  return r.rows.length > 0;
+}
+
+async function detectSchema() {
+  try {
+    SCHEMA.has_conversations_table = await tableExists("conversations");
+  } catch (_) {}
+  try {
+    SCHEMA.messages_has_conversation_id = await columnExists("messages", "conversation_id");
+  } catch (_) {}
+  try {
+    SCHEMA.tickets_has_conversation_id = await columnExists("tickets", "conversation_id");
+  } catch (_) {}
+  console.log("🧩 Schema detect:", SCHEMA);
+}
+
 async function addColumnIfMissing(table, column, ddl) {
   const ok = await columnExists(table, column);
   if (ok) return false;
@@ -182,6 +210,20 @@ async function ensureBaseTables() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id BIGSERIAL PRIMARY KEY,
+      wa_id TEXT NOT NULL REFERENCES customers(wa_id) ON DELETE CASCADE,
+      dept TEXT,
+      status TEXT DEFAULT 'open',
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW(),
+      last_message_at TIMESTAMP,
+      last_message TEXT,
+      unread_count INT DEFAULT 0
+    );
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS ticket_notes (
       id BIGSERIAL PRIMARY KEY,
       ticket_id BIGINT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
@@ -207,8 +249,10 @@ async function migrateSchema() {
   await addColumnIfMissing("tickets", "last_message", "last_message TEXT");
   await addColumnIfMissing("tickets", "unread_count", "unread_count INT DEFAULT 0");
   await addColumnIfMissing("tickets", "tags", "tags TEXT[] DEFAULT ARRAY[]::TEXT[]");
+  await addColumnIfMissing("tickets", "conversation_id", "conversation_id BIGINT");
 
-  await addColumnIfMissing("messages", "msg_type", "msg_type TEXT DEFAULT 'text'");
+    await addColumnIfMissing("messages", "conversation_id", "conversation_id BIGINT");
+await addColumnIfMissing("messages", "msg_type", "msg_type TEXT DEFAULT 'text'");
   await addColumnIfMissing("messages", "caption", "caption TEXT");
   await addColumnIfMissing("messages", "media_path", "media_path TEXT");
   await addColumnIfMissing("messages", "thumb_path", "thumb_path TEXT");
@@ -494,28 +538,116 @@ async function createTicketOrReopen(wa_id, dept, assignee) {
   const ins = await pool.query("INSERT INTO tickets(wa_id, dept, status, assignee, last_message_at, unread_count) VALUES($1,$2,'open',$3,NOW(),0) RETURNING id", [String(wa_id), String(dept), assignee || null]);
   return ins.rows[0].id;
 }
+
+async function getOrCreateConversation(wa_id, dept) {
+  // Works for both fresh schema and older DBs that require conversation_id on messages.
+  // Find an open/pending conversation first
+  try {
+    const r = await pool.query(
+      "SELECT id FROM conversations WHERE wa_id=$1 AND COALESCE(dept,'')=$2 AND COALESCE(status,'open') IN ('open','pending') ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1",
+      [String(wa_id), String(dept||'')]
+    );
+    if (r.rows.length) return r.rows[0].id;
+  } catch (_) {}
+  // Reopen latest closed conversation if exists
+  try {
+    const r = await pool.query(
+      "SELECT id FROM conversations WHERE wa_id=$1 AND COALESCE(dept,'')=$2 AND COALESCE(status,'open')='closed' ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1",
+      [String(wa_id), String(dept||'')]
+    );
+    if (r.rows.length) {
+      const id = r.rows[0].id;
+      await pool.query("UPDATE conversations SET status='open', updated_at=NOW(), last_message_at=NOW() WHERE id=$1", [id]);
+      return id;
+    }
+  } catch (_) {}
+  // Create new
+  const ins = await pool.query(
+    "INSERT INTO conversations(wa_id, dept, status, last_message_at, unread_count) VALUES($1,$2,'open',NOW(),0) RETURNING id",
+    [String(wa_id), String(dept||'')]
+  );
+  return ins.rows[0].id;
+}
+
+async function ensureTicketConversation(ticket_id, wa_id, dept) {
+  // If DB doesn't have tickets.conversation_id, just return null
+  const hasCol = await columnExists("tickets", "conversation_id").catch(()=>false);
+  if (!hasCol) return null;
+
+  const r = await pool.query("SELECT conversation_id FROM tickets WHERE id=$1 LIMIT 1", [Number(ticket_id)]);
+  const existing = r.rows[0]?.conversation_id ?? null;
+  if (existing) return Number(existing);
+
+  // Create conversation and bind
+  const cid = await getOrCreateConversation(wa_id, dept);
+  await pool.query("UPDATE tickets SET conversation_id=$2 WHERE id=$1", [Number(ticket_id), Number(cid)]);
+  return Number(cid);
+}
 async function bumpTicketOnIncoming(ticket_id, text) {
   await pool.query("UPDATE tickets SET last_message_at=NOW(), last_message=$2, unread_count=COALESCE(unread_count,0)+1, updated_at=NOW() WHERE id=$1", [ticket_id, String(text || "").slice(0, 600)]);
+  // Mirror to conversations if bound
+  try {
+    const hasCol = await columnExists("tickets","conversation_id").catch(()=>false);
+    if (!hasCol) return;
+    const r = await pool.query("SELECT conversation_id FROM tickets WHERE id=$1 LIMIT 1", [Number(ticket_id)]);
+    const cid = r.rows[0]?.conversation_id;
+    if (cid) {
+      await pool.query("UPDATE conversations SET last_message_at=NOW(), last_message=$2, unread_count=COALESCE(unread_count,0)+1, updated_at=NOW() WHERE id=$1", [Number(cid), String(text || "").slice(0, 600)]);
+    }
+  } catch (_) {}
 }
 async function bumpTicketOnOutgoing(ticket_id, text) {
   await pool.query("UPDATE tickets SET last_message_at=NOW(), last_message=$2, updated_at=NOW() WHERE id=$1", [ticket_id, String(text || "").slice(0, 600)]);
+  // Mirror to conversations if bound
+  try {
+    const hasCol = await columnExists("tickets","conversation_id").catch(()=>false);
+    if (!hasCol) return;
+    const r = await pool.query("SELECT conversation_id FROM tickets WHERE id=$1 LIMIT 1", [Number(ticket_id)]);
+    const cid = r.rows[0]?.conversation_id;
+    if (cid) {
+      await pool.query("UPDATE conversations SET last_message_at=NOW(), last_message=$2, updated_at=NOW() WHERE id=$1", [Number(cid), String(text || "").slice(0, 600)]);
+    }
+  } catch (_) {}
 }
-async function insertMessage({ ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id }) {
+async function insertMessage({ ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id, conversation_id }) {
   const wmid = (wa_message_id ?? null);
-  // If we have a WA message id, use ON CONFLICT to de-dup webhook retries.
+  const cid = (conversation_id ?? null);
+
+  // Choose target column set based on schema
+  const useConversation = await columnExists("messages", "conversation_id").catch(()=>false);
+
+  if (useConversation) {
+    // Ensure conversation_id is present when schema requires it
+    if (!cid) throw new Error("conversation_id required by DB schema but missing");
+    if (wmid && String(wmid).trim()) {
+      const r = await pool.query(
+        "INSERT INTO messages(conversation_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (wa_message_id) DO NOTHING RETURNING id",
+        [Number(cid), String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, String(wmid)]
+      );
+      return r.rows[0]?.id || null;
+    }
+    const r = await pool.query(
+      "INSERT INTO messages(conversation_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
+      "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
+      [Number(cid), String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, null]
+    );
+    return r.rows[0]?.id || null;
+  }
+
+  // Newer schema with ticket_id
   if (wmid && String(wmid).trim()) {
     const r = await pool.query(
       "INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
       "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (wa_message_id) DO NOTHING RETURNING id",
-      [ticket_id, String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, String(wmid)]
+      [Number(ticket_id), String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, String(wmid)]
     );
     return r.rows[0]?.id || null;
   }
-  // Otherwise just insert (no de-dup key)
   const r = await pool.query(
     "INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
     "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
-    [ticket_id, String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, null]
+    [Number(ticket_id), String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, null]
   );
   return r.rows[0]?.id || null;
 }
@@ -631,6 +763,7 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
       const assignee = dept === "presales" ? PRESALES_ASSIGNEE : AFTERSALES_ASSIGNEE;
 
       const ticket_id = await createTicketOrReopen(wa_id, dept, assignee);
+      const conversation_id = await ensureTicketConversation(ticket_id, wa_id, dept).catch(()=>null);
 
       let msg_type = "text";
       let text = null;
@@ -645,7 +778,7 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
       else if (type === "document") { msg_type="document"; const d=await downloadInboundMedia("document", m, wa_id); caption=d.caption; media_path=d.media_path; thumb_path=d.thumb_path; text="[document]"; }
       else { msg_type="text"; text = effectiveText || "[unsupported message type]"; }
 
-      const insertedId = await insertMessage({ ticket_id, wa_id, direction:"incoming", msg_type, text, caption, media_path, thumb_path, wa_message_id });
+      const insertedId = await insertMessage({ ticket_id, wa_id, direction:"incoming", msg_type, text, caption, media_path, thumb_path, wa_message_id, conversation_id });
       if (!insertedId) continue;
 
       await bumpTicketOnIncoming(ticket_id, caption || text || `[${msg_type}]`);
@@ -686,7 +819,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.2 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.3 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -811,7 +944,8 @@ app.post("/api/send", requireAuth, async (req, res) => {
     const waResp = await waSendText(wa_id, text);
     const outId = waResp?.messages?.[0]?.id || null;
 
-    await pool.query("INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, wa_message_id) VALUES($1,$2,'outgoing','text',$3,$4)", [ticketId, wa_id, text.slice(0, 4000), outId]);
+        const conversation_id = await ensureTicketConversation(ticketId, wa_id, (await pool.query('SELECT dept FROM tickets WHERE id=$1',[ticketId])).rows[0]?.dept || '').catch(()=>null);
+    await insertMessage({ ticket_id: ticketId, wa_id, direction:'outgoing', msg_type:'text', text: text.slice(0, 4000), wa_message_id: outId, conversation_id });
     await bumpTicketOnOutgoing(ticketId, text);
 
     sseSend("message", { wa_id, ticket_id: ticketId, direction: "outgoing", msg_type: "text" });
@@ -856,7 +990,8 @@ app.post("/api/send-media", requireAuth, upload.single("file"), async (req, res)
       }
     } catch (_) {}
 
-    await pool.query("INSERT INTO messages(ticket_id, wa_id, direction, msg_type, caption, media_path, thumb_path, wa_message_id) VALUES($1,$2,'outgoing',$3,$4,$5,$6,$7)", [ticketId, wa_id, msgType, caption || null, media_path, thumb_path, outId]);
+    const conversation_id = await ensureTicketConversation(ticketId, wa_id, (await pool.query('SELECT dept FROM tickets WHERE id=$1',[ticketId])).rows[0]?.dept || '').catch(()=>null);
+    await insertMessage({ ticket_id: ticketId, wa_id, direction:'outgoing', msg_type: msgType, caption: caption || null, media_path, thumb_path, wa_message_id: outId, conversation_id });
     await bumpTicketOnOutgoing(ticketId, caption || `[${msgType}]`);
 
     sseSend("message", { wa_id, ticket_id: ticketId, direction: "outgoing", msg_type: msgType });
@@ -1255,6 +1390,7 @@ app.get("/health", async (req, res) => { try { await dbPing(); res.json({ ok: tr
   try {
     await dbPing();
     console.log("✅ DB connected");
+    await detectSchema();
     await ensureBaseTables();
     await migrateSchema();
     await ensureSessionTable();
@@ -1267,7 +1403,7 @@ app.get("/health", async (req, res) => { try { await dbPing(); res.json({ ok: tr
   console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.0.2.1");
+  console.log("VERSION MARKER: V4.7.0.3.1");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
