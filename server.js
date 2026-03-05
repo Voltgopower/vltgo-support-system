@@ -609,16 +609,21 @@ async function bumpTicketOnOutgoing(ticket_id, text) {
     }
   } catch (_) {}
 }
-async function insertMessage({ ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id, conversation_id }) {
+async function insertMessage({ ticket_id, wa_id, dept, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id, conversation_id }) {
   const wmid = (wa_message_id ?? null);
-  const cid = (conversation_id ?? null);
+  let cid = (conversation_id ?? null);
 
   // Choose target column set based on schema
   const useConversation = await columnExists("messages", "conversation_id").catch(()=>false);
 
   if (useConversation) {
-    // Ensure conversation_id is present when schema requires it
+    // Some older schemas require conversation_id NOT NULL.
+    // If missing, create/find a conversation on the fly using (wa_id + dept).
+    if (!cid) {
+      cid = await getOrCreateConversation(wa_id, dept || "");
+    }
     if (!cid) throw new Error("conversation_id required by DB schema but missing");
+
     if (wmid && String(wmid).trim()) {
       const r = await pool.query(
         "INSERT INTO messages(conversation_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
@@ -778,7 +783,7 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
       else if (type === "document") { msg_type="document"; const d=await downloadInboundMedia("document", m, wa_id); caption=d.caption; media_path=d.media_path; thumb_path=d.thumb_path; text="[document]"; }
       else { msg_type="text"; text = effectiveText || "[unsupported message type]"; }
 
-      const insertedId = await insertMessage({ ticket_id, wa_id, direction:"incoming", msg_type, text, caption, media_path, thumb_path, wa_message_id, conversation_id });
+      const insertedId = await insertMessage({ ticket_id, wa_id, dept, direction:"incoming", msg_type, text, caption, media_path, thumb_path, wa_message_id, conversation_id });
       if (!insertedId) continue;
 
       await bumpTicketOnIncoming(ticket_id, caption || text || `[${msg_type}]`);
@@ -819,7 +824,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.3 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.4 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -945,7 +950,7 @@ app.post("/api/send", requireAuth, async (req, res) => {
     const outId = waResp?.messages?.[0]?.id || null;
 
         const conversation_id = await ensureTicketConversation(ticketId, wa_id, (await pool.query('SELECT dept FROM tickets WHERE id=$1',[ticketId])).rows[0]?.dept || '').catch(()=>null);
-    await insertMessage({ ticket_id: ticketId, wa_id, direction:'outgoing', msg_type:'text', text: text.slice(0, 4000), wa_message_id: outId, conversation_id });
+    await insertMessage({ ticket_id: ticketId, wa_id, dept: (await pool.query('SELECT dept FROM tickets WHERE id=$1',[ticketId])).rows[0]?.dept || '', direction:'outgoing', msg_type:'text', text: text.slice(0, 4000), wa_message_id: outId, conversation_id });
     await bumpTicketOnOutgoing(ticketId, text);
 
     sseSend("message", { wa_id, ticket_id: ticketId, direction: "outgoing", msg_type: "text" });
@@ -991,7 +996,7 @@ app.post("/api/send-media", requireAuth, upload.single("file"), async (req, res)
     } catch (_) {}
 
     const conversation_id = await ensureTicketConversation(ticketId, wa_id, (await pool.query('SELECT dept FROM tickets WHERE id=$1',[ticketId])).rows[0]?.dept || '').catch(()=>null);
-    await insertMessage({ ticket_id: ticketId, wa_id, direction:'outgoing', msg_type: msgType, caption: caption || null, media_path, thumb_path, wa_message_id: outId, conversation_id });
+    await insertMessage({ ticket_id: ticketId, wa_id, dept: (await pool.query('SELECT dept FROM tickets WHERE id=$1',[ticketId])).rows[0]?.dept || '', direction:'outgoing', msg_type: msgType, caption: caption || null, media_path, thumb_path, wa_message_id: outId, conversation_id });
     await bumpTicketOnOutgoing(ticketId, caption || `[${msgType}]`);
 
     sseSend("message", { wa_id, ticket_id: ticketId, direction: "outgoing", msg_type: msgType });
@@ -1403,7 +1408,7 @@ app.get("/health", async (req, res) => { try { await dbPing(); res.json({ ok: tr
   console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.0.3.1");
+  console.log("VERSION MARKER: V4.7.0.4.1");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
