@@ -1,5 +1,5 @@
 /**
- * Voltgo Support System V4.2 (Tickets)
+ * Voltgo Support System V4.3 (Tickets + Customers UI)
  * - Multi-agent login via UI_USERS (user:pass,user2:pass2)
  * - Strict isolation (STRICT_AGENT_VIEW=1): agents only see Unassigned + Mine
  * - Ticketing: one WhatsApp wa_id can have multiple tickets (presales/aftersales)
@@ -23,7 +23,7 @@
 
 require("dotenv").config();
 
-console.log("✅ LOADED SERVER.JS: Voltgo Support System V4.2 (Tickets) (2026-03-04)");
+console.log("✅ LOADED SERVER.JS: Voltgo Support System V4.3 (Tickets + Customers UI) (2026-03-04)");
 
 const express = require("express");
 const path = require("path");
@@ -72,6 +72,8 @@ const ADMIN_USERS = new Set(
 // Assignees
 const PRESALES_ASSIGNEE = (process.env.PRESALES_ASSIGNEE || "presales").trim();
 const AFTERSALES_ASSIGNEE = (process.env.AFTERSALES_ASSIGNEE || "aftersales").trim();
+
+const VERSION_MARKER = "V4_3_STABLE_2026-03-04";
 
 // Keyword routing
 const PRESALES_KEYWORDS = ["price", "quote", "buy", "dealer", "wholesale", "distributor", "lead", "sales"];
@@ -706,9 +708,13 @@ function uiLayout(title, user, bodyHtml, extraHead) {
     <div class="row" style="justify-content:space-between;">
       <div>
         <div class="h1">${esc(title)}</div>
-        <div class="sub">DB-backed • Version: V4_2_STABLE_2026-03-04 • Tickets • ${esc(STRICT_AGENT_VIEW ? "Strict Isolation ON" : "Strict Isolation OFF")}</div>
+        <div class="sub">DB-backed • Version: ${esc(VERSION_MARKER)} • ${esc(title)} • ${esc(STRICT_AGENT_VIEW ? "Strict Isolation ON" : "Strict Isolation OFF")}</div>
       </div>
       ${topRight}
+    </div>
+    <div class="row" style="margin-top:12px;">
+      <a href="/ui" style="text-decoration:none;"><button class="btn ${title==="Tickets" ? "primary" : ""}">Tickets</button></a>
+      <a href="/ui/customers" style="text-decoration:none;"><button class="btn ${title==="Customers" ? "primary" : ""}">Customers</button></a>
     </div>
     <div style="height:14px;"></div>
     ${bodyHtml}
@@ -1012,3 +1018,308 @@ app.get("/", (req, res) => {
     app.listen(PORT, () => console.log("⚠️ Server running WITHOUT DB on port", PORT));
   }
 })();
+// ------------------------ Customers aggregate API ------------------------
+app.get("/api/customers", requireAuth, async (req, res) => {
+  try {
+    const user = req.session.user;
+
+    const q = String(req.query.q || "").trim();
+    const dept = String(req.query.dept || "").trim();
+    const status = String(req.query.status || "").trim();
+    const assigneeQ = String(req.query.assignee || "").trim();
+    const unreadOnly = String(req.query.unread || "").trim() === "1";
+
+    // Build a filtered tickets CTE, then aggregate by wa_id
+    let where = "WHERE 1=1";
+    const params = [];
+    let i = 1;
+
+    if (dept) { where += ` AND department = $${i++}`; params.push(dept); }
+    if (status) { where += ` AND status = $${i++}`; params.push(status); }
+    if (assigneeQ) { where += ` AND assigned_to = $${i++}`; params.push(assigneeQ); }
+    if (unreadOnly) { where += ` AND COALESCE(unread_count,0) > 0`; }
+
+    if (q) {
+      where += ` AND (wa_id ILIKE $${i++} OR COALESCE(last_message,'') ILIKE $${i++})`;
+      params.push(`%${q}%`, `%${q}%`);
+    }
+
+    if (STRICT_AGENT_VIEW && !isAdminUser(user)) {
+      where += ` AND (COALESCE(NULLIF(assigned_to,''), '') = '' OR assigned_to = $${i++})`;
+      params.push(user);
+    }
+
+    const sql = `
+      WITH ft AS (
+        SELECT id, wa_id, department, assigned_to, status, created_at, last_message, last_time, unread_count
+        FROM tickets
+        ${where}
+      ),
+      latest AS (
+        SELECT DISTINCT ON (wa_id)
+          wa_id,
+          department AS last_dept,
+          assigned_to AS last_assignee,
+          status AS last_status,
+          last_message,
+          last_time,
+          unread_count,
+          created_at
+        FROM ft
+        ORDER BY wa_id, COALESCE(last_time, created_at) DESC, id DESC
+      ),
+      agg AS (
+        SELECT
+          wa_id,
+          COUNT(*)::int AS ticket_count,
+          SUM(CASE WHEN status='open' THEN 1 ELSE 0 END)::int AS open_count,
+          SUM(COALESCE(unread_count,0))::int AS unread_total
+        FROM ft
+        GROUP BY wa_id
+      )
+      SELECT
+        a.wa_id,
+        a.ticket_count,
+        a.open_count,
+        a.unread_total,
+        l.last_dept,
+        l.last_assignee,
+        l.last_status,
+        l.last_time,
+        l.last_message
+      FROM agg a
+      JOIN latest l USING (wa_id)
+      ORDER BY COALESCE(l.last_time, l.created_at) DESC
+      LIMIT 500
+    `;
+
+    const r = await pool.query(sql, params);
+    res.json({ ok: true, data: r.rows });
+  } catch (e) {
+    console.error("❌ /customers api error:", e);
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+// ------------------------ Customers UI ------------------------
+app.get("/ui/customers", requireAuth, async (req, res) => {
+  const user = req.session.user;
+  const html = `
+<div class="card pad">
+  <div class="row">
+    <input id="q" class="inp" placeholder="Search wa_id / last message" style="flex:1;min-width:240px;" />
+    <select id="dept" class="sel">
+      <option value="">All depts</option>
+      <option value="presales">Pre-Sales</option>
+      <option value="aftersales">After-Sales</option>
+    </select>
+    <select id="status" class="sel">
+      <option value="">All status</option>
+      <option value="open">open</option>
+      <option value="closed">closed</option>
+    </select>
+    <select id="assignee" class="sel">
+      <option value="">All assignees</option>
+      <option value="${esc(PRESALES_ASSIGNEE)}">${esc(PRESALES_ASSIGNEE)}</option>
+      <option value="${esc(AFTERSALES_ASSIGNEE)}">${esc(AFTERSALES_ASSIGNEE)}</option>
+      <option value="${esc(user)}">Mine</option>
+      <option value="__unassigned__">Unassigned</option>
+    </select>
+    <label class="pill"><input id="unread" type="checkbox" style="margin-right:8px;" />Unread only</label>
+    <button class="btn primary" onclick="applyFilters()">Apply</button>
+    <button class="btn" onclick="clearFilters()">Clear</button>
+  </div>
+</div>
+
+<div style="height:14px;"></div>
+
+<div class="card">
+  <div class="pad">
+    <table>
+      <thead>
+        <tr>
+          <th>wa_id</th>
+          <th>Open</th>
+          <th>Tickets</th>
+          <th>Last dept</th>
+          <th>Last status</th>
+          <th>Last assignee</th>
+          <th>Last time</th>
+          <th>Last message</th>
+        </tr>
+      </thead>
+      <tbody id="rows">
+        <tr><td class="muted" colspan="8">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  function qs(id){ return document.getElementById(id); }
+  function escapeHtml(s){ return String(s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;"); }
+
+  function readFilters(){
+    const q = qs("q").value.trim();
+    const dept = qs("dept").value.trim();
+    const status = qs("status").value.trim();
+    const assignee = qs("assignee").value.trim();
+    const unread = qs("unread").checked ? "1" : "";
+    return { q, dept, status, assignee, unread };
+  }
+
+  function setFiltersFromUrl(){
+    const u = new URL(location.href);
+    qs("q").value = u.searchParams.get("q") || "";
+    qs("dept").value = u.searchParams.get("dept") || "";
+    qs("status").value = u.searchParams.get("status") || "";
+    qs("assignee").value = u.searchParams.get("assignee") || "";
+    qs("unread").checked = (u.searchParams.get("unread")||"") === "1";
+  }
+
+  function applyFilters(){
+    const f = readFilters();
+    const u = new URL(location.href);
+    Object.entries(f).forEach(([k,v]) => { if(v) u.searchParams.set(k,v); else u.searchParams.delete(k); });
+    history.replaceState({}, "", u.toString());
+    load();
+  }
+  function clearFilters(){
+    qs("q").value=""; qs("dept").value=""; qs("status").value=""; qs("assignee").value=""; qs("unread").checked=false;
+    const u = new URL(location.href);
+    ["q","dept","status","assignee","unread"].forEach(k=>u.searchParams.delete(k));
+    history.replaceState({}, "", u.toString());
+    load();
+  }
+
+  async function load(){
+    const f = readFilters();
+    const params = new URLSearchParams();
+    Object.entries(f).forEach(([k,v])=>{ if(v) params.set(k,v); });
+    const r = await fetch("/api/customers?"+params.toString(), { credentials: "include" });
+    const j = await r.json();
+    const rowsEl = qs("rows");
+    if(!j.ok){
+      rowsEl.innerHTML = '<tr><td class="muted" colspan="8">'+escapeHtml(j.error||"error")+'</td></tr>';
+      return;
+    }
+    const data = j.data || [];
+    if(!data.length){
+      rowsEl.innerHTML = '<tr><td class="muted" colspan="8">No customers yet.</td></tr>';
+      return;
+    }
+    rowsEl.innerHTML = data.map(c=>{
+      const lastTime = c.last_time ? new Date(c.last_time).toLocaleString() : "";
+      const wa = escapeHtml(c.wa_id);
+      return '<tr>'
+        + '<td class="mono"><a class="link" href="/ui/customer/'+encodeURIComponent(c.wa_id)+'">'+wa+'</a></td>'
+        + '<td><span class="badge">'+escapeHtml(c.open_count)+'</span></td>'
+        + '<td>'+escapeHtml(c.ticket_count)+'</td>'
+        + '<td><span class="pill">'+escapeHtml(c.last_dept||"")+'</span></td>'
+        + '<td><span class="pill">'+escapeHtml(c.last_status||"")+'</span></td>'
+        + '<td>'+(c.last_assignee?('<span class="pill">'+escapeHtml(c.last_assignee)+'</span>'):'<span class="pill">unassigned</span>')+'</td>'
+        + '<td>'+escapeHtml(lastTime)+'</td>'
+        + '<td>'+escapeHtml((c.last_message||"").slice(0,140))+'</td>'
+        + '</tr>';
+    }).join("");
+  }
+
+  setFiltersFromUrl();
+  load();
+
+  // realtime refresh via SSE (same stream as tickets)
+  const es = new EventSource("/events");
+  es.onmessage = (ev) => {
+    try{
+      const msg = JSON.parse(ev.data||"{}");
+      if(msg && (msg.type==="ticket_update" || msg.type==="message")){
+        load();
+      }
+    }catch{}
+  };
+</script>
+`;
+  res.status(200).send(uiLayout("Customers", user, html));
+});
+
+// Customer detail page: list tickets for one wa_id (filtered by strict view)
+app.get("/ui/customer/:wa", requireAuth, async (req, res) => {
+  try {
+    const user = req.session.user;
+    const wa = String(req.params.wa || "").trim();
+    if (!wa) return res.status(400).send("Bad wa_id");
+
+    let sql = `SELECT id, wa_id, department, assigned_to, status, created_at, last_message, last_time, unread_count
+               FROM tickets WHERE wa_id = $1`;
+    const params = [wa];
+    let i = 2;
+
+    if (STRICT_AGENT_VIEW && !isAdminUser(user)) {
+      sql += ` AND (COALESCE(NULLIF(assigned_to,''), '') = '' OR assigned_to = $${i++})`;
+      params.push(user);
+    }
+
+    sql += ` ORDER BY COALESCE(last_time, created_at) DESC, id DESC`;
+
+    const r = await pool.query(sql, params);
+
+    const rows = (r.rows || []).map(t => {
+      const badge = (t.unread_count || 0) > 0 ? `<span class="badge">${esc(t.unread_count)}</span>` : "";
+      const ass = t.assigned_to ? `<span class="pill">${esc(t.assigned_to)}</span>` : `<span class="pill">unassigned</span>`;
+      const lastTime = t.last_time ? new Date(t.last_time).toLocaleString() : "";
+      return `<tr>
+        <td class="mono"><a class="link" href="/ui/ticket/${t.id}">#${t.id}</a> ${badge}</td>
+        <td><span class="pill">${esc(t.department)}</span></td>
+        <td><span class="pill">${esc(t.status)}</span></td>
+        <td>${ass}</td>
+        <td>${esc(lastTime)}</td>
+        <td>${esc((t.last_message||"").slice(0,140))}</td>
+      </tr>`;
+    }).join("");
+
+    const html = `
+<div class="card pad">
+  <div class="row" style="justify-content:space-between;">
+    <div>
+      <div class="h1" style="font-size:20px;">Customer: <span class="mono">${esc(wa)}</span></div>
+      <div class="sub">Tickets for this customer</div>
+    </div>
+    <a href="/ui/customers" style="text-decoration:none;"><button class="btn">← Back</button></a>
+  </div>
+</div>
+
+<div style="height:14px;"></div>
+
+<div class="card">
+  <div class="pad">
+    <table>
+      <thead>
+        <tr>
+          <th>Ticket</th>
+          <th>Dept</th>
+          <th>Status</th>
+          <th>Assignee</th>
+          <th>Last time</th>
+          <th>Last message</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows || `<tr><td class="muted" colspan="6">No tickets visible for this customer.</td></tr>`}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  // simple live refresh on events
+  const es = new EventSource("/events");
+  es.onmessage = () => { location.reload(); };
+</script>
+`;
+    res.status(200).send(uiLayout("Customers", user, html));
+  } catch (e) {
+    console.error("❌ /ui/customer error:", e);
+    res.status(500).send("Internal error");
+  }
+});
+
