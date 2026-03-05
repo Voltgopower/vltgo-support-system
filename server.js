@@ -236,12 +236,31 @@ async function migrateSchema() {
 }
 
 async function ensureIndexes() {
-  // Create indexes after columns are present; if index exists, IF NOT EXISTS handles it
-  try { await pool.query("CREATE INDEX IF NOT EXISTS idx_tickets_wa_id ON tickets(wa_id);"); } catch (_) {}
-  try { await pool.query("CREATE INDEX IF NOT EXISTS idx_tickets_dept ON tickets(dept);"); } catch (_) {}
-  try { await pool.query("CREATE INDEX IF NOT EXISTS idx_messages_ticket_id ON messages(ticket_id);"); } catch (_) {}
-}
 
+  // Ticket indexes
+  try {
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_tickets_wa_id ON tickets(wa_id);");
+  } catch (_) {}
+
+  try {
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_tickets_dept ON tickets(dept);");
+  } catch (_) {}
+
+  // Message indexes
+  try {
+    await pool.query("CREATE INDEX IF NOT EXISTS idx_messages_ticket_id ON messages(ticket_id);");
+  } catch (_) {}
+
+  // WhatsApp message duplicate protection
+  try {
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_wa_message_id
+      ON messages(wa_message_id)
+      WHERE wa_message_id IS NOT NULL;
+    `);
+  } catch (_) {}
+
+}
 function nowIso() { return new Date().toISOString(); }
 function esc(s) {
   return String(s ?? "")
