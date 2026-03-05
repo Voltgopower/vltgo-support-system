@@ -263,6 +263,34 @@ async function ensureIndexes() {
       WHERE wa_message_id IS NOT NULL AND wa_message_id <> '';
     `);
   } catch (_) {}
+
+  // ---- WA message de-dup (needs a UNIQUE index for ON CONFLICT (wa_message_id)) ----
+  // 1) Clean duplicates if any (keep the smallest id per wa_message_id)
+  try {
+    await pool.query(`
+      WITH dups AS (
+        SELECT wa_message_id, MIN(id) AS keep_id
+        FROM messages
+        WHERE wa_message_id IS NOT NULL AND wa_message_id <> ''
+        GROUP BY wa_message_id
+        HAVING COUNT(*) > 1
+      )
+      DELETE FROM messages m
+      USING dups d
+      WHERE m.wa_message_id = d.wa_message_id
+        AND m.id <> d.keep_id;
+    `);
+  } catch (_) {}
+
+  // 2) Create a normal UNIQUE index (Postgres allows multiple NULLs, so this is safe)
+  //    This makes: INSERT ... ON CONFLICT (wa_message_id) DO NOTHING work.
+  try {
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_wa_message_id_full
+      ON messages(wa_message_id);
+    `);
+  } catch (_) {}
+
 }
 
 // -------- auth/users --------
@@ -473,10 +501,21 @@ async function bumpTicketOnOutgoing(ticket_id, text) {
   await pool.query("UPDATE tickets SET last_message_at=NOW(), last_message=$2, updated_at=NOW() WHERE id=$1", [ticket_id, String(text || "").slice(0, 600)]);
 }
 async function insertMessage({ ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id }) {
+  const wmid = (wa_message_id ?? null);
+  // If we have a WA message id, use ON CONFLICT to de-dup webhook retries.
+  if (wmid && String(wmid).trim()) {
+    const r = await pool.query(
+      "INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
+      "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (wa_message_id) DO NOTHING RETURNING id",
+      [ticket_id, String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, String(wmid)]
+    );
+    return r.rows[0]?.id || null;
+  }
+  // Otherwise just insert (no de-dup key)
   const r = await pool.query(
     "INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
-    "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (wa_message_id) DO NOTHING RETURNING id",
-    [ticket_id, String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, wa_message_id ?? null]
+    "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
+    [ticket_id, String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, null]
   );
   return r.rows[0]?.id || null;
 }
@@ -647,7 +686,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.2 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1228,7 +1267,7 @@ app.get("/health", async (req, res) => { try { await dbPing(); res.json({ ok: tr
   console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.0.1");
+  console.log("VERSION MARKER: V4.7.0.2.1");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
