@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.0_LIGHT_UI (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.0.1_WEBHOOK_HOTFIX (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -528,9 +528,22 @@ async function downloadInboundMedia(kind, m, wa_id) {
 app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
   const rawBody = req.body;
   try {
-    if (!verifyAppSecret(req, rawBody)) return res.status(403).send("bad signature");
+    // IMPORTANT:
+    // If app.use(express.json()) runs before this route, req.body may already be an Object.
+    // So we must support Buffer | string | object safely.
+    const isBuf = Buffer.isBuffer(rawBody);
+    const rawText = isBuf ? rawBody.toString("utf8") : (typeof rawBody === "string" ? rawBody : null);
 
-    const body = JSON.parse(rawBody.toString("utf8"));
+    // Signature verify needs the raw bytes. If body was already parsed to object, we can't verify.
+    // (Most deployments do not set APP_SECRET; if you do, place the webhook route BEFORE express.json()).
+    if (process.env.APP_SECRET && !isBuf) {
+      console.warn("⚠️ APP_SECRET is set but webhook body is not Buffer. Move /webhook route above express.json() to verify signatures correctly.");
+    }
+    if (!verifyAppSecret(req, isBuf ? rawBody : Buffer.from(rawText || JSON.stringify(rawBody || {})))) {
+      return res.status(403).send("bad signature");
+    }
+
+    const body = rawText ? JSON.parse(rawText) : (rawBody && typeof rawBody === "object" ? rawBody : {});
     const entry = body.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
@@ -920,7 +933,7 @@ button.ghost:hover{background:#f1f5f9}
 </style></head>
 <body>
 <div class="top"><div><div class="brand">Voltgo Support System</div>
-<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.0</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
+<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.0.1</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
 <div class="meta">Strict Isolation: ${STRICT_AGENT_VIEW ? "ON" : "OFF"}</div></div>
 
 <div class="wrap">
@@ -1215,7 +1228,7 @@ app.get("/health", async (req, res) => { try { await dbPing(); res.json({ ok: tr
   console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.0");
+  console.log("VERSION MARKER: V4.7.0.1");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
