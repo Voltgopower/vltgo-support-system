@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.2.1_WEBHOOK_HOTFIX (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.2.3_WEBHOOK_HOTFIX (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -1016,7 +1016,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.2.1 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.2.3 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1294,7 +1294,7 @@ app.post("/api/ticket-notes/add", requireAuth, async (req, res) => {
 });
 
 // -------- UI Dashboard --------
-app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
+app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("text/html; charset=utf-8");
   const user = getUser(req);
   res.send(`<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Voltgo Support System</title>
@@ -1343,7 +1343,7 @@ button.ghost:hover{background:#f1f5f9}
 </style></head>
 <body>
 <div class="top"><div><div class="brand">Voltgo Support System</div>
-<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.2.1</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
+<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.2.3</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
 <div class="meta">Strict Isolation: ${STRICT_AGENT_VIEW ? "ON" : "OFF"}</div></div>
 
 <div class="wrap">
@@ -1639,7 +1639,8 @@ el('ticketList').addEventListener('click',(ev)=>{
 });
 
 loadTickets();
-</body></html>`);
+</script>
+</body></html`);
 });
 
 app.get("/", (req, res) => res.redirect("/ui"));
@@ -1648,7 +1649,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.7.2.1",
+    version: "V4.7.2.3",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1659,7 +1660,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.7.2.1 " + new Date().toISOString());
+  res.send("pong V4.7.2.3 " + new Date().toISOString());
 });
 
 // Optional debug key for one-off diagnostics (set Railway variable DEBUG_KEY to enable)
@@ -1720,12 +1721,12 @@ app.get("/debug/messages", async (req, res) => {
     console.error("❌ DB init failed:", e);
   }
   console.log("=================================");
-  const APP_VERSION = "V4.7.2.1";
+  const APP_VERSION = "V4.7.2.3";
 
 console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.2.1");
+  console.log("VERSION MARKER: V4.7.2.3");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
