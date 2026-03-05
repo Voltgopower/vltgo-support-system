@@ -1,342 +1,395 @@
+#!/usr/bin/env node
 /**
- * Voltgo Support System V4.3 (Tickets + Customers UI)
- * - Multi-agent login via UI_USERS (user:pass,user2:pass2)
- * - Strict isolation (STRICT_AGENT_VIEW=1): agents only see Unassigned + Mine
- * - Ticketing: one WhatsApp wa_id can have multiple tickets (presales/aftersales)
- * - Auto routing by keyword OR menu (1/2)
- * - DB-backed (Postgres): auto-migrate tables
+ * Voltgo Support System V4.5 (Railway Stable)
+ * - DB-backed (Postgres)
+ * - Multi-agent UI login (UI_USERS=presales:111111,aftersales:222222)
+ * - Dept routing: presales / aftersales
+ *   - AI routing optional (OPENAI_API_KEY) with fallback menu 1/2 when unknown
+ * - Strict isolation (STRICT_AGENT_VIEW=1): agents only see their dept
+ * - Customers (name + notes) + Tickets + Messages
+ * - Realtime UI via SSE (auto push)
  *
- * Required env:
- *   DATABASE_URL
- *   VERIFY_TOKEN
- *   WA_TOKEN
- *   PHONE_NUMBER_ID
- *   UI_USERS=presales:111111,aftersales:222222
+ * Required .env variables (Railway Variables or local .env):
+ *   VERIFY_TOKEN=voltgo_webhook_verify
+ *   WA_TOKEN=... (Meta permanent/system user token)
+ *   PHONE_NUMBER_ID=...
+ *   DATABASE_URL=postgresql://...
+ *   SESSION_SECRET=...
+ *
+ * Optional:
+ *   UI_USERS=presales:111111,aftersales:222222   (if not set, falls back to UI_USER/UI_PASS)
+ *   UI_USER=admin
+ *   UI_PASS=voltgo123
  *   PRESALES_ASSIGNEE=presales
  *   AFTERSALES_ASSIGNEE=aftersales
- *   SESSION_SECRET=...
- * Optional:
- *   PORT=8080
  *   STRICT_AGENT_VIEW=1
- *   ADMIN_USERS=admin,bruce
+ *   OPENAI_API_KEY=...   (enables AI routing)
+ *   OPENAI_MODEL=gpt-4o-mini
+ *   APP_SECRET=... (Meta webhook signature verify; optional)
  */
 
 require("dotenv").config();
-
-console.log("✅ LOADED SERVER.JS: Voltgo Support System V4.3 (Tickets + Customers UI) (2026-03-04)");
+console.log("✅ LOADED SERVER.JS: V4.5_STABLE_RAILWAY (2026-03-04)");
 
 const express = require("express");
-const path = require("path");
+const crypto = require("crypto");
 const fs = require("fs");
+const path = require("path");
 const multer = require("multer");
 const session = require("express-session");
 const { Pool } = require("pg");
 
-// Optional sharp
+// Optional OpenAI
+let OpenAI = null;
+let openai = null;
+if (process.env.OPENAI_API_KEY) {
+  try {
+    OpenAI = require("openai");
+    openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    console.log("✅ OpenAI enabled for routing");
+  } catch (e) {
+    console.warn("⚠️ OPENAI_API_KEY set but 'openai' package missing. Run: npm i openai");
+  }
+}
+
+// Optional sharp (thumbnails)
 let sharp = null;
-try { sharp = require("sharp"); console.log("✅ sharp enabled: thumbnails will be generated"); }
-catch { console.log("ℹ️ sharp not installed: thumbnails disabled"); }
+try {
+  sharp = require("sharp");
+  console.log("✅ sharp enabled: thumbnails will be generated");
+} catch (e) {
+  console.log("ℹ️ sharp not installed: thumbnails disabled (ok)");
+}
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+app.set("trust proxy", 1);
+app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-// ------------------------ env & config ------------------------
-function mustEnv(k) {
-  const v = process.env[k];
+const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
+
+// ------------------------ ENV helpers ------------------------
+function requireEnv(name) {
+  const v = process.env[name];
   if (!v) {
-    console.error("Missing .env variable:", k);
+    console.error("Missing .env variable:", name);
     process.exit(1);
   }
   return v;
 }
 
-const PORT = parseInt(process.env.PORT || "8080", 10);
-const VERIFY_TOKEN = mustEnv("VERIFY_TOKEN");
-const DATABASE_URL = mustEnv("DATABASE_URL");
-const WA_TOKEN = mustEnv("WA_TOKEN");
-const PHONE_NUMBER_ID = mustEnv("PHONE_NUMBER_ID");
+const VERIFY_TOKEN = requireEnv("VERIFY_TOKEN");
+const WA_TOKEN = requireEnv("WA_TOKEN");
+const PHONE_NUMBER_ID = requireEnv("PHONE_NUMBER_ID");
+const DATABASE_URL = requireEnv("DATABASE_URL");
 
-const UI_USERS_RAW = (process.env.UI_USERS || "").trim();
-const UI_USER_SINGLE = (process.env.UI_USER || "").trim();
-const UI_PASS_SINGLE = (process.env.UI_PASS || "").trim();
-const SESSION_SECRET = (process.env.SESSION_SECRET || "change_me_session_secret").trim();
-const STRICT_AGENT_VIEW = (process.env.STRICT_AGENT_VIEW || "").trim() === "1";
-const ADMIN_USERS = new Set(
-  (process.env.ADMIN_USERS || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean)
+const SESSION_SECRET = process.env.SESSION_SECRET || "voltgo_super_secret_key";
+const UI_USER_FALLBACK = process.env.UI_USER || "admin";
+const UI_PASS_FALLBACK = process.env.UI_PASS || "voltgo123";
+const PRESALES_ASSIGNEE = process.env.PRESALES_ASSIGNEE || "presales";
+const AFTERSALES_ASSIGNEE = process.env.AFTERSALES_ASSIGNEE || "aftersales";
+const STRICT_AGENT_VIEW = String(process.env.STRICT_AGENT_VIEW || "1") === "1";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+// ------------------------ Session ------------------------
+app.use(
+  session({
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: false, // Railway terminates TLS; this is ok behind proxy
+      maxAge: 1000 * 60 * 60 * 24 * 7
+    }
+  })
 );
 
-// Assignees
-const PRESALES_ASSIGNEE = (process.env.PRESALES_ASSIGNEE || "presales").trim();
-const AFTERSALES_ASSIGNEE = (process.env.AFTERSALES_ASSIGNEE || "aftersales").trim();
-
-const VERSION_MARKER = "V4_3_STABLE_2026-03-04";
-
-// Keyword routing
-const PRESALES_KEYWORDS = ["price", "quote", "buy", "dealer", "wholesale", "distributor", "lead", "sales"];
-const AFTERSALES_KEYWORDS = ["support", "warranty", "problem", "issue", "bms", "can", "return", "rma", "install", "trouble", "fault", "broken"];
-
-// ------------------------ helpers ------------------------
-function esc(s) {
-  return String(s ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
-function nowISO() {
-  return new Date().toISOString();
-}
-
-function isAdminUser(u) {
-  if (!u) return false;
-  if (ADMIN_USERS.has(u)) return true;
-  if (u === "admin") return true;
-  if (UI_USER_SINGLE && u === UI_USER_SINGLE) return true;
-  return false;
-}
-
-function parseUiUsers() {
-  const map = new Map();
-  if (UI_USERS_RAW) {
-    for (const pair of UI_USERS_RAW.split(",")) {
-      const p = pair.trim();
-      if (!p) continue;
-      const idx = p.indexOf(":");
-      if (idx <= 0) continue;
-      const user = p.slice(0, idx).trim();
-      const pass = p.slice(idx + 1).trim();
-      if (user && pass) map.set(user, pass);
-    }
-  }
-  if (UI_USER_SINGLE && UI_PASS_SINGLE) {
-    map.set(UI_USER_SINGLE, UI_PASS_SINGLE);
-  }
-  return map;
-}
-const UI_USERS = parseUiUsers();
-
-function requireAuth(req, res, next) {
-  if (req.session && req.session.user) return next();
-  res.redirect("/login");
-}
-
-// Very small event bus for SSE
-const sseClients = new Set();
-function sseBroadcast(event, dataObj) {
-  const payload = `event: ${event}\ndata: ${JSON.stringify(dataObj)}\n\n`;
-  for (const res of sseClients) {
-    try { res.write(payload); } catch { /* ignore */ }
-  }
-}
-
-// ------------------------ storage paths ------------------------
+// ------------------------ Upload dirs ------------------------
 const LOGS_DIR = path.join(process.cwd(), "logs");
+const UPLOADS_DIR = path.join(LOGS_DIR, "uploads");
 const MEDIA_DIR = path.join(LOGS_DIR, "media");
 const THUMBS_DIR = path.join(MEDIA_DIR, "__thumbs");
-const UPLOADS_DIR = path.join(LOGS_DIR, "uploads");
-for (const d of [LOGS_DIR, MEDIA_DIR, THUMBS_DIR, UPLOADS_DIR]) {
-  try { fs.mkdirSync(d, { recursive: true }); } catch { /* ignore */ }
+for (const d of [LOGS_DIR, UPLOADS_DIR, MEDIA_DIR, THUMBS_DIR]) {
+  try { fs.mkdirSync(d, { recursive: true }); } catch (_) {}
 }
-const upload = multer({ dest: UPLOADS_DIR }); // reserved for future uploads
+
+const upload = multer({
+  dest: UPLOADS_DIR,
+  limits: { fileSize: 25 * 1024 * 1024 }
+});
 
 // ------------------------ DB ------------------------
-const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+const pool = new Pool({ connectionString: DATABASE_URL });
 
 async function dbPing() {
-  await pool.query("SELECT 1 as ok");
+  const c = await pool.connect();
+  try {
+    await c.query("SELECT 1");
+  } finally {
+    c.release();
+  }
 }
 
-async function dbInit() {
-  // customers: include meta for pending choice
+async function ensureTables() {
+  // Customers: stable entity per wa_id
   await pool.query(`
     CREATE TABLE IF NOT EXISTS customers (
       wa_id TEXT PRIMARY KEY,
       name TEXT,
+      notes TEXT,
       created_at TIMESTAMP DEFAULT NOW(),
-      meta JSONB DEFAULT '{}'::jsonb
-    )
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
   `);
 
-  // tickets
+  // Tickets: can have multiple tickets per customer
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tickets (
-      id SERIAL PRIMARY KEY,
-      wa_id TEXT NOT NULL,
-      department TEXT NOT NULL,
-      assigned_to TEXT,
-      status TEXT DEFAULT 'open',
+      id BIGSERIAL PRIMARY KEY,
+      wa_id TEXT NOT NULL REFERENCES customers(wa_id) ON DELETE CASCADE,
+      dept TEXT NOT NULL CHECK (dept IN ('presales','aftersales')),
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','pending','closed')),
+      assignee TEXT,
       created_at TIMESTAMP DEFAULT NOW(),
       updated_at TIMESTAMP DEFAULT NOW(),
+      last_message_at TIMESTAMP,
       last_message TEXT,
-      last_time TIMESTAMP,
       unread_count INT DEFAULT 0,
-      meta JSONB DEFAULT '{}'::jsonb
-    )
+      tags TEXT[] DEFAULT ARRAY[]::TEXT[]
+    );
   `);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tickets_wa_status ON tickets(wa_id, status)`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tickets_assignee ON tickets(assigned_to)`);
 
-  // messages: add ticket_id if missing
-  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS ticket_id INT`);
-  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_ticket ON messages(ticket_id, id)`);
+  // Messages: attach to ticket
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id BIGSERIAL PRIMARY KEY,
+      ticket_id BIGINT NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+      wa_id TEXT NOT NULL,
+      direction TEXT NOT NULL CHECK (direction IN ('incoming','outgoing')),
+      msg_type TEXT NOT NULL DEFAULT 'text',
+      text TEXT,
+      caption TEXT,
+      media_path TEXT,
+      thumb_path TEXT,
+      wa_message_id TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 
-  console.log("✅ DB connected");
-  console.log("✅ tables ready");
+  // quick indexes
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tickets_wa_id ON tickets(wa_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_tickets_dept ON tickets(dept);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_messages_ticket_id ON messages(ticket_id);`);
 }
 
-async function upsertCustomer(wa_id) {
-  await pool.query(
-    `INSERT INTO customers(wa_id) VALUES($1)
-     ON CONFLICT (wa_id) DO NOTHING`,
-    [wa_id]
-  );
+function nowIso() {
+  return new Date().toISOString();
 }
 
-async function setCustomerMeta(wa_id, patchObj) {
-  await pool.query(
-    `UPDATE customers
-     SET meta = COALESCE(meta,'{}'::jsonb) || $2::jsonb
-     WHERE wa_id = $1`,
-    [wa_id, JSON.stringify(patchObj)]
-  );
+function esc(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
-async function getCustomerMeta(wa_id) {
-  const r = await pool.query(`SELECT meta FROM customers WHERE wa_id=$1`, [wa_id]);
-  return (r.rows[0] && r.rows[0].meta) ? r.rows[0].meta : {};
+// ------------------------ Auth / Users ------------------------
+function parseUiUsers() {
+  // UI_USERS=presales:111111,aftersales:222222
+  const raw = (process.env.UI_USERS || "").trim();
+  const map = {};
+  if (!raw) return null;
+  raw.split(",").map(x => x.trim()).filter(Boolean).forEach(pair => {
+    const idx = pair.indexOf(":");
+    if (idx > 0) {
+      const u = pair.slice(0, idx).trim();
+      const p = pair.slice(idx + 1).trim();
+      if (u && p) map[u] = p;
+    }
+  });
+  return Object.keys(map).length ? map : null;
 }
 
-function classifyDepartment(text) {
+const UI_USERS_MAP = parseUiUsers();
+
+function getUserFromSession(req) {
+  if (req.session && req.session.user) return req.session.user;
+  return null;
+}
+
+function requireAuth(req, res, next) {
+  const u = getUserFromSession(req);
+  if (!u) return res.redirect("/login");
+  return next();
+}
+
+function userDept(username) {
+  if (!username) return null;
+  if (username === PRESALES_ASSIGNEE) return "presales";
+  if (username === AFTERSALES_ASSIGNEE) return "aftersales";
+  return null;
+}
+
+// ------------------------ SSE (Realtime UI) ------------------------
+const sseClients = new Set(); // { res, user }
+function sseSend(type, payload) {
+  const data = JSON.stringify({ type, payload, ts: nowIso() });
+  for (const c of sseClients) {
+    try {
+      c.res.write("event: " + type + "\n");
+      c.res.write("data: " + data + "\n\n");
+    } catch (_) {}
+  }
+}
+
+app.get("/sse", requireAuth, (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders?.();
+  const user = getUserFromSession(req);
+  const client = { res, user };
+  sseClients.add(client);
+  res.write("event: hello\n");
+  res.write("data: " + JSON.stringify({ ok: true, user, ts: nowIso() }) + "\n\n");
+  req.on("close", () => {
+    sseClients.delete(client);
+  });
+});
+
+// ------------------------ WhatsApp helpers ------------------------
+async function waSendText(toWaId, text) {
+  const url = "https://graph.facebook.com/v20.0/" + encodeURIComponent(PHONE_NUMBER_ID) + "/messages";
+  const body = {
+    messaging_product: "whatsapp",
+    to: String(toWaId),
+    type: "text",
+    text: { body: String(text) }
+  };
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + WA_TOKEN,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    console.error("❌ waSendText failed", resp.status, json);
+    throw new Error("waSendText failed: " + resp.status);
+  }
+  return json;
+}
+
+// Optional signature verify
+function verifyAppSecret(req, rawBody) {
+  const secret = process.env.APP_SECRET;
+  if (!secret) return true;
+  const sig = req.get("x-hub-signature-256");
+  if (!sig) return false;
+  const expected = "sha256=" + crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+}
+
+// ------------------------ Routing logic ------------------------
+const ROUTE_HINTS = {
+  presales: ["price", "quote", "cost", "wholesale", "dealer", "buy", "order", "discount", "lead"],
+  aftersales: ["support", "warranty", "broken", "issue", "problem", "return", "rma", "bms", "charge", "charging", "fault", "help"]
+};
+
+function keywordRoute(text) {
   const t = String(text || "").toLowerCase();
-  const hitPre = PRESALES_KEYWORDS.some(k => t.includes(k));
-  const hitAfter = AFTERSALES_KEYWORDS.some(k => t.includes(k));
-  if (hitPre && !hitAfter) return "presales";
-  if (hitAfter && !hitPre) return "aftersales";
-  if (hitAfter && hitPre) return "aftersales";
-  return "";
+  for (const w of ROUTE_HINTS.presales) if (t.includes(w)) return "presales";
+  for (const w of ROUTE_HINTS.aftersales) if (t.includes(w)) return "aftersales";
+  return "unknown";
 }
 
-function defaultAssigneeForDept(dept) {
-  if (dept === "presales") return PRESALES_ASSIGNEE;
-  if (dept === "aftersales") return AFTERSALES_ASSIGNEE;
-  return "";
+async function aiRoute(text) {
+  if (!openai) return "unknown";
+  const msg = String(text || "").slice(0, 1200);
+  const prompt =
+    "Classify the customer message for a battery company into one of:\n" +
+    "- presales (pricing, dealer, wholesale, buying, order)\n" +
+    "- aftersales (support, warranty, troubleshooting, defective, install)\n" +
+    "- unknown\n\n" +
+    "Return only one word: presales | aftersales | unknown\n\n" +
+    "Message:\n" + msg;
+
+  try {
+    const res = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0
+    });
+    const out = String(res.choices?.[0]?.message?.content || "").trim().toLowerCase();
+    if (out.includes("presales")) return "presales";
+    if (out.includes("aftersales")) return "aftersales";
+    return "unknown";
+  } catch (e) {
+    console.warn("⚠️ aiRoute failed; fallback to keyword/menu", e?.message || e);
+    return "unknown";
+  }
 }
 
-async function getOrCreateOpenTicket(wa_id, dept) {
-  const r = await pool.query(
-    `SELECT id, assigned_to FROM tickets
-     WHERE wa_id=$1 AND department=$2 AND status='open'
-     ORDER BY id DESC
-     LIMIT 1`,
-    [wa_id, dept]
-  );
-  if (r.rows.length) return r.rows[0];
-
-  const assignee = defaultAssigneeForDept(dept) || null;
-  const ins = await pool.query(
-    `INSERT INTO tickets(wa_id, department, assigned_to, status, created_at, updated_at)
-     VALUES($1,$2,$3,'open',NOW(),NOW())
-     RETURNING id, assigned_to`,
-    [wa_id, dept, assignee]
-  );
-  return ins.rows[0];
-}
-
-async function addMessage({ conversation_id, wa_id, direction, msg_type, text, caption, tags, wa_message_id, ticket_id }) {
+async function ensureCustomer(wa_id) {
   await pool.query(
-    `INSERT INTO messages(conversation_id, wa_id, direction, msg_type, text, caption, tags, wa_message_id, ticket_id, created_at)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())`,
+    "INSERT INTO customers(wa_id) VALUES($1) ON CONFLICT (wa_id) DO NOTHING",
+    [String(wa_id)]
+  );
+}
+
+async function createTicketIfNeeded(wa_id, dept, assignee) {
+  // If there is an open ticket for same wa_id+dept, reuse it.
+  const q = await pool.query(
+    "SELECT id FROM tickets WHERE wa_id=$1 AND dept=$2 AND status IN ('open','pending') ORDER BY id DESC LIMIT 1",
+    [String(wa_id), String(dept)]
+  );
+  if (q.rows.length) return q.rows[0].id;
+
+  const ins = await pool.query(
+    "INSERT INTO tickets(wa_id, dept, status, assignee, last_message_at, unread_count) VALUES($1,$2,'open',$3,NOW(),0) RETURNING id",
+    [String(wa_id), String(dept), assignee || null]
+  );
+  return ins.rows[0].id;
+}
+
+async function bumpTicketOnIncoming(ticket_id, text) {
+  await pool.query(
+    "UPDATE tickets SET last_message_at=NOW(), last_message=$2, unread_count=unread_count+1, updated_at=NOW() WHERE id=$1",
+    [ticket_id, String(text || "").slice(0, 600)]
+  );
+}
+
+async function bumpTicketOnOutgoing(ticket_id, text) {
+  await pool.query(
+    "UPDATE tickets SET last_message_at=NOW(), last_message=$2, updated_at=NOW() WHERE id=$1",
+    [ticket_id, String(text || "").slice(0, 600)]
+  );
+}
+
+async function insertMessage({ ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id }) {
+  await pool.query(
+    "INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
     [
-      conversation_id,
-      wa_id,
-      direction,
-      msg_type,
-      text || null,
-      caption || null,
-      JSON.stringify(tags || []),
-      wa_message_id || null,
-      ticket_id || null,
+      ticket_id,
+      String(wa_id),
+      String(direction),
+      String(msg_type || "text"),
+      text ?? null,
+      caption ?? null,
+      media_path ?? null,
+      thumb_path ?? null,
+      wa_message_id ?? null
     ]
   );
 }
 
-async function touchTicket(ticket_id, last_message, isIncoming) {
-  if (isIncoming) {
-    await pool.query(
-      `UPDATE tickets
-       SET last_message=$2, last_time=NOW(), updated_at=NOW(),
-           unread_count = COALESCE(unread_count,0) + 1
-       WHERE id=$1`,
-      [ticket_id, last_message || null]
-    );
-  } else {
-    await pool.query(
-      `UPDATE tickets
-       SET last_message=$2, last_time=NOW(), updated_at=NOW()
-       WHERE id=$1`,
-      [ticket_id, last_message || null]
-    );
-  }
-}
-
-async function markTicketRead(ticket_id) {
-  await pool.query(`UPDATE tickets SET unread_count=0, updated_at=NOW() WHERE id=$1`, [ticket_id]);
-}
-
-async function closeTicket(ticket_id) {
-  // If your tickets table doesn't have closed_at yet, ignore (no ALTER here).
-  await pool.query(`UPDATE tickets SET status='closed', updated_at=NOW() WHERE id=$1`, [ticket_id]);
-}
-
-async function assignTicket(ticket_id, assignee) {
-  await pool.query(`UPDATE tickets SET assigned_to=$2, updated_at=NOW() WHERE id=$1`, [ticket_id, assignee]);
-}
-
-// ------------------------ WhatsApp API ------------------------
-async function waSendText(toWaId, bodyText) {
-  const url = `https://graph.facebook.com/v19.0/${encodeURIComponent(PHONE_NUMBER_ID)}/messages`;
-  const payload = {
-    messaging_product: "whatsapp",
-    to: String(toWaId),
-    type: "text",
-    text: { body: String(bodyText) },
-  };
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${WA_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const data = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    const msg = `WA send failed: ${resp.status} ${JSON.stringify(data)}`;
-    throw new Error(msg);
-  }
-  return data;
-}
-
-function menuText() {
-  return [
-    "Hi! Please choose:",
-    "1) Pre-Sales (price/quote/dealer)",
-    "2) After-Sales (support/warranty/problem)",
-    "",
-    "Reply with 1 or 2.",
-  ].join("\n");
-}
-
-// ------------------------ Webhook ------------------------
+// ------------------------ Webhook (Verify + Receive) ------------------------
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
@@ -347,979 +400,732 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-app.post("/webhook", async (req, res) => {
-  res.sendStatus(200);
-
-  try {
-    const body = req.body || {};
-    const entry = body.entry && body.entry[0];
-    const changes = entry && entry.changes && entry.changes[0];
-    const value = changes && changes.value;
-    const messages = value && value.messages;
-
-    if (!messages || !messages.length) return;
-
-    const msg = messages[0];
-    const from = msg.from; // wa_id
-    const msgId = msg.id || null;
-    const text = (msg.text && msg.text.body) ? msg.text.body : "";
-    const msgType = msg.type || "text";
-
-    if (!from) return;
-
-    await upsertCustomer(from);
-
-    const meta = await getCustomerMeta(from);
-    const pending = meta && meta.pending_choice;
-
-    let dept = "";
-    const trimmed = String(text || "").trim();
-
-    if (pending) {
-      if (trimmed === "1") dept = "presales";
-      else if (trimmed === "2") dept = "aftersales";
-      await setCustomerMeta(from, { pending_choice: false });
-    }
-
-    if (!dept) dept = classifyDepartment(text);
-
-    if (!dept) {
-      await setCustomerMeta(from, { pending_choice: true });
-      try {
-        const data = await waSendText(from, menuText());
-        await addMessage({
-          conversation_id: from,
-          wa_id: from,
-          direction: "outgoing",
-          msg_type: "text",
-          text: menuText(),
-          caption: null,
-          tags: [],
-          wa_message_id: (data.messages && data.messages[0] && data.messages[0].id) ? data.messages[0].id : null,
-          ticket_id: null,
-        });
-      } catch (e) {
-        console.error("❌ WA menu send failed:", e.message || e);
+app.post(
+  "/webhook",
+  express.raw({ type: "*/*" }),
+  async (req, res) => {
+    const rawBody = req.body;
+    try {
+      if (!verifyAppSecret(req, rawBody)) {
+        return res.status(403).send("bad signature");
       }
-      return;
+
+      const body = JSON.parse(rawBody.toString("utf8"));
+
+      const entry = body.entry?.[0];
+      const change = entry?.changes?.[0];
+      const value = change?.value;
+      const messages = value?.messages || [];
+      if (!messages.length) return res.json({ ok: true });
+
+      for (const m of messages) {
+        const wa_id = m.from;
+        const wa_message_id = m.id;
+        const type = m.type;
+
+        let text = "";
+        if (type === "text") text = m.text?.body || "";
+        else if (type === "button") text = m.button?.text || "";
+        else if (type === "interactive") {
+          // e.g. list reply
+          text = m.interactive?.button_reply?.title || m.interactive?.list_reply?.title || "";
+        } else {
+          text = "[non-text message]";
+        }
+
+        await ensureCustomer(wa_id);
+
+        // Dept selection logic:
+        // 1) If message is "1" or "2" -> explicit dept.
+        // 2) Else if existing open/pending ticket exists in either dept, reuse the most recently updated ticket
+        //    (but STRICT isolation still applies to agents in UI).
+        // 3) Else try AI routing; if unknown -> ask menu.
+        let dept = null;
+
+        const trimmed = String(text || "").trim();
+        if (trimmed === "1" || /^sales$/i.test(trimmed) || /^presales$/i.test(trimmed) || /^price$/i.test(trimmed)) {
+          dept = "presales";
+        } else if (trimmed === "2" || /^support$/i.test(trimmed) || /^aftersales$/i.test(trimmed)) {
+          dept = "aftersales";
+        } else {
+          // check latest open ticket
+          const latest = await pool.query(
+            "SELECT id, dept FROM tickets WHERE wa_id=$1 AND status IN ('open','pending') ORDER BY updated_at DESC LIMIT 1",
+            [String(wa_id)]
+          );
+          if (latest.rows.length) {
+            dept = latest.rows[0].dept;
+          } else {
+            // route
+            let r = keywordRoute(text);
+            if (r === "unknown") r = await aiRoute(text);
+            if (r === "unknown") {
+              await waSendText(
+                wa_id,
+                "Hi! To connect you faster, please choose:\n1️⃣ Sales (price/quote)\n2️⃣ Support (warranty/issue)"
+              );
+              continue;
+            }
+            dept = r;
+          }
+        }
+
+        const assignee = dept === "presales" ? PRESALES_ASSIGNEE : AFTERSALES_ASSIGNEE;
+        const ticket_id = await createTicketIfNeeded(wa_id, dept, assignee);
+
+        await insertMessage({
+          ticket_id,
+          wa_id,
+          direction: "incoming",
+          msg_type: "text",
+          text,
+          wa_message_id
+        });
+
+        await bumpTicketOnIncoming(ticket_id, text);
+
+        sseSend("message", { wa_id, ticket_id, dept, direction: "incoming", text });
+        sseSend("tickets", { changed: true });
+        sseSend("customers", { changed: true });
+      }
+
+      return res.json({ ok: true });
+
+    } catch (e) {
+      console.error("❌ webhook error:", e);
+      return res.status(200).json({ ok: true });
     }
-
-    const ticket = await getOrCreateOpenTicket(from, dept);
-
-    await addMessage({
-      conversation_id: from,
-      wa_id: from,
-      direction: "incoming",
-      msg_type: msgType,
-      text: text || null,
-      caption: null,
-      tags: [],
-      wa_message_id: msgId,
-      ticket_id: ticket.id,
-    });
-
-    await touchTicket(ticket.id, text, true);
-
-    sseBroadcast("ticket_update", { wa_id: from, ticket_id: ticket.id, ts: nowISO() });
-  } catch (e) {
-    console.error("❌ webhook handler error:", e);
   }
-});
+);
 
-// ------------------------ UI auth ------------------------
-app.use(session({
-  secret: SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: { maxAge: 14 * 24 * 3600 * 1000 },
-}));
+// ------------------------ UI: Login/Logout ------------------------
+function renderLogin(errMsg) {
+  const hint = errMsg ? "<div class='err'>" + esc(errMsg) + "</div>" : "";
+  return (
+    "<!doctype html><html><head><meta charset='utf-8'/>" +
+    "<meta name='viewport' content='width=device-width, initial-scale=1'/>" +
+    "<title>Voltgo Support Login</title>" +
+    "<style>" +
+    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#0b1220;color:#e6edf3;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;}" +
+    ".card{background:#111b2e;border:1px solid #203052;border-radius:16px;padding:28px;width:360px;box-shadow:0 10px 30px rgba(0,0,0,.35)}" +
+    "h1{margin:0 0 10px 0;font-size:20px}" +
+    "p{margin:0 0 16px 0;color:#9fb0c7;font-size:13px}" +
+    "input{width:100%;padding:10px 12px;border-radius:10px;border:1px solid #2a3b61;background:#0b1220;color:#e6edf3;margin:8px 0;}" +
+    "button{width:100%;padding:10px 12px;border-radius:10px;border:0;background:#2563eb;color:#fff;font-weight:700;cursor:pointer;margin-top:10px}" +
+    ".err{background:#3b1d1d;border:1px solid #7f1d1d;color:#fecaca;padding:10px 12px;border-radius:10px;margin:10px 0}" +
+    "</style></head><body><div class='card'>" +
+    "<h1>Voltgo Support System</h1>" +
+    "<p>Login to continue</p>" +
+    hint +
+    "<form method='POST' action='/login'>" +
+    "<input name='username' placeholder='Username' autocomplete='username'/>" +
+    "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
+    "<button type='submit'>Login</button>" +
+    "</form>" +
+    "<p style='margin-top:14px;color:#7f93ad'>Version: V4.5 • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "</div></body></html>"
+  );
+}
 
 app.get("/login", (req, res) => {
-  const html = `
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <title>Voltgo Support System - Login</title>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:40px;background:#f6f7fb;}
-    .card{max-width:420px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:20px;box-shadow:0 10px 22px rgba(0,0,0,0.06);}
-    h1{font-size:20px;margin:0 0 10px;}
-    label{display:block;margin-top:12px;font-size:13px;color:#374151;}
-    input{width:100%;padding:10px;border-radius:10px;border:1px solid #d1d5db;margin-top:6px;font-size:14px;}
-    button{margin-top:16px;width:100%;padding:10px;border-radius:10px;border:0;background:#2563eb;color:#fff;font-weight:600;cursor:pointer;}
-    .hint{margin-top:10px;font-size:12px;color:#6b7280;}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Voltgo Support System</h1>
-    <form method="POST" action="/login">
-      <label>Username</label>
-      <input name="username" autocomplete="username" />
-      <label>Password</label>
-      <input name="password" type="password" autocomplete="current-password" />
-      <button type="submit">Login</button>
-    </form>
-    <div class="hint">V4.2 Tickets • ${esc(STRICT_AGENT_VIEW ? "Strict View ON" : "Strict View OFF")}</div>
-  </div>
-</body>
-</html>`;
-  res.status(200).send(html);
+  res.status(200).send(renderLogin());
 });
 
 app.post("/login", (req, res) => {
   const u = String(req.body.username || "").trim();
   const p = String(req.body.password || "").trim();
-  if (!u || !p) return res.redirect("/login");
-  const okPass = UI_USERS.get(u);
-  if (okPass && okPass === p) {
-    req.session.user = u;
-    return res.redirect("/ui");
+
+  let ok = false;
+  if (UI_USERS_MAP) {
+    ok = UI_USERS_MAP[u] && UI_USERS_MAP[u] === p;
+  } else {
+    ok = u === UI_USER_FALLBACK && p === UI_PASS_FALLBACK;
   }
-  return res.redirect("/login");
+
+  if (!ok) return res.status(401).send(renderLogin("Invalid username or password"));
+
+  req.session.user = u;
+  req.session.save(() => res.redirect("/ui"));
 });
 
 app.get("/logout", (req, res) => {
-  try { req.session.destroy(() => res.redirect("/login")); }
-  catch { res.redirect("/login"); }
+  req.session.destroy(() => res.redirect("/login"));
 });
 
-// ------------------------ SSE ------------------------
-app.get("/events", requireAuth, (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.flushHeaders?.();
+// ------------------------ API: Customers/Tickets/Messages ------------------------
+function applyIsolationFilter(req, baseWhere, params) {
+  const u = getUserFromSession(req);
+  const dept = userDept(u);
 
-  res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, ts: nowISO() })}\n\n`);
-  sseClients.add(res);
-  req.on("close", () => { sseClients.delete(res); });
-});
+  if (!STRICT_AGENT_VIEW) return { where: baseWhere, params };
 
-// ------------------------ API ------------------------
-app.get("/api/me", requireAuth, (req, res) => {
-  res.json({ user: req.session.user, admin: isAdminUser(req.session.user), strict: STRICT_AGENT_VIEW });
-});
+  if (dept === "presales" || dept === "aftersales") {
+    const clause = (baseWhere ? (baseWhere + " AND ") : "") + "t.dept = $" + (params.length + 1);
+    return { where: clause, params: params.concat([dept]) };
+  }
+  // Unknown user => no dept => show nothing
+  const clause = (baseWhere ? (baseWhere + " AND ") : "") + "1=0";
+  return { where: clause, params };
+}
 
-app.get("/api/tickets", requireAuth, async (req, res) => {
+// Customers list (aggregated across tickets)
+app.get("/api/customers", requireAuth, async (req, res) => {
   try {
-    const user = req.session.user;
-
     const q = String(req.query.q || "").trim();
-    const dept = String(req.query.dept || "").trim();
-    const status = String(req.query.status || "").trim();
-    const assigneeQ = String(req.query.assignee || "").trim();
-    const unreadOnly = String(req.query.unread || "").trim() === "1";
+    const unreadOnly = String(req.query.unread || "0") === "1";
 
-    let sql = `SELECT id, wa_id, department, assigned_to, status, created_at, updated_at, last_message, last_time, unread_count
-               FROM tickets
-               WHERE 1=1`;
-    const params = [];
-    let i = 1;
-
-    if (dept) { sql += ` AND department = $${i++}`; params.push(dept); }
-    if (status) { sql += ` AND status = $${i++}`; params.push(status); }
-    if (assigneeQ) { sql += ` AND assigned_to = $${i++}`; params.push(assigneeQ); }
-    if (unreadOnly) { sql += ` AND COALESCE(unread_count,0) > 0`; }
+    let where = "";
+    let params = [];
 
     if (q) {
-      sql += ` AND (wa_id ILIKE $${i++} OR COALESCE(last_message,'') ILIKE $${i++})`;
-      params.push(`%${q}%`, `%${q}%`);
+      params.push("%" + q + "%");
+      where = "(c.wa_id ILIKE $" + params.length + " OR COALESCE(c.name,'') ILIKE $" + params.length + " OR COALESCE(c.notes,'') ILIKE $" + params.length + " OR COALESCE(t.last_message,'') ILIKE $" + params.length + ")";
+    }
+    if (unreadOnly) {
+      where = (where ? where + " AND " : "") + "t.unread_count > 0";
     }
 
-    if (STRICT_AGENT_VIEW && !isAdminUser(user)) {
-      sql += ` AND (COALESCE(NULLIF(assigned_to,''), '') = '' OR assigned_to = $${i++})`;
-      params.push(user);
-    }
+    // Isolation via tickets alias t
+    const iso = applyIsolationFilter(req, where, params);
+    where = iso.where;
+    params = iso.params;
 
-    sql += ` ORDER BY COALESCE(last_time, created_at) DESC LIMIT 200`;
+    const sql =
+      "SELECT c.wa_id, COALESCE(c.name,'') AS name, COALESCE(c.notes,'') AS notes," +
+      "       COUNT(DISTINCT t.id) AS tickets," +
+      "       SUM(CASE WHEN t.status='open' THEN 1 ELSE 0 END) AS open_tickets," +
+      "       MAX(t.last_message_at) AS last_time," +
+      "       MAX(t.last_message) AS last_message," +
+      "       SUM(COALESCE(t.unread_count,0)) AS unread" +
+      "  FROM customers c" +
+      "  LEFT JOIN tickets t ON t.wa_id=c.wa_id" +
+      (where ? " WHERE " + where : "") +
+      " GROUP BY c.wa_id, c.name, c.notes" +
+      " ORDER BY COALESCE(MAX(t.last_message_at), c.updated_at) DESC NULLS LAST" +
+      " LIMIT 500";
 
     const r = await pool.query(sql, params);
-    res.json({ ok: true, data: r.rows });
+    res.json({ ok: true, rows: r.rows });
   } catch (e) {
-    console.error("❌ /api/tickets error:", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    console.error("❌ /api/customers error:", e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-app.get("/api/tickets/:id/messages", requireAuth, async (req, res) => {
+// Customer profile
+app.get("/api/customer/:wa_id", requireAuth, async (req, res) => {
   try {
-    const user = req.session.user;
-    const id = parseInt(req.params.id, 10);
+    const wa_id = String(req.params.wa_id);
+    const c = await pool.query("SELECT wa_id, COALESCE(name,'') AS name, COALESCE(notes,'') AS notes FROM customers WHERE wa_id=$1", [wa_id]);
+    if (!c.rows.length) return res.status(404).json({ ok: false, error: "not found" });
+    res.json({ ok: true, customer: c.rows[0] });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
 
-    const t = await pool.query(`SELECT id, wa_id, assigned_to FROM tickets WHERE id=$1`, [id]);
-    if (!t.rows.length) return res.status(404).json({ ok: false, error: "not found" });
-    const ticket = t.rows[0];
+// Update name/notes
+app.post("/api/customer/:wa_id", requireAuth, async (req, res) => {
+  try {
+    const wa_id = String(req.params.wa_id);
+    const name = req.body.name != null ? String(req.body.name).slice(0, 120) : null;
+    const notes = req.body.notes != null ? String(req.body.notes).slice(0, 2000) : null;
 
-    if (STRICT_AGENT_VIEW && !isAdminUser(user)) {
-      const assignee = String(ticket.assigned_to || "");
-      if (assignee && assignee !== user) return res.status(403).json({ ok: false, error: "forbidden" });
+    await pool.query(
+      "UPDATE customers SET name=COALESCE($2,name), notes=COALESCE($3,notes), updated_at=NOW() WHERE wa_id=$1",
+      [wa_id, name, notes]
+    );
+    sseSend("customers", { changed: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("❌ update customer error:", e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Tickets list
+app.get("/api/tickets", requireAuth, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    const status = String(req.query.status || "").trim(); // open/pending/closed
+    const dept = String(req.query.dept || "").trim();     // presales/aftersales
+    const unreadOnly = String(req.query.unread || "0") === "1";
+
+    let where = "";
+    let params = [];
+
+    if (q) {
+      params.push("%" + q + "%");
+      where = "(t.wa_id ILIKE $" + params.length + " OR COALESCE(c.name,'') ILIKE $" + params.length + " OR COALESCE(t.last_message,'') ILIKE $" + params.length + ")";
+    }
+    if (status && (status === "open" || status === "pending" || status === "closed")) {
+      params.push(status);
+      where = (where ? where + " AND " : "") + "t.status = $" + params.length;
+    }
+    if (dept && (dept === "presales" || dept === "aftersales")) {
+      params.push(dept);
+      where = (where ? where + " AND " : "") + "t.dept = $" + params.length;
+    }
+    if (unreadOnly) {
+      where = (where ? where + " AND " : "") + "t.unread_count > 0";
     }
 
-    const r = await pool.query(
-      `SELECT id, conversation_id, wa_id, direction, msg_type, text, caption, tags, wa_message_id, created_at
-       FROM messages
-       WHERE ticket_id = $1
-       ORDER BY id ASC
-       LIMIT 500`,
-      [id]
-    );
-    await markTicketRead(id);
-    res.json({ ok: true, ticket, messages: r.rows });
+    const iso = applyIsolationFilter(req, where, params);
+    where = iso.where;
+    params = iso.params;
+
+    const sql =
+      "SELECT t.id, t.wa_id, t.dept, t.status, COALESCE(t.assignee,'') AS assignee," +
+      "       COALESCE(c.name,'') AS name, t.last_message_at, COALESCE(t.last_message,'') AS last_message," +
+      "       COALESCE(t.unread_count,0) AS unread_count" +
+      "  FROM tickets t" +
+      "  JOIN customers c ON c.wa_id=t.wa_id" +
+      (where ? " WHERE " + where : "") +
+      " ORDER BY COALESCE(t.last_message_at, t.updated_at) DESC NULLS LAST" +
+      " LIMIT 500";
+
+    const r = await pool.query(sql, params);
+    res.json({ ok: true, rows: r.rows });
   } catch (e) {
-    console.error("❌ /api/ticket/messages error:", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    console.error("❌ /api/tickets error:", e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-app.post("/api/tickets/:id/reply", requireAuth, async (req, res) => {
+// Ticket messages
+app.get("/api/ticket/:id/messages", requireAuth, async (req, res) => {
   try {
-    const user = req.session.user;
-    const id = parseInt(req.params.id, 10);
+    const id = Number(req.params.id);
+    // isolation: ensure ticket visible to user
+    const base = "t.id=$1";
+    const iso = applyIsolationFilter(req, base, [id]);
+    const check = await pool.query(
+      "SELECT t.id FROM tickets t WHERE " + iso.where + " LIMIT 1",
+      iso.params
+    );
+    if (!check.rows.length) return res.status(404).json({ ok: false, error: "ticket not found" });
+
+    const r = await pool.query(
+      "SELECT id, direction, msg_type, COALESCE(text,'') AS text, COALESCE(caption,'') AS caption, media_path, thumb_path, created_at FROM messages WHERE ticket_id=$1 ORDER BY id ASC LIMIT 2000",
+      [id]
+    );
+
+    // mark read
+    await pool.query("UPDATE tickets SET unread_count=0 WHERE id=$1", [id]);
+    sseSend("tickets", { changed: true });
+
+    res.json({ ok: true, rows: r.rows });
+  } catch (e) {
+    console.error("❌ /api/ticket/:id/messages error:", e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// Send message from UI
+app.post("/api/ticket/:id/send", requireAuth, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
     const text = String(req.body.text || "").trim();
     if (!text) return res.status(400).json({ ok: false, error: "empty" });
 
-    const t = await pool.query(`SELECT id, wa_id, assigned_to FROM tickets WHERE id=$1`, [id]);
-    if (!t.rows.length) return res.status(404).json({ ok: false, error: "not found" });
-    const ticket = t.rows[0];
+    // isolation check + get wa_id
+    const base = "t.id=$1";
+    const iso = applyIsolationFilter(req, base, [id]);
+    const t = await pool.query(
+      "SELECT t.id, t.wa_id, t.dept FROM tickets t WHERE " + iso.where + " LIMIT 1",
+      iso.params
+    );
+    if (!t.rows.length) return res.status(404).json({ ok: false, error: "ticket not found" });
 
-    if (STRICT_AGENT_VIEW && !isAdminUser(user)) {
-      const assignee = String(ticket.assigned_to || "");
-      if (assignee && assignee !== user) return res.status(403).json({ ok: false, error: "forbidden" });
-    }
+    const wa_id = t.rows[0].wa_id;
 
-    const wa = ticket.wa_id;
-    const data = await waSendText(wa, text);
+    const waResp = await waSendText(wa_id, text);
+    const wa_message_id = waResp?.messages?.[0]?.id || null;
 
-    await addMessage({
-      conversation_id: wa,
-      wa_id: wa,
+    await insertMessage({
+      ticket_id: id,
+      wa_id,
       direction: "outgoing",
       msg_type: "text",
       text,
-      caption: null,
-      tags: [],
-      wa_message_id: (data.messages && data.messages[0] && data.messages[0].id) ? data.messages[0].id : null,
-      ticket_id: id,
+      wa_message_id
     });
-    await touchTicket(id, text, false);
 
-    sseBroadcast("ticket_update", { ticket_id: id, ts: nowISO() });
+    await bumpTicketOnOutgoing(id, text);
+
+    sseSend("message", { wa_id, ticket_id: id, direction: "outgoing", text });
+    sseSend("tickets", { changed: true });
+    sseSend("customers", { changed: true });
+
     res.json({ ok: true });
   } catch (e) {
-    console.error("❌ /api/tickets/:id/reply error:", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    console.error("❌ send error:", e);
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-app.post("/api/tickets/:id/close", requireAuth, async (req, res) => {
+// Change ticket status
+app.post("/api/ticket/:id/status", requireAuth, async (req, res) => {
   try {
-    const user = req.session.user;
-    const id = parseInt(req.params.id, 10);
-
-    const t = await pool.query(`SELECT id, assigned_to FROM tickets WHERE id=$1`, [id]);
-    if (!t.rows.length) return res.status(404).json({ ok: false, error: "not found" });
-    const ticket = t.rows[0];
-
-    if (STRICT_AGENT_VIEW && !isAdminUser(user)) {
-      const assignee = String(ticket.assigned_to || "");
-      if (assignee && assignee !== user) return res.status(403).json({ ok: false, error: "forbidden" });
+    const id = Number(req.params.id);
+    const status = String(req.body.status || "").trim();
+    if (!["open", "pending", "closed"].includes(status)) {
+      return res.status(400).json({ ok: false, error: "bad status" });
     }
-
-    await closeTicket(id);
-    sseBroadcast("ticket_update", { ticket_id: id, ts: nowISO() });
-    res.json({ ok: true });
+    const base = "t.id=$1";
+    const iso = applyIsolationFilter(req, base, [id]);
+    const upd = await pool.query(
+      "UPDATE tickets t SET status=$2, updated_at=NOW() WHERE " + iso.where,
+      iso.params.concat([status])
+    );
+    sseSend("tickets", { changed: true });
+    res.json({ ok: true, updated: upd.rowCount });
   } catch (e) {
-    console.error("❌ close ticket error:", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-app.post("/api/tickets/:id/assign", requireAuth, async (req, res) => {
-  try {
-    const user = req.session.user;
-    const id = parseInt(req.params.id, 10);
-    const assignee = String(req.body.assignee || "").trim();
-
-    if (STRICT_AGENT_VIEW && !isAdminUser(user)) {
-      if (assignee && assignee !== user) return res.status(403).json({ ok: false, error: "forbidden" });
-    }
-
-    await assignTicket(id, assignee || null);
-    sseBroadcast("ticket_update", { ticket_id: id, ts: nowISO() });
-    res.json({ ok: true });
-  } catch (e) {
-    console.error("❌ assign ticket error:", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// ------------------------ UI pages ------------------------
-function uiLayout(title, user, bodyHtml, extraHead) {
-  const topRight = `
-    <div style="display:flex;gap:10px;align-items:center;justify-content:flex-end;">
-      <span style="font-size:13px;color:#6b7280;">${esc(user)}${isAdminUser(user) ? " (admin)" : ""}</span>
-      <a href="/logout" style="text-decoration:none;">
-        <button class="btn">Logout</button>
-      </a>
-    </div>
-  `;
-  return `
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>${esc(title)}</title>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#f6f7fb;color:#0f172a;}
-    .wrap{max-width:1200px;margin:0 auto;padding:28px;}
-    .row{display:flex;gap:14px;align-items:center;flex-wrap:wrap;}
-    .h1{font-size:28px;font-weight:800;letter-spacing:-0.02em;margin:0;}
-    .sub{color:#6b7280;font-size:13px;margin-top:4px;}
-    .card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 10px 22px rgba(0,0,0,0.06);}
-    .pad{padding:16px;}
-    .btn{padding:10px 14px;border-radius:999px;border:1px solid #e5e7eb;background:#fff;cursor:pointer;font-weight:600;}
-    .btn.primary{background:#2563eb;border-color:#2563eb;color:#fff;}
-    .btn.danger{background:#ef4444;border-color:#ef4444;color:#fff;}
-    .inp,.sel{padding:10px 12px;border-radius:999px;border:1px solid #e5e7eb;background:#fff;font-size:14px;}
-    table{width:100%;border-collapse:separate;border-spacing:0;}
-    th,td{padding:12px 10px;border-bottom:1px solid #eef2f7;vertical-align:top;}
-    th{font-size:12px;color:#64748b;letter-spacing:.02em;text-align:left;}
-    td{font-size:14px;}
-    .pill{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;border:1px solid #e5e7eb;background:#f8fafc;font-size:12px;color:#0f172a;}
-    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;}
-    .muted{color:#64748b;}
-    .link{color:#2563eb;text-decoration:none;font-weight:700;}
-    .badge{display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;padding:0 8px;border-radius:999px;background:#eef2ff;color:#3730a3;font-weight:800;font-size:12px;}
-    .split{display:flex;gap:16px;flex-wrap:wrap;}
-    .left{flex:1;min-width:320px;}
-    .right{flex:1;min-width:320px;}
-    textarea{width:100%;min-height:90px;border-radius:14px;border:1px solid #e5e7eb;padding:12px;font-size:14px;}
-    .msg{padding:10px 12px;border-radius:14px;border:1px solid #e5e7eb;margin:8px 0;background:#fff;}
-    .msg.in{background:#f1f5f9;}
-    .msg .meta{display:flex;gap:10px;font-size:12px;color:#64748b;margin-bottom:6px;}
-  </style>
-  ${extraHead || ""}
-</head>
-<body>
-  <div class="wrap">
-    <div class="row" style="justify-content:space-between;">
-      <div>
-        <div class="h1">${esc(title)}</div>
-        <div class="sub">DB-backed • Version: ${esc(VERSION_MARKER)} • ${esc(title)} • ${esc(STRICT_AGENT_VIEW ? "Strict Isolation ON" : "Strict Isolation OFF")}</div>
-      </div>
-      ${topRight}
-    </div>
-    <div class="row" style="margin-top:12px;">
-      <a href="/ui" style="text-decoration:none;"><button class="btn ${title==="Tickets" ? "primary" : ""}">Tickets</button></a>
-      <a href="/ui/customers" style="text-decoration:none;"><button class="btn ${title==="Customers" ? "primary" : ""}">Customers</button></a>
-    </div>
-    <div style="height:14px;"></div>
-    ${bodyHtml}
-  </div>
-</body>
-</html>`;
+// ------------------------ UI HTML ------------------------
+function layout(title, user, bodyHtml, extraHead) {
+  const head = extraHead || "";
+  return (
+    "<!doctype html><html><head><meta charset='utf-8'/>" +
+    "<meta name='viewport' content='width=device-width, initial-scale=1'/>" +
+    "<title>" + esc(title) + "</title>" +
+    "<style>" +
+    "body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;background:#f6f8fb;color:#0b1220;margin:0}" +
+    ".top{display:flex;align-items:center;justify-content:space-between;padding:22px 28px}" +
+    ".brand{font-size:38px;font-weight:900;letter-spacing:-.8px}" +
+    ".sub{color:#6b7a90;font-size:14px;margin-top:4px}" +
+    ".right{display:flex;align-items:center;gap:12px;color:#6b7a90}" +
+    ".pill{background:#fff;border:1px solid #e3e8f2;border-radius:999px;padding:10px 14px;font-weight:700;color:#0b1220;cursor:pointer}" +
+    ".pill.primary{background:#2563eb;border-color:#2563eb;color:#fff}" +
+    ".pill.ghost{background:#fff}" +
+    ".wrap{padding:0 28px 28px 28px}" +
+    ".panel{background:#fff;border:1px solid #e3e8f2;border-radius:18px;box-shadow:0 10px 30px rgba(11,18,32,.06)}" +
+    ".toolbar{display:flex;flex-wrap:wrap;gap:10px;padding:14px 14px;border-bottom:1px solid #eef2f8}" +
+    "input,select{height:44px;border-radius:999px;border:1px solid #e3e8f2;padding:0 14px;background:#fff;outline:none;font-size:14px}" +
+    "input{min-width:280px}" +
+    "table{width:100%;border-collapse:separate;border-spacing:0}" +
+    "th,td{padding:14px 16px;border-bottom:1px solid #eef2f8;font-size:14px;vertical-align:middle}" +
+    "th{color:#6b7a90;font-weight:800;text-transform:none;letter-spacing:.2px}" +
+    "tr:hover td{background:#fbfcfe}" +
+    "a{color:#2563eb;text-decoration:none;font-weight:800}" +
+    ".badge{display:inline-flex;align-items:center;gap:8px;border:1px solid #e3e8f2;border-radius:999px;padding:8px 12px;background:#fff;color:#0b1220;font-weight:800}" +
+    ".badge.green{border-color:#bbf7d0;background:#f0fdf4;color:#166534}" +
+    ".badge.gray{border-color:#e5e7eb;background:#f9fafb;color:#374151}" +
+    ".muted{color:#6b7a90}" +
+    ".tabs{display:flex;gap:12px;margin:8px 0 16px 0}" +
+    ".tab{padding:10px 16px;border-radius:999px;border:1px solid #e3e8f2;background:#fff;font-weight:900;cursor:pointer}" +
+    ".tab.active{background:#2563eb;color:#fff;border-color:#2563eb}" +
+    ".grid{display:grid;grid-template-columns: 1.1fr .9fr;gap:16px}" +
+    ".card{background:#fff;border:1px solid #e3e8f2;border-radius:18px;box-shadow:0 10px 30px rgba(11,18,32,.06)}" +
+    ".card .hd{padding:14px 16px;border-bottom:1px solid #eef2f8;font-weight:900}" +
+    ".card .bd{padding:14px 16px}" +
+    "textarea{width:100%;min-height:110px;border-radius:14px;border:1px solid #e3e8f2;padding:10px 12px;font-size:14px;outline:none;resize:vertical}" +
+    ".msgs{max-height:520px;overflow:auto;padding:14px 16px}" +
+    ".msg{margin:10px 0;display:flex}" +
+    ".bubble{max-width:78%;padding:10px 12px;border-radius:14px;border:1px solid #e3e8f2;background:#fff}" +
+    ".msg.in .bubble{background:#f9fafb}" +
+    ".msg.out{justify-content:flex-end}" +
+    ".msg.out .bubble{background:#eef2ff;border-color:#c7d2fe}" +
+    ".msg .meta{font-size:12px;color:#6b7a90;margin-top:6px}" +
+    ".sendRow{display:flex;gap:10px;align-items:center;padding:14px 16px;border-top:1px solid #eef2f8}" +
+    ".sendRow input{flex:1;min-width:0}" +
+    ".small{font-size:12px;color:#6b7a90}" +
+    "</style>" +
+    head +
+    "</head><body>" +
+    "<div class='top'>" +
+    "<div><div class='brand'>" + esc(title) + "</div>" +
+    "<div class='sub'>DB-backed • Version: V4_5_STABLE_2026-03-04 • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</div></div>" +
+    "<div class='right'><span class='muted'>" + esc(user || "") + "</span>" +
+    "<a class='pill ghost' href='/logout'>Logout</a></div></div>" +
+    "<div class='wrap'>" + bodyHtml + "</div>" +
+    "</body></html>"
+  );
 }
 
-app.get("/ui", requireAuth, async (req, res) => {
-  const user = req.session.user;
-  const html = `
-<div class="card pad">
-  <div class="row">
-    <input id="q" class="inp" placeholder="Search wa_id / last message" style="flex:1;min-width:240px;" />
-    <select id="dept" class="sel">
-      <option value="">All depts</option>
-      <option value="presales">Pre-Sales</option>
-      <option value="aftersales">After-Sales</option>
-    </select>
-    <select id="status" class="sel">
-      <option value="">All status</option>
-      <option value="open">open</option>
-      <option value="closed">closed</option>
-    </select>
-    <select id="assignee" class="sel">
-      <option value="">All assignees</option>
-      <option value="${esc(PRESALES_ASSIGNEE)}">${esc(PRESALES_ASSIGNEE)}</option>
-      <option value="${esc(AFTERSALES_ASSIGNEE)}">${esc(AFTERSALES_ASSIGNEE)}</option>
-      <option value="${esc(user)}">Mine</option>
-      <option value="__unassigned__">Unassigned</option>
-    </select>
-    <label class="pill"><input id="unread" type="checkbox" style="margin-right:8px;" />Unread only</label>
-    <button class="btn primary" onclick="applyFilters()">Apply</button>
-    <button class="btn" onclick="clearFilters()">Clear</button>
-  </div>
-</div>
+function uiIndexPage(user) {
+  const body =
+    "<div class='tabs'>" +
+    "<button class='tab active' id='tabCustomers'>Customers</button>" +
+    "<button class='tab' id='tabTickets'>Tickets</button>" +
+    "</div>" +
+    "<div class='panel' id='panelCustomers'>" +
+    "<div class='toolbar'>" +
+    "<input id='qCustomers' placeholder='Search wa_id / name / notes / last message'/>" +
+    "<label class='badge gray'><input type='checkbox' id='unreadCustomers' style='margin-right:8px'/>Unread only</label>" +
+    "<button class='pill primary' id='applyCustomers'>Apply</button>" +
+    "<button class='pill' id='clearCustomers'>Clear</button>" +
+    "</div>" +
+    "<div style='overflow:auto'>" +
+    "<table><thead><tr>" +
+    "<th style='width:190px'>wa_id</th><th style='width:220px'>Name</th><th style='width:90px'>Open</th><th style='width:90px'>Tickets</th><th style='width:200px'>Last time</th><th>Last message</th>" +
+    "</tr></thead><tbody id='customersTbody'>" +
+    "<tr><td colspan='6' class='muted'>Loading...</td></tr>" +
+    "</tbody></table>" +
+    "</div></div>" +
 
-<div style="height:14px;"></div>
+    "<div class='panel' id='panelTickets' style='display:none'>" +
+    "<div class='toolbar'>" +
+    "<input id='qTickets' placeholder='Search wa_id / name / last message'/>" +
+    "<select id='deptTickets'><option value=''>All depts</option><option value='presales'>presales</option><option value='aftersales'>aftersales</option></select>" +
+    "<select id='statusTickets'><option value=''>All status</option><option value='open'>open</option><option value='pending'>pending</option><option value='closed'>closed</option></select>" +
+    "<label class='badge gray'><input type='checkbox' id='unreadTickets' style='margin-right:8px'/>Unread only</label>" +
+    "<button class='pill primary' id='applyTickets'>Apply</button>" +
+    "<button class='pill' id='clearTickets'>Clear</button>" +
+    "</div>" +
+    "<div style='overflow:auto'>" +
+    "<table><thead><tr>" +
+    "<th style='width:90px'>Ticket</th><th style='width:180px'>wa_id</th><th style='width:140px'>Name</th><th style='width:110px'>Dept</th><th style='width:110px'>Status</th><th style='width:110px'>Unread</th><th style='width:200px'>Last time</th><th>Last message</th>" +
+    "</tr></thead><tbody id='ticketsTbody'>" +
+    "<tr><td colspan='8' class='muted'>Loading...</td></tr>" +
+    "</tbody></table>" +
+    "</div></div>" +
 
-<div class="card">
-  <div class="pad">
-    <table>
-      <thead>
-        <tr>
-          <th>Ticket</th>
-          <th>wa_id</th>
-          <th>Dept</th>
-          <th>Status</th>
-          <th>Assignee</th>
-          <th>Last time</th>
-          <th>Last message</th>
-        </tr>
-      </thead>
-      <tbody id="tbody">
-        <tr><td colspan="7" class="muted">Loading…</td></tr>
-      </tbody>
-    </table>
-  </div>
-</div>
+    "<script>" +
+    "const $=s=>document.querySelector(s);" +
+    "function fmt(ts){ if(!ts) return ''; try{return new Date(ts).toLocaleString();}catch(e){return ts;} }" +
 
-<script>
-  function qs(k){ return new URLSearchParams(location.search).get(k) || ""; }
-  function setEl(id, v){ const el=document.getElementById(id); if(!el) return; if(el.type==="checkbox"){ el.checked = (v==="1"); } else { el.value=v; } }
+    "function setTab(name){ " +
+      "if(name==='customers'){ $('#tabCustomers').classList.add('active'); $('#tabTickets').classList.remove('active'); $('#panelCustomers').style.display='block'; $('#panelTickets').style.display='none'; }" +
+      "else{ $('#tabTickets').classList.add('active'); $('#tabCustomers').classList.remove('active'); $('#panelTickets').style.display='block'; $('#panelCustomers').style.display='none'; }" +
+    "}" +
+    "$('#tabCustomers').onclick=()=>setTab('customers');" +
+    "$('#tabTickets').onclick=()=>setTab('tickets');" +
 
-  setEl("q", qs("q"));
-  setEl("dept", qs("dept"));
-  setEl("status", qs("status"));
-  setEl("assignee", qs("assignee"));
-  setEl("unread", qs("unread"));
+    "async function loadCustomers(){ " +
+      "const q=encodeURIComponent($('#qCustomers').value||'');" +
+      "const unread=$('#unreadCustomers').checked?'1':'0';" +
+      "const r=await fetch('/api/customers?q='+q+'&unread='+unread);" +
+      "const j=await r.json();" +
+      "const tb=$('#customersTbody');" +
+      "tb.innerHTML='';" +
+      "if(!j.ok){ tb.innerHTML='<tr><td colspan=6 class=muted>Error</td></tr>'; return; }" +
+      "if(!j.rows.length){ tb.innerHTML='<tr><td colspan=6 class=muted>No customers</td></tr>'; return; }" +
+      "for(const c of j.rows){ " +
+        "const name = c.name ? c.name : ('Customer ' + c.wa_id);" +
+        "const open = Number(c.open_tickets||0);" +
+        "const tickets = Number(c.tickets||0);" +
+        "const last = fmt(c.last_time);" +
+        "const msg = (c.last_message||'');" +
+        "tb.insertAdjacentHTML('beforeend', " +
+          "`<tr>`+" +
+          "`<td><a href='/ui/customer/${encodeURIComponent(c.wa_id)}'>${c.wa_id}</a></td>`+" +
+          "`<td>${name}</td>`+" +
+          "`<td><span class='badge ${open>0?'green':'gray'}'>${open}</span></td>`+" +
+          "`<td><span class='badge gray'>${tickets}</span></td>`+" +
+          "`<td>${last}</td>`+" +
+          "`<td>${msg}</td>`+" +
+          "`</tr>`" +
+        ");" +
+      "}" +
+    "}" +
 
-  function applyFilters(){
-    const q = document.getElementById("q").value.trim();
-    const dept = document.getElementById("dept").value;
-    const status = document.getElementById("status").value;
-    let assignee = document.getElementById("assignee").value;
-    const unread = document.getElementById("unread").checked ? "1" : "";
-    const p = new URLSearchParams();
-    if(q) p.set("q", q);
-    if(dept) p.set("dept", dept);
-    if(status) p.set("status", status);
-    if(assignee === "__unassigned__") { p.set("assignee", ""); p.set("only_unassigned","1"); }
-    else if(assignee) p.set("assignee", assignee);
-    if(unread) p.set("unread", unread);
-    location.search = p.toString();
+    "async function loadTickets(){ " +
+      "const q=encodeURIComponent($('#qTickets').value||'');" +
+      "const dept=encodeURIComponent($('#deptTickets').value||'');" +
+      "const status=encodeURIComponent($('#statusTickets').value||'');" +
+      "const unread=$('#unreadTickets').checked?'1':'0';" +
+      "const r=await fetch('/api/tickets?q='+q+'&dept='+dept+'&status='+status+'&unread='+unread);" +
+      "const j=await r.json();" +
+      "const tb=$('#ticketsTbody');" +
+      "tb.innerHTML='';" +
+      "if(!j.ok){ tb.innerHTML='<tr><td colspan=8 class=muted>Error</td></tr>'; return; }" +
+      "if(!j.rows.length){ tb.innerHTML='<tr><td colspan=8 class=muted>No tickets yet</td></tr>'; return; }" +
+      "for(const t of j.rows){ " +
+        "const name = t.name ? t.name : ('Customer ' + t.wa_id);" +
+        "const last = fmt(t.last_message_at);" +
+        "const msg = (t.last_message||'');" +
+        "tb.insertAdjacentHTML('beforeend', " +
+          "`<tr>`+" +
+          "`<td><a href='/ui/ticket/${t.id}'>#${t.id}</a></td>`+" +
+          "`<td><a href='/ui/customer/${encodeURIComponent(t.wa_id)}'>${t.wa_id}</a></td>`+" +
+          "`<td>${name}</td>`+" +
+          "`<td><span class='badge gray'>${t.dept}</span></td>`+" +
+          "`<td><span class='badge ${t.status==='open'?'green':'gray'}'>${t.status}</span></td>`+" +
+          "`<td><span class='badge gray'>${t.unread_count}</span></td>`+" +
+          "`<td>${last}</td>`+" +
+          "`<td>${msg}</td>`+" +
+          "`</tr>`" +
+        ");" +
+      "}" +
+    "}" +
+
+    "$('#applyCustomers').onclick=loadCustomers;" +
+    "$('#clearCustomers').onclick=()=>{ $('#qCustomers').value=''; $('#unreadCustomers').checked=false; loadCustomers(); };" +
+    "$('#applyTickets').onclick=loadTickets;" +
+    "$('#clearTickets').onclick=()=>{ $('#qTickets').value=''; $('#deptTickets').value=''; $('#statusTickets').value=''; $('#unreadTickets').checked=false; loadTickets(); };" +
+
+    "loadCustomers(); loadTickets();" +
+
+    "const es=new EventSource('/sse');" +
+    "es.addEventListener('customers', ()=>{ if($('#panelCustomers').style.display!=='none') loadCustomers(); });" +
+    "es.addEventListener('tickets', ()=>{ if($('#panelTickets').style.display!=='none') loadTickets(); });" +
+    "</script>";
+
+  return layout("Customers", user, body, "");
+}
+
+function uiCustomerPage(user, wa_id) {
+  const body =
+    "<div class='tabs'>" +
+    "<a class='tab' href='/ui'>Back</a>" +
+    "<a class='tab active' href='/ui/customer/" + esc(wa_id) + "'>Customer</a>" +
+    "</div>" +
+    "<div class='grid'>" +
+      "<div class='card'>" +
+        "<div class='hd'>Customer Profile</div>" +
+        "<div class='bd'>" +
+          "<div class='small'>wa_id</div><div style='font-weight:900;margin-bottom:10px'>" + esc(wa_id) + "</div>" +
+          "<div class='small'>Name</div><input id='name' placeholder='e.g. John / Dealer_CA' style='width:100%;min-width:0'/>" +
+          "<div style='height:10px'></div>" +
+          "<div class='small'>Notes</div><textarea id='notes' placeholder='VIP / issue history / preferences'></textarea>" +
+          "<div style='display:flex;gap:10px;margin-top:12px'>" +
+            "<button class='pill primary' id='save'>Save</button>" +
+            "<a class='pill' href='/ui'>Back</a>" +
+          "</div>" +
+          "<div id='msg' class='small' style='margin-top:10px'></div>" +
+        "</div>" +
+      "</div>" +
+      "<div class='card'>" +
+        "<div class='hd'>Tickets</div>" +
+        "<div class='bd'><div id='tickets' class='muted'>Loading...</div></div>" +
+      "</div>" +
+    "</div>" +
+    "<script>" +
+    "const $=s=>document.querySelector(s);" +
+    "async function load(){ " +
+      "let r=await fetch('/api/customer/" + encodeURIComponent(wa_id) + "'); let j=await r.json();" +
+      "if(j.ok){ $('#name').value=j.customer.name||''; $('#notes').value=j.customer.notes||''; }" +
+      "r=await fetch('/api/tickets?q=' + encodeURIComponent('" + wa_id + "')); j=await r.json();" +
+      "if(j.ok){ " +
+        "const rows=j.rows.filter(x=>x.wa_id==='" + wa_id + "');" +
+        "if(!rows.length){ $('#tickets').innerHTML='No tickets yet'; return; }" +
+        "let html='<table><thead><tr><th>Ticket</th><th>Dept</th><th>Status</th><th>Unread</th><th>Last</th></tr></thead><tbody>';"+
+        "for(const t of rows){ html+=`<tr><td><a href="/ui/ticket/${t.id}">#${t.id}</a></td><td>${t.dept}</td><td>${t.status}</td><td>${t.unread_count}</td><td>${new Date(t.last_message_at||Date.now()).toLocaleString()}</td></tr>`; }"+
+        "html+='</tbody></table>'; $('#tickets').innerHTML=html;" +
+      "} }" +
+    "}" +
+    "$('#save').onclick=async()=>{ " +
+      "const body={name:$('#name').value, notes:$('#notes').value};" +
+      "const r=await fetch('/api/customer/" + encodeURIComponent(wa_id) + "',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});" +
+      "const j=await r.json(); $('#msg').textContent = j.ok ? 'Saved' : ('Error: '+(j.error||''));" +
+    "};" +
+    "load();" +
+    "</script>";
+
+  return layout("Customer", user, body, "");
+}
+
+function uiTicketPage(user, ticketId) {
+  const body =
+    "<div class='tabs'>" +
+    "<a class='tab' href='/ui'>Back</a>" +
+    "<a class='tab active' href='/ui/ticket/" + esc(ticketId) + "'>Ticket #" + esc(ticketId) + "</a>" +
+    "</div>" +
+    "<div class='grid'>" +
+      "<div class='card'>" +
+        "<div class='hd'>Messages</div>" +
+        "<div class='msgs' id='msgs'><div class='muted'>Loading...</div></div>" +
+        "<div class='sendRow'>" +
+          "<input id='text' placeholder='Type a reply...'/>" +
+          "<button class='pill primary' id='send'>Send</button>" +
+        "</div>" +
+      "</div>" +
+      "<div class='card'>" +
+        "<div class='hd'>Actions</div>" +
+        "<div class='bd'>" +
+          "<div class='small'>Status</div>" +
+          "<div style='display:flex;gap:10px;flex-wrap:wrap;margin:10px 0'>" +
+            "<button class='pill' data-status='open'>Open</button>" +
+            "<button class='pill' data-status='pending'>Pending</button>" +
+            "<button class='pill' data-status='closed'>Closed</button>" +
+          "</div>" +
+          "<div id='info' class='small'></div>" +
+          "<div style='height:8px'></div>" +
+          "<div class='small'>Tip: Incoming messages auto-push via realtime stream.</div>" +
+        "</div>" +
+      "</div>" +
+    "</div>" +
+    "<script>" +
+    "const $=s=>document.querySelector(s);" +
+    "const ticketId=" + JSON.stringify(Number(ticketId)) + ";" +
+    "function escHtml(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}" +
+    "function render(rows){ const el=$('#msgs'); el.innerHTML=''; if(!rows.length){ el.innerHTML='<div class=muted>No messages</div>'; return; }" +
+      "for(const m of rows){ const dir=m.direction==='outgoing'?'out':'in'; const txt=escHtml(m.text||m.caption||''); const ts=new Date(m.created_at).toLocaleString();" +
+        "el.insertAdjacentHTML('beforeend', `<div class=" + '"msg ${dir}"' + "><div class=" + '"bubble"' + "><div>${txt}</div><div class=" + '"meta"' + ">${ts}</div></div></div>`);" +
+      "}" +
+      "el.scrollTop=el.scrollHeight;" +
+    "}" +
+    "async function load(){ const r=await fetch('/api/ticket/'+ticketId+'/messages'); const j=await r.json(); if(j.ok){ render(j.rows); } else { $('#msgs').innerHTML='<div class=muted>Error loading</div>'; } }" +
+    "$('#send').onclick=async()=>{ const text=$('#text').value.trim(); if(!text) return; $('#text').value=''; const r=await fetch('/api/ticket/'+ticketId+'/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})}); const j=await r.json(); if(!j.ok){ $('#info').textContent='Send failed: '+(j.error||''); } else { $('#info').textContent='Sent'; } setTimeout(()=>$('#info').textContent='',1200); load(); };" +
+    "document.querySelectorAll('[data-status]').forEach(btn=>{ btn.onclick=async()=>{ const st=btn.getAttribute('data-status'); const r=await fetch('/api/ticket/'+ticketId+'/status',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:st})}); const j=await r.json(); $('#info').textContent=j.ok?'Updated':'Error'; setTimeout(()=>$('#info').textContent='',1200); }; });" +
+    "load();" +
+    "const es=new EventSource('/sse'); es.addEventListener('message', (ev)=>{ try{ const j=JSON.parse(ev.data).payload; if(j.ticket_id===ticketId){ load(); } }catch(e){} });" +
+    "</script>";
+
+  return layout("Ticket", user, body, "");
+}
+
+// UI routes
+app.get("/ui", requireAuth, (req, res) => {
+  try {
+    const user = getUserFromSession(req);
+    res.status(200).send(uiIndexPage(user));
+  } catch (e) {
+    console.error("❌ /ui error:", e);
+    res.status(500).send("UI error");
   }
-  function clearFilters(){ location.search=""; }
-
-  async function load(){
-    const p = new URLSearchParams(location.search);
-    let url = "/api/tickets";
-    if(p.toString()) url += "?" + p.toString();
-    const r = await fetch(url);
-    const j = await r.json();
-    const tbody = document.getElementById("tbody");
-    if(!j.ok){
-      tbody.innerHTML = '<tr><td colspan="7" class="muted">Error: '+(j.error||'')+'</td></tr>';
-      return;
-    }
-    const rows = j.data || [];
-    if(!rows.length){
-      tbody.innerHTML = '<tr><td colspan="7" class="muted">No tickets yet. Send a WhatsApp message to create a ticket.</td></tr>';
-      return;
-    }
-    tbody.innerHTML = rows.map(t=>{
-      const badge = (t.unread_count && t.unread_count>0) ? '<span class="badge">'+t.unread_count+'</span>' : '';
-      const ass = t.assigned_to ? '<span class="pill">'+escapeHtml(t.assigned_to)+'</span>' : '<span class="pill">unassigned</span>';
-      const lastTime = t.last_time ? new Date(t.last_time).toLocaleString() : '';
-      return '<tr>'
-        + '<td class="mono"><a class="link" href="/ui/ticket/'+t.id+'">#'+t.id+'</a> '+badge+'</td>'
-        + '<td class="mono">'+escapeHtml(t.wa_id)+'</td>'
-        + '<td><span class="pill">'+escapeHtml(t.department)+'</span></td>'
-        + '<td><span class="pill">'+escapeHtml(t.status)+'</span></td>'
-        + '<td>'+ass+'</td>'
-        + '<td>'+escapeHtml(lastTime)+'</td>'
-        + '<td>'+escapeHtml((t.last_message||'').slice(0,120))+'</td>'
-        + '</tr>';
-    }).join("");
-  }
-
-  function escapeHtml(s){
-    return String(s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;");
-  }
-
-  load();
-
-  const es = new EventSource("/events");
-  es.addEventListener("ticket_update", (ev) => { load(); });
-</script>
-`;
-  res.status(200).send(uiLayout("Tickets", user, html));
 });
 
-app.get("/ui/ticket/:id", requireAuth, async (req, res) => {
-  const user = req.session.user;
-  const id = parseInt(req.params.id, 10);
-
-  const t = await pool.query(`SELECT * FROM tickets WHERE id=$1`, [id]);
-  if (!t.rows.length) return res.status(404).send("Not found");
-  const ticket = t.rows[0];
-
-  if (STRICT_AGENT_VIEW && !isAdminUser(user)) {
-    const assignee = String(ticket.assigned_to || "");
-    if (assignee && assignee !== user) return res.status(403).send("Forbidden");
-  }
-
-  const body = `
-<div class="split">
-  <div class="left">
-    <div class="card pad">
-      <div class="row" style="justify-content:space-between;">
-        <div>
-          <div style="font-size:18px;font-weight:800;">Ticket #${esc(ticket.id)} <span class="pill">${esc(ticket.department)}</span></div>
-          <div class="sub">wa_id: <span class="mono">${esc(ticket.wa_id)}</span></div>
-        </div>
-        <div class="row">
-          <span class="pill">Status: ${esc(ticket.status)}</span>
-          <span class="pill">Assignee: ${esc(ticket.assigned_to || "unassigned")}</span>
-        </div>
-      </div>
-
-      <div style="height:10px;"></div>
-
-      <div class="row">
-        <button class="btn" onclick="selfAssign()">Take</button>
-        <button class="btn danger" onclick="closeTicket()">Close</button>
-        <a href="/ui" class="link" style="margin-left:auto;">← Back</a>
-      </div>
-    </div>
-
-    <div style="height:14px;"></div>
-
-    <div class="card pad">
-      <div id="msgs" class="muted">Loading…</div>
-    </div>
-  </div>
-
-  <div class="right">
-    <div class="card pad">
-      <div style="font-weight:800;margin-bottom:8px;">Reply</div>
-      <textarea id="reply" placeholder="Type message to WhatsApp…"></textarea>
-      <div style="height:10px;"></div>
-      <div class="row">
-        <button class="btn primary" onclick="sendReply()">Send</button>
-        <span class="muted" id="hint"></span>
-      </div>
-    </div>
-  </div>
-</div>
-
-<script>
-  const ticketId = ${JSON.stringify(ticket.id)};
-  const me = ${JSON.stringify({ user, admin: isAdminUser(user), strict: STRICT_AGENT_VIEW })};
-
-  function escapeHtml(s){
-    return String(s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;");
-  }
-
-  async function load(){
-    const r = await fetch("/api/tickets/"+ticketId+"/messages");
-    const j = await r.json();
-    const box = document.getElementById("msgs");
-    if(!j.ok){
-      box.innerHTML = '<div class="muted">Error: '+escapeHtml(j.error||'')+'</div>';
-      return;
-    }
-    const msgs = j.messages || [];
-    if(!msgs.length){
-      box.innerHTML = '<div class="muted">No messages yet.</div>';
-      return;
-    }
-    box.innerHTML = msgs.map(m=>{
-      const cls = m.direction === "incoming" ? "msg in" : "msg";
-      const ts = m.created_at ? new Date(m.created_at).toLocaleString() : "";
-      return '<div class="'+cls+'">'
-        + '<div class="meta"><span class="pill">'+escapeHtml(m.direction)+'</span><span>'+escapeHtml(ts)+'</span></div>'
-        + '<div>'+escapeHtml(m.text || "")+'</div>'
-        + '</div>';
-    }).join("");
-  }
-
-  async function sendReply(){
-    const txt = document.getElementById("reply").value.trim();
-    if(!txt) return;
-    document.getElementById("hint").textContent = "Sending…";
-    const r = await fetch("/api/tickets/"+ticketId+"/reply", {
-      method:"POST",
-      headers:{ "Content-Type":"application/x-www-form-urlencoded" },
-      body: "text="+encodeURIComponent(txt)
-    });
-    const j = await r.json();
-    if(!j.ok){
-      document.getElementById("hint").textContent = "Error: " + (j.error||"");
-      return;
-    }
-    document.getElementById("reply").value = "";
-    document.getElementById("hint").textContent = "Sent";
-    load();
-  }
-
-  async function closeTicket(){
-    if(!confirm("Close this ticket?")) return;
-    const r = await fetch("/api/tickets/"+ticketId+"/close", { method:"POST" });
-    const j = await r.json();
-    if(!j.ok) alert("Error: "+(j.error||""));
-    else location.href="/ui";
-  }
-
-  async function selfAssign(){
-    const r = await fetch("/api/tickets/"+ticketId+"/assign", {
-      method:"POST",
-      headers:{ "Content-Type":"application/x-www-form-urlencoded" },
-      body: "assignee="+encodeURIComponent(me.user)
-    });
-    const j = await r.json();
-    if(!j.ok) alert("Error: "+(j.error||""));
-    else location.reload();
-  }
-
-  load();
-  const es = new EventSource("/events");
-  es.addEventListener("ticket_update", (ev)=>{ load(); });
-</script>
-`;
-  res.status(200).send(uiLayout("Ticket Detail", user, body));
+app.get("/ui/customer/:wa_id", requireAuth, (req, res) => {
+  const user = getUserFromSession(req);
+  res.status(200).send(uiCustomerPage(user, String(req.params.wa_id)));
 });
 
-// ------------------------ root ------------------------
-app.get("/", (req, res) => {
-  res.redirect("/ui");
+app.get("/ui/ticket/:id", requireAuth, (req, res) => {
+  const user = getUserFromSession(req);
+  res.status(200).send(uiTicketPage(user, String(req.params.id)));
 });
 
-// ------------------------ start ------------------------
+// ------------------------ Health ------------------------
+app.get("/", (req, res) => res.redirect("/ui"));
+app.get("/health", async (req, res) => {
+  try { await dbPing(); res.json({ ok: true }); } catch (e) { res.status(500).json({ ok: false }); }
+});
+
+// ------------------------ Boot ------------------------
 (async () => {
   try {
     await dbPing();
-    await dbInit();
-
-    console.log("=================================");
-    console.log("🚀 Server running");
-    console.log("NODE VERSION:", process.version);
-    console.log("PORT:", PORT);
-    console.log("VERIFY_TOKEN SET:", !!process.env.VERIFY_TOKEN);
-    console.log("UI_USERS SET:", !!process.env.UI_USERS || (!!UI_USER_SINGLE && !!UI_PASS_SINGLE));
-    console.log("SESSION_SECRET SET:", !!process.env.SESSION_SECRET);
-    console.log("WA_TOKEN SET:", !!process.env.WA_TOKEN);
-    console.log("PHONE_NUMBER_ID SET:", !!process.env.PHONE_NUMBER_ID);
-    console.log("DATABASE_URL SET:", !!process.env.DATABASE_URL);
-    console.log("STRICT_AGENT_VIEW:", STRICT_AGENT_VIEW);
-    console.log("MEDIA DIR:", MEDIA_DIR);
-    console.log("THUMBS DIR:", THUMBS_DIR);
-    console.log("UPLOADS DIR:", UPLOADS_DIR);
-    console.log("VERSION MARKER:", "V4_2_STABLE_2026-03-04");
-    console.log("SHARP ENABLED:", !!sharp);
-    console.log("=================================");
-
-    app.listen(PORT, () => {
-      console.log("✅ Server running on port", PORT);
-    });
+    console.log("✅ DB connected");
+    await ensureTables();
+    console.log("✅ tables ready");
   } catch (e) {
     console.error("❌ DB init failed:", e);
-    app.listen(PORT, () => console.log("⚠️ Server running WITHOUT DB on port", PORT));
   }
+
+  console.log("=================================");
+  console.log("🚀 Server running");
+  console.log("NODE VERSION:", process.version);
+  console.log("PORT:", PORT);
+  console.log("VERIFY_TOKEN SET:", !!process.env.VERIFY_TOKEN ? "YES" : "NO");
+  console.log("APP_SECRET SET:", !!process.env.APP_SECRET ? "YES" : "NO");
+  console.log("UI_USERS SET:", !!process.env.UI_USERS ? "YES" : "NO");
+  console.log("UI_USER SET:", !!process.env.UI_USER ? "YES" : "NO");
+  console.log("UI_PASS SET:", !!process.env.UI_PASS ? "YES" : "NO");
+  console.log("SESSION_SECRET SET:", !!process.env.SESSION_SECRET ? "YES" : "NO");
+  console.log("OPENAI_API_KEY SET:", !!process.env.OPENAI_API_KEY ? "YES" : "NO");
+  console.log("WA_TOKEN SET:", !!process.env.WA_TOKEN ? "YES" : "NO");
+  console.log("PHONE_NUMBER_ID SET:", !!process.env.PHONE_NUMBER_ID ? "YES" : "NO");
+  console.log("DATABASE_URL SET:", !!process.env.DATABASE_URL ? "true" : "false");
+  console.log("MEDIA DIR:", MEDIA_DIR);
+  console.log("UPLOADS DIR:", UPLOADS_DIR);
+  console.log("VERSION MARKER: V4_5_STABLE_2026-03-04");
+  console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
+  console.log("=================================");
+
+  app.listen(PORT, () => console.log("✅ Server running on port " + PORT));
 })();
-// ------------------------ Customers aggregate API ------------------------
-app.get("/api/customers", requireAuth, async (req, res) => {
-  try {
-    const user = req.session.user;
-
-    const q = String(req.query.q || "").trim();
-    const dept = String(req.query.dept || "").trim();
-    const status = String(req.query.status || "").trim();
-    const assigneeQ = String(req.query.assignee || "").trim();
-    const unreadOnly = String(req.query.unread || "").trim() === "1";
-
-    // Build a filtered tickets CTE, then aggregate by wa_id
-    let where = "WHERE 1=1";
-    const params = [];
-    let i = 1;
-
-    if (dept) { where += ` AND department = $${i++}`; params.push(dept); }
-    if (status) { where += ` AND status = $${i++}`; params.push(status); }
-    if (assigneeQ) { where += ` AND assigned_to = $${i++}`; params.push(assigneeQ); }
-    if (unreadOnly) { where += ` AND COALESCE(unread_count,0) > 0`; }
-
-    if (q) {
-      where += ` AND (wa_id ILIKE $${i++} OR COALESCE(last_message,'') ILIKE $${i++})`;
-      params.push(`%${q}%`, `%${q}%`);
-    }
-
-    if (STRICT_AGENT_VIEW && !isAdminUser(user)) {
-      where += ` AND (COALESCE(NULLIF(assigned_to,''), '') = '' OR assigned_to = $${i++})`;
-      params.push(user);
-    }
-
-    const sql = `
-      WITH ft AS (
-        SELECT id, wa_id, department, assigned_to, status, created_at, last_message, last_time, unread_count
-        FROM tickets
-        ${where}
-      ),
-      latest AS (
-        SELECT DISTINCT ON (wa_id)
-          wa_id,
-          department AS last_dept,
-          assigned_to AS last_assignee,
-          status AS last_status,
-          last_message,
-          last_time,
-          unread_count,
-          created_at
-        FROM ft
-        ORDER BY wa_id, COALESCE(last_time, created_at) DESC, id DESC
-      ),
-      agg AS (
-        SELECT
-          wa_id,
-          COUNT(*)::int AS ticket_count,
-          SUM(CASE WHEN status='open' THEN 1 ELSE 0 END)::int AS open_count,
-          SUM(COALESCE(unread_count,0))::int AS unread_total
-        FROM ft
-        GROUP BY wa_id
-      )
-      SELECT
-        a.wa_id,
-        a.ticket_count,
-        a.open_count,
-        a.unread_total,
-        l.last_dept,
-        l.last_assignee,
-        l.last_status,
-        l.last_time,
-        l.last_message
-      FROM agg a
-      JOIN latest l USING (wa_id)
-      ORDER BY COALESCE(l.last_time, l.created_at) DESC
-      LIMIT 500
-    `;
-
-    const r = await pool.query(sql, params);
-    res.json({ ok: true, data: r.rows });
-  } catch (e) {
-    console.error("❌ /customers api error:", e);
-    res.status(500).json({ ok: false, error: String(e.message || e) });
-  }
-});
-
-// ------------------------ Customers UI ------------------------
-app.get("/ui/customers", requireAuth, async (req, res) => {
-  const user = req.session.user;
-  const html = `
-<div class="card pad">
-  <div class="row">
-    <input id="q" class="inp" placeholder="Search wa_id / last message" style="flex:1;min-width:240px;" />
-    <select id="dept" class="sel">
-      <option value="">All depts</option>
-      <option value="presales">Pre-Sales</option>
-      <option value="aftersales">After-Sales</option>
-    </select>
-    <select id="status" class="sel">
-      <option value="">All status</option>
-      <option value="open">open</option>
-      <option value="closed">closed</option>
-    </select>
-    <select id="assignee" class="sel">
-      <option value="">All assignees</option>
-      <option value="${esc(PRESALES_ASSIGNEE)}">${esc(PRESALES_ASSIGNEE)}</option>
-      <option value="${esc(AFTERSALES_ASSIGNEE)}">${esc(AFTERSALES_ASSIGNEE)}</option>
-      <option value="${esc(user)}">Mine</option>
-      <option value="__unassigned__">Unassigned</option>
-    </select>
-    <label class="pill"><input id="unread" type="checkbox" style="margin-right:8px;" />Unread only</label>
-    <button class="btn primary" onclick="applyFilters()">Apply</button>
-    <button class="btn" onclick="clearFilters()">Clear</button>
-  </div>
-</div>
-
-<div style="height:14px;"></div>
-
-<div class="card">
-  <div class="pad">
-    <table>
-      <thead>
-        <tr>
-          <th>wa_id</th>
-          <th>Open</th>
-          <th>Tickets</th>
-          <th>Last dept</th>
-          <th>Last status</th>
-          <th>Last assignee</th>
-          <th>Last time</th>
-          <th>Last message</th>
-        </tr>
-      </thead>
-      <tbody id="rows">
-        <tr><td class="muted" colspan="8">Loading...</td></tr>
-      </tbody>
-    </table>
-  </div>
-</div>
-
-<script>
-  function qs(id){ return document.getElementById(id); }
-  function escapeHtml(s){ return String(s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'","&#39;"); }
-
-  function readFilters(){
-    const q = qs("q").value.trim();
-    const dept = qs("dept").value.trim();
-    const status = qs("status").value.trim();
-    const assignee = qs("assignee").value.trim();
-    const unread = qs("unread").checked ? "1" : "";
-    return { q, dept, status, assignee, unread };
-  }
-
-  function setFiltersFromUrl(){
-    const u = new URL(location.href);
-    qs("q").value = u.searchParams.get("q") || "";
-    qs("dept").value = u.searchParams.get("dept") || "";
-    qs("status").value = u.searchParams.get("status") || "";
-    qs("assignee").value = u.searchParams.get("assignee") || "";
-    qs("unread").checked = (u.searchParams.get("unread")||"") === "1";
-  }
-
-  function applyFilters(){
-    const f = readFilters();
-    const u = new URL(location.href);
-    Object.entries(f).forEach(([k,v]) => { if(v) u.searchParams.set(k,v); else u.searchParams.delete(k); });
-    history.replaceState({}, "", u.toString());
-    load();
-  }
-  function clearFilters(){
-    qs("q").value=""; qs("dept").value=""; qs("status").value=""; qs("assignee").value=""; qs("unread").checked=false;
-    const u = new URL(location.href);
-    ["q","dept","status","assignee","unread"].forEach(k=>u.searchParams.delete(k));
-    history.replaceState({}, "", u.toString());
-    load();
-  }
-
-  async function load(){
-    const f = readFilters();
-    const params = new URLSearchParams();
-    Object.entries(f).forEach(([k,v])=>{ if(v) params.set(k,v); });
-    const r = await fetch("/api/customers?"+params.toString(), { credentials: "include" });
-    const j = await r.json();
-    const rowsEl = qs("rows");
-    if(!j.ok){
-      rowsEl.innerHTML = '<tr><td class="muted" colspan="8">'+escapeHtml(j.error||"error")+'</td></tr>';
-      return;
-    }
-    const data = j.data || [];
-    if(!data.length){
-      rowsEl.innerHTML = '<tr><td class="muted" colspan="8">No customers yet.</td></tr>';
-      return;
-    }
-    rowsEl.innerHTML = data.map(c=>{
-      const lastTime = c.last_time ? new Date(c.last_time).toLocaleString() : "";
-      const wa = escapeHtml(c.wa_id);
-      return '<tr>'
-        + '<td class="mono"><a class="link" href="/ui/customer/'+encodeURIComponent(c.wa_id)+'">'+wa+'</a></td>'
-        + '<td><span class="badge">'+escapeHtml(c.open_count)+'</span></td>'
-        + '<td>'+escapeHtml(c.ticket_count)+'</td>'
-        + '<td><span class="pill">'+escapeHtml(c.last_dept||"")+'</span></td>'
-        + '<td><span class="pill">'+escapeHtml(c.last_status||"")+'</span></td>'
-        + '<td>'+(c.last_assignee?('<span class="pill">'+escapeHtml(c.last_assignee)+'</span>'):'<span class="pill">unassigned</span>')+'</td>'
-        + '<td>'+escapeHtml(lastTime)+'</td>'
-        + '<td>'+escapeHtml((c.last_message||"").slice(0,140))+'</td>'
-        + '</tr>';
-    }).join("");
-  }
-
-  setFiltersFromUrl();
-  load();
-
-  // realtime refresh via SSE (same stream as tickets)
-  const es = new EventSource("/events");
-  es.onmessage = (ev) => {
-    try{
-      const msg = JSON.parse(ev.data||"{}");
-      if(msg && (msg.type==="ticket_update" || msg.type==="message")){
-        load();
-      }
-    }catch{}
-  };
-</script>
-`;
-  res.status(200).send(uiLayout("Customers", user, html));
-});
-
-// Customer detail page: list tickets for one wa_id (filtered by strict view)
-app.get("/ui/customer/:wa", requireAuth, async (req, res) => {
-  try {
-    const user = req.session.user;
-    const wa = String(req.params.wa || "").trim();
-    if (!wa) return res.status(400).send("Bad wa_id");
-
-    let sql = `SELECT id, wa_id, department, assigned_to, status, created_at, last_message, last_time, unread_count
-               FROM tickets WHERE wa_id = $1`;
-    const params = [wa];
-    let i = 2;
-
-    if (STRICT_AGENT_VIEW && !isAdminUser(user)) {
-      sql += ` AND (COALESCE(NULLIF(assigned_to,''), '') = '' OR assigned_to = $${i++})`;
-      params.push(user);
-    }
-
-    sql += ` ORDER BY COALESCE(last_time, created_at) DESC, id DESC`;
-
-    const r = await pool.query(sql, params);
-
-    const rows = (r.rows || []).map(t => {
-      const badge = (t.unread_count || 0) > 0 ? `<span class="badge">${esc(t.unread_count)}</span>` : "";
-      const ass = t.assigned_to ? `<span class="pill">${esc(t.assigned_to)}</span>` : `<span class="pill">unassigned</span>`;
-      const lastTime = t.last_time ? new Date(t.last_time).toLocaleString() : "";
-      return `<tr>
-        <td class="mono"><a class="link" href="/ui/ticket/${t.id}">#${t.id}</a> ${badge}</td>
-        <td><span class="pill">${esc(t.department)}</span></td>
-        <td><span class="pill">${esc(t.status)}</span></td>
-        <td>${ass}</td>
-        <td>${esc(lastTime)}</td>
-        <td>${esc((t.last_message||"").slice(0,140))}</td>
-      </tr>`;
-    }).join("");
-
-    const html = `
-<div class="card pad">
-  <div class="row" style="justify-content:space-between;">
-    <div>
-      <div class="h1" style="font-size:20px;">Customer: <span class="mono">${esc(wa)}</span></div>
-      <div class="sub">Tickets for this customer</div>
-    </div>
-    <a href="/ui/customers" style="text-decoration:none;"><button class="btn">← Back</button></a>
-  </div>
-</div>
-
-<div style="height:14px;"></div>
-
-<div class="card">
-  <div class="pad">
-    <table>
-      <thead>
-        <tr>
-          <th>Ticket</th>
-          <th>Dept</th>
-          <th>Status</th>
-          <th>Assignee</th>
-          <th>Last time</th>
-          <th>Last message</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows || `<tr><td class="muted" colspan="6">No tickets visible for this customer.</td></tr>`}
-      </tbody>
-    </table>
-  </div>
-</div>
-
-<script>
-  // simple live refresh on events
-  const es = new EventSource("/events");
-  es.onmessage = () => { location.reload(); };
-</script>
-`;
-    res.status(200).send(uiLayout("Customers", user, html));
-  } catch (e) {
-    console.error("❌ /ui/customer error:", e);
-    res.status(500).send("Internal error");
-  }
-});
-
