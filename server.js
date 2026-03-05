@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.0.8_WEBHOOK_HOTFIX (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.0.9_WEBHOOK_HOTFIX (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -673,6 +673,22 @@ async function ensureTicketConversation(ticket_id, wa_id, dept) {
   await pool.query("UPDATE tickets SET conversation_id=$2 WHERE id=$1", [Number(ticket_id), Number(cid)]);
   return Number(cid);
 }
+
+async function markTicketNeedRoute(ticket_id) {
+  // Set status to pending and add a tag to indicate routing required (best-effort).
+  try {
+    const hasStatus = await columnExists("tickets","status").catch(()=>false);
+    const hasTags = await columnExists("tickets","tags").catch(()=>false);
+    if (hasStatus && hasTags) {
+      await pool.query(
+        "UPDATE tickets SET status='pending', tags = (CASE WHEN tags IS NULL THEN ARRAY['need_route']::text[] WHEN NOT ('need_route'=ANY(tags)) THEN array_append(tags,'need_route') ELSE tags END), updated_at=NOW() WHERE id=$1",
+        [Number(ticket_id)]
+      );
+    } else if (hasStatus) {
+      await pool.query("UPDATE tickets SET status='pending', updated_at=NOW() WHERE id=$1", [Number(ticket_id)]);
+    }
+  } catch (_) {}
+}
 async function bumpTicketOnIncoming(ticket_id, text) {
   await pool.query("UPDATE tickets SET last_message_at=NOW(), last_message=$2, unread_count=COALESCE(unread_count,0)+1, updated_at=NOW() WHERE id=$1", [ticket_id, String(text || "").slice(0, 600)]);
   // Mirror to conversations if bound
@@ -796,7 +812,7 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
   try {
     const ct = req.get("content-type") || "";
     const typ = rawBody === null ? "null" : Array.isArray(rawBody) ? "array" : Buffer.isBuffer(rawBody) ? "buffer" : typeof rawBody;
-    console.log("📩 WEBHOOK HIT V4.7.0.8", { ct, typ, len: Buffer.isBuffer(rawBody) ? rawBody.length : undefined, t: new Date().toISOString() });
+    console.log("📩 WEBHOOK HIT V4.7.0.9", { ct, typ, len: Buffer.isBuffer(rawBody) ? rawBody.length : undefined, t: new Date().toISOString() });
   } catch (_) {}
 
   try {
@@ -836,6 +852,7 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
       if (profileName) await setCustomerNameIfEmpty(wa_id, profileName);
 
       let dept = null;
+      let routeUnknown = false;
       let effectiveText = "";
       if (type === "text") effectiveText = m.text?.body || "";
       else if (type === "button") effectiveText = m.button?.text || "";
@@ -855,6 +872,7 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
         }
       }
 
+      if (!dept) routeUnknown = true;
       if (!dept && (type === "text" || type === "button" || type === "interactive")) {
         await waSendText(wa_id,
           "Hi! To connect you faster, please choose:\n1️⃣ Sales (price/quote)\n2️⃣ Support (warranty/issue)\n\n为更快处理，请回复：\n1）售前（报价/下单）\n2）售后（质保/故障）"
@@ -864,6 +882,19 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
       if (!dept) dept = "presales";
       const assignee = dept === "presales" ? PRESALES_ASSIGNEE : AFTERSALES_ASSIGNEE;
 
+      // If this message is a routing selection (1/2), try to update the latest pending 'need_route' ticket
+      try {
+        const isSelect = (trimmed === "1" || trimmed === "2" || /^sales$/i.test(trimmed) || /^presales$/i.test(trimmed) || /^support$/i.test(trimmed) || /^aftersales$/i.test(trimmed));
+        if (isSelect) {
+          const cand = await pool.query(
+            "SELECT id FROM tickets WHERE wa_id=$1 AND status='pending' ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1",
+            [String(wa_id)]
+          );
+          if (cand.rows.length) {
+            await pool.query("UPDATE tickets SET dept=$2, assignee=$3, status='open', updated_at=NOW() WHERE id=$1", [Number(cand.rows[0].id), dept, assignee]);
+          }
+        }
+      } catch (_) {}
       const ticket_id = await createTicketOrReopen(wa_id, dept, assignee);
       const conversation_id = await ensureTicketConversation(ticket_id, wa_id, dept).catch(()=>null);
 
@@ -884,6 +915,15 @@ app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
       if (!insertedId) continue;
 
       await bumpTicketOnIncoming(ticket_id, caption || text || `[${msg_type}]`);
+
+      if (routeUnknown) {
+        await markTicketNeedRoute(ticket_id);
+        try {
+          await waSendText(wa_id,
+            "Hi! To connect you faster, please choose:\n1️⃣ Sales (price/quote)\n2️⃣ Support (warranty/issue)\n\n为更快处理，请回复：\n1）售前（报价/下单）\n2）售后（质保/故障）"
+          );
+        } catch (_) {}
+      }
 
       sseSend("message", { wa_id, ticket_id, dept, direction:"incoming", msg_type });
       sseSend("tickets", { changed:true });
@@ -921,7 +961,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.8 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.0.9 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1209,7 +1249,7 @@ button.ghost:hover{background:#f1f5f9}
 </style></head>
 <body>
 <div class="top"><div><div class="brand">Voltgo Support System</div>
-<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.0.8</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
+<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.0.9</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
 <div class="meta">Strict Isolation: ${STRICT_AGENT_VIEW ? "ON" : "OFF"}</div></div>
 
 <div class="wrap">
@@ -1490,7 +1530,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.7.0.8",
+    version: "V4.7.0.9",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1501,7 +1541,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.7.0.8 " + new Date().toISOString());
+  res.send("pong V4.7.0.9 " + new Date().toISOString());
 });
 
 
@@ -1523,7 +1563,7 @@ app.get("/debug/ping", (req, res) => {
   console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.0.8.1");
+  console.log("VERSION MARKER: V4.7.0.9.1");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
