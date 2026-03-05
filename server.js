@@ -797,7 +797,7 @@ app.get("/__version", async (req, res) => {
   return res.json({
     ok: true,
     ts: new Date().toISOString(),
-    marker: "V4_1_2_STABLE_2026-03-04",
+    marker: "V4_1_3_STABLE_2026-03-04",
     node: process.version,
     db_ok: dbOk,
     sharp: !!sharp,
@@ -1150,7 +1150,7 @@ app.get("/customers", async (req, res) => {
         COALESCE(l.last_created_at, b.last_message_at) DESC NULLS LAST
       LIMIT 800
       `,
-      [status || "", ctag || ""]
+      [status || "", ctag || "", assigneeQ || ""]
     );
 
     let customers = r.rows.map((x) => ({
@@ -1386,7 +1386,7 @@ app.get("/ui", async (req, res) => {
     <div class="top">
       <div>
         <h2>Customers</h2>
-        <div class="muted">DB-backed • Version: V4_1_2_STABLE_2026-03-04</div>
+        <div class="muted">DB-backed • Version: V4_1_3_STABLE_2026-03-04</div>
       </div>
 
       <div class="topRight">
@@ -1955,7 +1955,7 @@ app.get("/ui/customer/:wa_id", async (req, res) => {
       </div>
     </div>
 
-    <div class="muted" style="margin-top:10px;">Version: V4_1_2_STABLE_2026-03-04</div>
+    <div class="muted" style="margin-top:10px;">Version: V4_1_3_STABLE_2026-03-04</div>
   </div>
 
   <script>
@@ -2396,7 +2396,7 @@ app.post("/send", upload.single("file"), async (req, res) => {
     console.log("MEDIA DIR:", mediaDir);
     console.log("THUMBS DIR:", thumbsDir);
     console.log("UPLOADS DIR:", uploadsDir);
-    console.log("VERSION MARKER: V4_1_2_STABLE_2026-03-04");
+    console.log("VERSION MARKER: V4_1_3_STABLE_2026-03-04");
     console.log("SHARP ENABLED:", !!sharp);
     console.log("=================================");
     console.log(`✅ Server running on port ${PORT}`);
