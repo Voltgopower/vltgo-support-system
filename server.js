@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.3.0_WEBHOOK_HOTFIX (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.3.2_FIXED (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -772,12 +772,28 @@ async function insertMessage({ ticket_id, wa_id, dept, direction, msg_type, text
   const wmid = (wa_message_id ?? null);
   let cid = (conversation_id ?? null);
 
-  // Choose target column set based on schema
-  const useConversation = await columnExists("messages", "conversation_id").catch(()=>false);
+  // Prefer ticket_id storage when available because current UI reads messages by ticket_id.
+  const hasTicketId = await columnExists("messages", "ticket_id").catch(()=>false);
+  const hasConversationId = await columnExists("messages", "conversation_id").catch(()=>false);
 
-  if (useConversation) {
-    // Some older schemas require conversation_id NOT NULL.
-    // If missing, create/find a conversation on the fly using (wa_id + dept).
+  if (hasTicketId && ticket_id) {
+    if (wmid && String(wmid).trim()) {
+      const r = await pool.query(
+        "INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (wa_message_id) DO NOTHING RETURNING id",
+        [Number(ticket_id), String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, String(wmid)]
+      );
+      return r.rows[0]?.id || null;
+    }
+    const r = await pool.query(
+      "INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
+      "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
+      [Number(ticket_id), String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, null]
+    );
+    return r.rows[0]?.id || null;
+  }
+
+  if (hasConversationId) {
     if (!cid) {
       cid = await getOrCreateConversation(wa_id, dept || "");
     }
@@ -799,21 +815,7 @@ async function insertMessage({ ticket_id, wa_id, dept, direction, msg_type, text
     return r.rows[0]?.id || null;
   }
 
-  // Newer schema with ticket_id
-  if (wmid && String(wmid).trim()) {
-    const r = await pool.query(
-      "INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
-      "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (wa_message_id) DO NOTHING RETURNING id",
-      [Number(ticket_id), String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, String(wmid)]
-    );
-    return r.rows[0]?.id || null;
-  }
-  const r = await pool.query(
-    "INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
-    "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
-    [Number(ticket_id), String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, null]
-  );
-  return r.rows[0]?.id || null;
+  throw new Error("messages schema unsupported: no ticket_id and no conversation_id");
 }
 
 // -------- webhook verify/receive --------
@@ -1016,7 +1018,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.3.0 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.3.2 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1112,9 +1114,10 @@ app.get("/api/messages", requireAuth, async (req, res) => {
 
     const hasTicketId = await columnExists("messages", "ticket_id").catch(()=>false);
     const hasConversationId = await columnExists("messages", "conversation_id").catch(()=>false);
+    const hasTicketConv = await columnExists("tickets","conversation_id").catch(()=>false);
 
-    // Helper normalize: always return both rows and messages for UI compatibility
-    const send = (mode, rows) => res.json({ ok: true, mode, rows, messages: rows });
+    let rows = [];
+    let mode = "unknown";
 
     if (hasTicketId) {
       const r = await pool.query(
@@ -1122,29 +1125,45 @@ app.get("/api/messages", requireAuth, async (req, res) => {
         "FROM messages WHERE ticket_id=$1 ORDER BY id ASC LIMIT 2500",
         [ticketId]
       );
-      return send("ticket_id", r.rows);
+      rows = r.rows;
+      mode = "ticket_id";
     }
 
     if (hasConversationId) {
-      const hasTicketConv = await columnExists("tickets","conversation_id").catch(()=>false);
       const t = await pool.query(
         "SELECT wa_id::text AS wa_id, " + (hasTicketConv ? "conversation_id::text AS conversation_id " : "NULL::text AS conversation_id ") +
         "FROM tickets WHERE id=$1 LIMIT 1",
         [ticketId]
       );
-      if (!t.rows.length) return send("conversation_id", []);
-      const wa_id = String(t.rows[0].wa_id || "");
-      const cid = t.rows[0].conversation_id ? String(t.rows[0].conversation_id) : wa_id;
+      if (t.rows.length) {
+        const wa_id = String(t.rows[0].wa_id || "");
+        const cid = t.rows[0].conversation_id ? String(t.rows[0].conversation_id) : wa_id;
 
-      const r = await pool.query(
-        "SELECT id::text AS id, wa_id::text AS wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id, created_at " +
-        "FROM messages WHERE conversation_id=$1 ORDER BY id ASC LIMIT 2500",
-        [cid]
-      );
-      return send("conversation_id", r.rows);
+        const r2 = await pool.query(
+          "SELECT id::text AS id, wa_id::text AS wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id, created_at " +
+          "FROM messages WHERE conversation_id=$1 ORDER BY id ASC LIMIT 2500",
+          [cid]
+        );
+
+        if (r2.rows.length) {
+          const seen = new Set(rows.map(x => String(x.wa_message_id || x.id)));
+          for (const item of r2.rows) {
+            const key = String(item.wa_message_id || item.id);
+            if (!seen.has(key)) {
+              rows.push(item);
+              seen.add(key);
+            }
+          }
+          rows.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
+          mode = mode === "ticket_id" ? "ticket_id+conversation_id" : "conversation_id";
+        }
+      }
     }
 
-    return send("unknown", []);
+    await pool.query("UPDATE tickets SET unread_count=0, updated_at=NOW() WHERE id=$1", [ticketId]).catch(()=>{});
+    sseSend("tickets", { changed: true });
+
+    return res.json({ ok: true, mode, rows, messages: rows });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
@@ -1295,7 +1314,7 @@ app.post("/api/ticket-notes/add", requireAuth, async (req, res) => {
 
 // -------- UI Dashboard --------
 
-app.get("/ui.js", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("application/javascript; charset=utf-8"); res.send('\n(() => {\n  const $ = (id) => document.getElementById(id);\n  const statusEl = $("status");\n  const listEl = $("ticketList");\n  const chatEl = $("chat");\n  const chatTitle = $("chatTitle");\n  const chatMeta = $("chatMeta");\n  const msgCount = $("msgCount");\n  const btnRefresh = $("refresh");\n  const inText = $("text");\n  const btnSend = $("send");\n\n  let tickets = [];\n  let active = null;\n\n  function setStatus(text, ok=true){\n    if(!statusEl) return;\n    statusEl.textContent = text;\n    statusEl.classList.remove("ok","err");\n    statusEl.classList.add(ok ? "ok" : "err");\n  }\n\n  async function api(url, opts){\n    const r = await fetch(url, Object.assign({ credentials:"same-origin" }, opts||{}));\n    const j = await r.json().catch(()=>({}));\n    if(!r.ok) throw new Error((j && (j.error||j.message)) || ("HTTP "+r.status));\n    return j;\n  }\n\n  function renderTickets(){\n    if(!listEl) return;\n    listEl.innerHTML = "";\n    if(!tickets.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No tickets.";\n      listEl.appendChild(d);\n      return;\n    }\n    tickets.forEach(t=>{\n      const row=document.createElement("div");\n      row.className="row" + (active && String(active.id)===String(t.id) ? " active" : "");\n      row.dataset.id=String(t.id);\n      const top=document.createElement("div");\n      top.style.display="flex";\n      top.style.justifyContent="space-between";\n      top.style.gap="8px";\n      top.innerHTML = "<div><b>#"+t.id+"</b> "+(t.wa_id||"")+"</div><div class=\'muted\'>"+(t.status||"")+"</div>";\n      const sub=document.createElement("div");\n      sub.className="muted";\n      sub.textContent = (t.last_message || "").toString().slice(0,90);\n      row.appendChild(top);\n      row.appendChild(sub);\n      row.onclick=()=>selectTicket(t);\n      listEl.appendChild(row);\n    });\n  }\n\n  function renderMessages(rows){\n    if(!chatEl) return;\n    chatEl.innerHTML="";\n    rows.forEach(m=>{\n      const wrap=document.createElement("div");\n      wrap.className="msg " + (m.direction==="outgoing" ? "outgoing" : "incoming");\n      const bubble=document.createElement("div");\n      bubble.className="bubble";\n      const txt = (m.text && String(m.text).trim()) ? m.text : (m.caption||"");\n      bubble.textContent = txt || ("["+ (m.msg_type||"") +"]");\n      const meta=document.createElement("div");\n      meta.className="muted";\n      meta.textContent = (m.created_at||"");\n      wrap.appendChild(bubble);\n      wrap.appendChild(meta);\n      chatEl.appendChild(wrap);\n    });\n    if(msgCount) msgCount.textContent = String(rows.length);\n    chatEl.scrollTop = chatEl.scrollHeight;\n  }\n\n  async function loadTickets(){\n    try{\n      const j = await api("/api/tickets");\n      tickets = j.tickets || j.rows || [];\n      setStatus("JS: OK · tickets " + tickets.length, true);\n      renderTickets();\n      if(!active && tickets.length) selectTicket(tickets[0]);\n    }catch(e){\n      setStatus("JS: /api/tickets failed", false);\n      console.error("loadTickets", e);\n    }\n  }\n\n  async function loadMessages(){\n    if(!active) return;\n    try{\n      const j = await api("/api/messages?ticket_id=" + encodeURIComponent(active.id));\n      const rows = j.messages || j.rows || [];\n      renderMessages(rows);\n      btnSend.disabled = false;\n    }catch(e){\n      console.error("loadMessages", e);\n    }\n  }\n\n  async function selectTicket(t){\n    active = t;\n    try{ await api("/api/tickets/mark-read", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ ticket_id: t.id }) }); }catch(e){ console.error("markRead", e); }\n    renderTickets();\n    if(chatTitle) chatTitle.textContent = "Ticket #"+t.id;\n    if(chatMeta) chatMeta.textContent = (t.dept||"") + " · " + (t.wa_id||"");\n    await loadMessages();\n  }\n\n  async function sendText(){\n    if(!active) return;\n    const text = (inText.value || "").trim();\n    if(!text) return;\n    btnSend.disabled = true;\n    try{\n      await api("/api/send", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ ticket_id: active.id, wa_id: active.wa_id, text }) });\n      inText.value = "";\n      await loadMessages();\n      await loadTickets();\n    }catch(e){\n      console.error("send", e);\n      alert("Send failed: " + e.message);\n    }finally{\n      btnSend.disabled = false;\n    }\n  }\n\n  if(btnRefresh) btnRefresh.onclick = ()=>{ loadTickets(); if(active) loadMessages(); };\n  if(btnSend) btnSend.onclick = ()=>sendText();\n  if(inText) inText.addEventListener("keydown",(ev)=>{ if(ev.key==="Enter"){ ev.preventDefault(); sendText(); } });\n\n  loadTickets();\n  setInterval(()=>{ loadTickets(); if(active) loadMessages(); }, 2000);\n})();\n'); });
+app.get("/ui.js", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("application/javascript; charset=utf-8"); res.send('\n(() => {\n  const $ = (id) => document.getElementById(id);\n  const statusEl = $("status");\n  const listEl = $("ticketList");\n  const chatEl = $("chat");\n  const chatTitle = $("chatTitle");\n  const chatMeta = $("chatMeta");\n  const msgCount = $("msgCount");\n  const btnRefresh = $("refresh");\n  const inText = $("text");\n  const btnSend = $("send");\n\n  let tickets = [];\n  let active = null;\n\n  function setStatus(text, ok=true){\n    if(!statusEl) return;\n    statusEl.textContent = text;\n    statusEl.classList.remove("ok","err");\n    statusEl.classList.add(ok ? "ok" : "err");\n  }\n\n  async function api(url, opts){\n    const r = await fetch(url, Object.assign({ credentials:"same-origin" }, opts||{}));\n    const j = await r.json().catch(()=>({}));\n    if(!r.ok) throw new Error((j && (j.error||j.message)) || ("HTTP "+r.status));\n    return j;\n  }\n\n  function renderTickets(){\n    if(!listEl) return;\n    listEl.innerHTML = "";\n    if(!tickets.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No tickets.";\n      listEl.appendChild(d);\n      return;\n    }\n    tickets.forEach(t=>{\n      const row=document.createElement("div");\n      row.className="row" + (active && String(active.id)===String(t.id) ? " active" : "");\n      row.dataset.id=String(t.id);\n      const top=document.createElement("div");\n      top.style.display="flex";\n      top.style.justifyContent="space-between";\n      top.style.gap="8px";\n      top.innerHTML = "<div><b>#"+t.id+"</b> "+(t.wa_id||"")+"</div><div class=\'muted\'>"+(t.status||"")+"</div>";\n      const sub=document.createElement("div");\n      sub.className="muted";\n      sub.textContent = (t.last_message || "").toString().slice(0,90);\n      row.appendChild(top);\n      row.appendChild(sub);\n      row.onclick=()=>selectTicket(t);\n      listEl.appendChild(row);\n    });\n  }\n\n  function renderMessages(rows){\n    if(!chatEl) return;\n    chatEl.innerHTML="";\n    rows.forEach(m=>{\n      const wrap=document.createElement("div");\n      wrap.className="msg " + (m.direction==="outgoing" ? "outgoing" : "incoming");\n      const bubble=document.createElement("div");\n      bubble.className="bubble";\n      const txt = (m.text && String(m.text).trim()) ? m.text : (m.caption||"");\n      bubble.textContent = txt || ("["+ (m.msg_type||"") +"]");\n      const meta=document.createElement("div");\n      meta.className="muted";\n      meta.textContent = (m.created_at||"");\n      wrap.appendChild(bubble);\n      wrap.appendChild(meta);\n      chatEl.appendChild(wrap);\n    });\n    if(msgCount) msgCount.textContent = String(rows.length);\n    chatEl.scrollTop = chatEl.scrollHeight;\n  }\n\n  async function loadTickets(){\n    try{\n      const j = await api("/api/tickets");\n      tickets = j.tickets || j.rows || [];\n      setStatus("JS: OK · tickets " + tickets.length, true);\n      renderTickets();\n      if(!active && tickets.length) selectTicket(tickets[0]);\n    }catch(e){\n      setStatus("JS: /api/tickets failed", false);\n      console.error("loadTickets", e);\n    }\n  }\n\n  async function loadMessages(){\n    if(!active) return;\n    try{\n      const j = await api("/api/messages?ticket_id=" + encodeURIComponent(active.id));\n      const rows = j.messages || j.rows || [];\n      renderMessages(rows);\n      btnSend.disabled = false;\n    }catch(e){\n      console.error("loadMessages", e);\n    }\n  }\n\n  async function selectTicket(t){\n    active = t;\n    renderTickets();\n    if(chatTitle) chatTitle.textContent = "Ticket #"+t.id;\n    if(chatMeta) chatMeta.textContent = (t.dept||"") + " · " + (t.wa_id||"");\n    await loadMessages();\n  }\n\n  async function sendText(){\n    if(!active) return;\n    const text = (inText.value || "").trim();\n    if(!text) return;\n    btnSend.disabled = true;\n    try{\n      await api("/api/send", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ ticket_id: active.id, wa_id: active.wa_id, text }) });\n      inText.value = "";\n      await loadMessages();\n      await loadTickets();\n    }catch(e){\n      console.error("send", e);\n      alert("Send failed: " + e.message);\n    }finally{\n      btnSend.disabled = false;\n    }\n  }\n\n  if(btnRefresh) btnRefresh.onclick = ()=>{ loadTickets(); if(active) loadMessages(); };\n  if(btnSend) btnSend.onclick = ()=>sendText();\n  if(inText) inText.addEventListener("keydown",(ev)=>{ if(ev.key==="Enter"){ ev.preventDefault(); sendText(); } });\n\n  loadTickets();\n  setInterval(()=>{ loadTickets(); if(active) loadMessages(); }, 2000);\n})();\n'); });
 
 app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("text/html; charset=utf-8");
   const user = getUser(req);
@@ -1369,7 +1388,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
     </div>
   </div>
 
-  <script src="/ui.js?v=V4.7.3.0"></script>
+  <script src="/ui.js?v=V4.7.3.2"></script>
 </body>
 </html>
 `);
@@ -1381,7 +1400,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.7.3.0",
+    version: "V4.7.3.2",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1392,7 +1411,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.7.3.0 " + new Date().toISOString());
+  res.send("pong V4.7.3.2 " + new Date().toISOString());
 });
 
 // Optional debug key for one-off diagnostics (set Railway variable DEBUG_KEY to enable)
@@ -1453,12 +1472,12 @@ app.get("/debug/messages", async (req, res) => {
     console.error("❌ DB init failed:", e);
   }
   console.log("=================================");
-  const APP_VERSION = "V4.7.3.0";
+  const APP_VERSION = "V4.7.3.2";
 
 console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.3.0");
+  console.log("VERSION MARKER: V4.7.3.2");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
