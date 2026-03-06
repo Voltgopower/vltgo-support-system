@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.3.7_HOTFIX (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.3.8_UI (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -1035,7 +1035,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.3.7 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.3.8 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1331,7 +1331,7 @@ app.post("/api/ticket-notes/add", requireAuth, async (req, res) => {
 
 // -------- UI Dashboard --------
 
-app.get("/ui.js", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("application/javascript; charset=utf-8"); res.send('\n(() => {\n  const $ = (id) => document.getElementById(id);\n  const statusEl = $("status");\n  const listEl = $("ticketList");\n  const chatEl = $("chat");\n  const chatTitle = $("chatTitle");\n  const chatMeta = $("chatMeta");\n  const msgCount = $("msgCount");\n  const btnRefresh = $("refresh");\n  const inText = $("text");\n  const btnSend = $("send");\n\n  let tickets = [];\n  let active = null;\n\n  function setStatus(text, ok=true){\n    if(!statusEl) return;\n    statusEl.textContent = text;\n    statusEl.classList.remove("ok","err");\n    statusEl.classList.add(ok ? "ok" : "err");\n  }\n\n  async function api(url, opts){\n    const r = await fetch(url, Object.assign({ credentials:"same-origin" }, opts||{}));\n    const j = await r.json().catch(()=>({}));\n    if(!r.ok) throw new Error((j && (j.error||j.message)) || ("HTTP "+r.status));\n    return j;\n  }\n\n  function renderTickets(){\n    if(!listEl) return;\n    listEl.innerHTML = "";\n    if(!tickets.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No tickets.";\n      listEl.appendChild(d);\n      return;\n    }\n    tickets.forEach(t=>{\n      const row=document.createElement("div");\n      row.className="row" + (active && String(active.id)===String(t.id) ? " active" : "");\n      row.dataset.id=String(t.id);\n      const top=document.createElement("div");\n      top.style.display="flex";\n      top.style.justifyContent="space-between";\n      top.style.gap="8px";\n      top.innerHTML = "<div><b>#"+t.id+"</b> "+(t.wa_id||"")+"</div><div class=\'muted\'>"+(t.status||"")+"</div>";\n      const sub=document.createElement("div");\n      sub.className="muted";\n      sub.textContent = (t.last_message || "").toString().slice(0,90);\n      row.appendChild(top);\n      row.appendChild(sub);\n      row.onclick=()=>selectTicket(t);\n      listEl.appendChild(row);\n    });\n  }\n\n  function renderMessages(rows){\n    if(!chatEl) return;\n    chatEl.innerHTML="";\n    rows.forEach(m=>{\n      const wrap=document.createElement("div");\n      wrap.className="msg " + (m.direction==="outgoing" ? "outgoing" : "incoming");\n      const bubble=document.createElement("div");\n      bubble.className="bubble";\n      const txt = (m.text && String(m.text).trim()) ? m.text : (m.caption||"");\n      bubble.textContent = txt || ("["+ (m.msg_type||"") +"]");\n      const meta=document.createElement("div");\n      meta.className="muted";\n      meta.textContent = (m.created_at||"");\n      wrap.appendChild(bubble);\n      wrap.appendChild(meta);\n      chatEl.appendChild(wrap);\n    });\n    if(msgCount) msgCount.textContent = String(rows.length);\n    chatEl.scrollTop = chatEl.scrollHeight;\n  }\n\n  async function loadTickets(){\n    try{\n      const j = await api("/api/tickets");\n      tickets = j.tickets || j.rows || [];\n      setStatus("JS: OK · tickets " + tickets.length, true);\n      renderTickets();\n      if(!active && tickets.length) selectTicket(tickets[0]);\n    }catch(e){\n      setStatus("JS: /api/tickets failed", false);\n      console.error("loadTickets", e);\n    }\n  }\n\n  async function loadMessages(){\n    if(!active) return;\n    try{\n      const j = await api("/api/messages?ticket_id=" + encodeURIComponent(active.id));\n      const rows = j.messages || j.rows || [];\n      renderMessages(rows);\n      btnSend.disabled = false;\n    }catch(e){\n      console.error("loadMessages", e);\n    }\n  }\n\n  async function selectTicket(t){\n    active = t;\n    renderTickets();\n    if(chatTitle) chatTitle.textContent = "Ticket #"+t.id;\n    if(chatMeta) chatMeta.textContent = (t.dept||"") + " · " + (t.wa_id||"");\n    await loadMessages();\n  }\n\n  async function sendText(){\n    if(!active) return;\n    const text = (inText.value || "").trim();\n    if(!text) return;\n    btnSend.disabled = true;\n    try{\n      await api("/api/send", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ ticket_id: active.id, wa_id: active.wa_id, text }) });\n      inText.value = "";\n      await loadMessages();\n      await loadTickets();\n    }catch(e){\n      console.error("send", e);\n      alert("Send failed: " + e.message);\n    }finally{\n      btnSend.disabled = false;\n    }\n  }\n\n  if(btnRefresh) btnRefresh.onclick = ()=>{ loadTickets(); if(active) loadMessages(); };\n  if(btnSend) btnSend.onclick = ()=>sendText();\n  if(inText) inText.addEventListener("keydown",(ev)=>{ if(ev.key==="Enter"){ ev.preventDefault(); sendText(); } });\n\n  loadTickets();\n  setInterval(()=>{ loadTickets(); }, 2000);\n})();\n'); });
+app.get("/ui.js", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("application/javascript; charset=utf-8"); res.send('\n(() => {\n  const $ = (id) => document.getElementById(id);\n  const statusEl = $("status");\n  const listEl = $("ticketList");\n  const chatEl = $("chat");\n  const chatTitle = $("chatTitle");\n  const chatMeta = $("chatMeta");\n  const msgCount = $("msgCount");\n  const btnRefresh = $("refresh");\n  const btnReloadChat = $("reloadChat");\n  const inText = $("text");\n  const btnSend = $("send");\n  const custName = $("custName");\n  const custPhone = $("custPhone");\n  const custNotes = $("custNotes");\n  const btnSaveCustomer = $("saveCustomer");\n  const notesList = $("ticketNotes");\n  const newNote = $("newNote");\n  const btnAddNote = $("addNote");\n\n  let tickets = [];\n  let active = null;\n\n  function setStatus(text, ok=true){\n    if(!statusEl) return;\n    statusEl.textContent = text;\n    statusEl.classList.toggle("ok", !!ok);\n  }\n\n  function fmtTime(v){\n    if(!v) return "";\n    const d = new Date(v);\n    if (isNaN(d)) return String(v);\n    const mm = String(d.getMonth()+1).padStart(2, "0");\n    const dd = String(d.getDate()).padStart(2, "0");\n    const hh = String(d.getHours()).padStart(2, "0");\n    const mi = String(d.getMinutes()).padStart(2, "0");\n    return mm + "-" + dd + " " + hh + ":" + mi;\n  }\n\n  async function api(url, opts){\n    const r = await fetch(url, Object.assign({ credentials:"same-origin" }, opts||{}));\n    const j = await r.json().catch(()=>({}));\n    if(!r.ok) throw new Error((j && (j.error||j.message)) || ("HTTP " + r.status));\n    return j;\n  }\n\n  function renderTickets(){\n    if(!listEl) return;\n    listEl.innerHTML = "";\n    if(!tickets.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No tickets.";\n      listEl.appendChild(d);\n      return;\n    }\n    tickets.forEach(t=>{\n      const row=document.createElement("div");\n      row.className="row" + (active && String(active.id)===String(t.id) ? " active" : "");\n      row.dataset.id=String(t.id);\n      const top=document.createElement("div");\n      top.style.display="flex";\n      top.style.justifyContent="space-between";\n      top.style.gap="8px";\n      const title = (t.name && String(t.name).trim()) ? t.name : (t.wa_id || "");\n      top.innerHTML = "<div><b>#"+t.id+"</b> " + title + "</div><div class=\'muted\'>"+(t.status||"")+"</div>";\n      const sub=document.createElement("div");\n      sub.className="muted";\n      sub.textContent = (t.last_message || "").toString().slice(0,90);\n      row.appendChild(top);\n      row.appendChild(sub);\n      row.onclick=()=>selectTicket(t);\n      listEl.appendChild(row);\n    });\n  }\n\n  function renderMessages(rows){\n    if(!chatEl) return;\n    const prevTop = chatEl.scrollTop;\n    const ordered = (rows || []).slice().sort((a,b)=>{\n      const at = Date.parse(a && a.created_at ? a.created_at : "") || 0;\n      const bt = Date.parse(b && b.created_at ? b.created_at : "") || 0;\n      if (at !== bt) return at - bt;\n      return (Number(a && a.id ? a.id : 0) - Number(b && b.id ? b.id : 0));\n    });\n\n    chatEl.innerHTML="";\n    ordered.forEach(m=>{\n      const wrap=document.createElement("div");\n      wrap.className="msg " + (m.direction==="outgoing" ? "outgoing" : "incoming");\n      const bubble=document.createElement("div");\n      bubble.className="bubble";\n      const txt = (m.text && String(m.text).trim()) ? m.text : (m.caption||"");\n      bubble.textContent = txt || ("[" + (m.msg_type||"") + "]");\n      const meta=document.createElement("div");\n      meta.className="muted";\n      meta.textContent = fmtTime(m.created_at || "");\n      wrap.appendChild(bubble);\n      wrap.appendChild(meta);\n      chatEl.appendChild(wrap);\n    });\n    if(msgCount) msgCount.textContent = String(ordered.length);\n    chatEl.scrollTop = Math.min(prevTop, Math.max(0, chatEl.scrollHeight - chatEl.clientHeight));\n  }\n\n  function renderTicketNotes(rows){\n    if(!notesList) return;\n    notesList.innerHTML = "";\n    const items = rows || [];\n    if(!items.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No notes yet.";\n      notesList.appendChild(d);\n      return;\n    }\n    items.forEach(n=>{\n      const el=document.createElement("div");\n      el.className="noteItem";\n      const head=document.createElement("div");\n      head.className="muted";\n      head.textContent = (n.author || "system") + " · " + fmtTime(n.created_at);\n      const body=document.createElement("div");\n      body.textContent = n.note || "";\n      el.appendChild(head);\n      el.appendChild(body);\n      notesList.appendChild(el);\n    });\n  }\n\n  async function loadTickets(){\n    try{\n      const j = await api("/api/tickets");\n      tickets = j.tickets || j.rows || [];\n      setStatus("JS: OK · tickets " + tickets.length, true);\n      renderTickets();\n      if(!active && tickets.length) selectTicket(tickets[0]);\n      if(active){\n        const fresh = tickets.find(x => String(x.id) === String(active.id));\n        if(fresh){\n          active = fresh;\n          renderTickets();\n        }\n      }\n    }catch(e){\n      setStatus("JS: /api/tickets failed", false);\n      console.error("loadTickets", e);\n    }\n  }\n\n  async function loadMessages(){\n    if(!active) return;\n    try{\n      const j = await api("/api/messages?ticket_id=" + encodeURIComponent(active.id));\n      const rows = j.messages || j.rows || [];\n      renderMessages(rows);\n      btnSend.disabled = false;\n    }catch(e){\n      console.error("loadMessages", e);\n    }\n  }\n\n  async function loadCustomer(){\n    if(!active) return;\n    try{\n      const j = await api("/api/customer?wa_id=" + encodeURIComponent(active.wa_id));\n      const row = j.row || {};\n      if(custName) custName.value = row.name || "";\n      if(custPhone) custPhone.value = row.wa_id || active.wa_id || "";\n      if(custNotes) custNotes.value = row.notes || "";\n    }catch(e){\n      console.error("loadCustomer", e);\n    }\n  }\n\n  async function loadNotes(){\n    if(!active) return;\n    try{\n      const j = await api("/api/ticket-notes?ticket_id=" + encodeURIComponent(active.id));\n      renderTicketNotes(j.rows || []);\n    }catch(e){\n      console.error("loadNotes", e);\n    }\n  }\n\n  async function selectTicket(t){\n    active = t;\n    try{\n      await api("/api/tickets/mark-read", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({ ticket_id: t.id })\n      });\n      t.unread_count = 0;\n    }catch(e){\n      console.error("markRead", e);\n    }\n    renderTickets();\n    if(chatTitle) chatTitle.textContent = "Ticket #" + t.id;\n    if(chatMeta) chatMeta.textContent = (t.dept||"") + " · " + (t.wa_id||"");\n    await loadMessages();\n    await loadCustomer();\n    await loadNotes();\n  }\n\n  async function sendText(){\n    if(!active) return;\n    const text = (inText.value || "").trim();\n    if(!text) return;\n    btnSend.disabled = true;\n    try{\n      await api("/api/send", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({ ticket_id: active.id, wa_id: active.wa_id, text })\n      });\n      inText.value = "";\n      await loadMessages();\n      await loadTickets();\n    }catch(e){\n      console.error("send", e);\n      alert("Send failed: " + e.message);\n    }finally{\n      btnSend.disabled = false;\n    }\n  }\n\n  async function saveCustomer(){\n    if(!active) return;\n    try{\n      await api("/api/customer/update", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({\n          wa_id: active.wa_id,\n          name: custName ? custName.value : "",\n          notes: custNotes ? custNotes.value : ""\n        })\n      });\n      await loadTickets();\n      alert("Customer saved");\n    }catch(e){\n      console.error("saveCustomer", e);\n      alert("Save failed: " + e.message);\n    }\n  }\n\n  async function addTicketNote(){\n    if(!active) return;\n    const note = (newNote.value || "").trim();\n    if(!note) return;\n    try{\n      await api("/api/ticket-notes/add", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({ ticket_id: active.id, note })\n      });\n      newNote.value = "";\n      await loadNotes();\n    }catch(e){\n      console.error("addNote", e);\n      alert("Add note failed: " + e.message);\n    }\n  }\n\n  if(btnRefresh) btnRefresh.onclick = ()=>{ loadTickets(); };\n  if(btnReloadChat) btnReloadChat.onclick = ()=>{ if(active) loadMessages(); };\n  if(btnSend) btnSend.onclick = ()=>sendText();\n  if(btnSaveCustomer) btnSaveCustomer.onclick = ()=>saveCustomer();\n  if(btnAddNote) btnAddNote.onclick = ()=>addTicketNote();\n\n  if(inText){\n    inText.addEventListener("keydown", (ev)=>{\n      if(ev.key === "Enter" && !ev.shiftKey){\n        ev.preventDefault();\n        sendText();\n      }\n    });\n  }\n\n  loadTickets();\n  setInterval(()=>{ loadTickets(); }, 2000);\n})();\n'); });
 
 app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("text/html; charset=utf-8");
   const user = getUser(req);
@@ -1347,28 +1347,33 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
     .top{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:#fff;border-bottom:1px solid #e5e7eb;position:sticky;top:0;z-index:5}
     .brand{font-weight:700}
     .pill{font-size:12px;padding:3px 8px;border:1px solid #e5e7eb;border-radius:999px;background:#fff;color:#444}
-    .wrap{display:grid;grid-template-columns:320px 1fr;gap:10px;padding:10px}
+    .wrap{display:grid;grid-template-columns:320px minmax(420px,1fr) 320px;gap:10px;padding:10px}
     .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
     .left{padding:10px}
     .list{display:flex;flex-direction:column;gap:6px;max-height:calc(100vh - 120px);overflow:auto}
     .row{padding:10px;border:1px solid #eee;border-radius:10px;cursor:pointer}
-    .row.active{border-color:#111}
+    .row.active{border-color:#2563eb;background:#eff6ff}
     .muted{color:#666;font-size:12px}
-    .main{display:flex;flex-direction:column}
-    .chat{padding:10px;max-height:calc(100vh - 180px);overflow:auto}
+    .main{display:flex;flex-direction:column;min-width:0}
+    .chat{padding:10px;max-height:calc(100vh - 190px);overflow:auto}
     .msg{display:flex;flex-direction:column;gap:2px;margin:8px 0}
-    .bubble{display:inline-block;padding:8px 10px;border-radius:10px;border:1px solid #eee;max-width:72%}
+    .bubble{display:inline-block;padding:8px 10px;border-radius:10px;border:1px solid #eee;max-width:65%;word-break:break-word}
     .incoming{align-items:flex-start}
-    .incoming .bubble{background:#f3f4f6;width:fit-content;max-width:72%}
+    .incoming .bubble{background:#f3f4f6;width:fit-content;max-width:65%}
     .outgoing{align-items:flex-end}
-    .outgoing .bubble{background:#111;color:#fff;border-color:#111}
+    .outgoing .bubble{background:#2563eb;color:#fff;border-color:#2563eb;width:fit-content;max-width:65%}
     .composer{display:flex;gap:8px;padding:10px;border-top:1px solid #e5e7eb}
     input,textarea{font:inherit}
     .in{flex:1;padding:10px;border:1px solid #e5e7eb;border-radius:10px}
     .btn{padding:10px 12px;border:1px solid #111;background:#111;color:#fff;border-radius:10px;cursor:pointer}
     .btn:disabled{opacity:.5;cursor:not-allowed}
-    .err{background:#fdecec;border-color:#f0b3b3;color:#8a1f1f}
     .ok{background:#eef7ee;border-color:#b7dfb7;color:#2b6b2b}
+    .side{padding:10px;display:flex;flex-direction:column;gap:10px}
+    .field label{display:block;font-size:12px;color:#666;margin-bottom:4px}
+    .field input,.field textarea{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #e5e7eb;border-radius:10px;background:#fff}
+    .field textarea{min-height:78px;resize:vertical}
+    .notesList{display:flex;flex-direction:column;gap:8px;max-height:240px;overflow:auto}
+    .noteItem{border:1px solid #eee;border-radius:10px;padding:8px 10px}
   </style>
 </head>
 <body>
@@ -1396,7 +1401,10 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
           <div style="font-weight:600" id="chatTitle">Conversation</div>
           <div class="muted" id="chatMeta">Select a ticket</div>
         </div>
-        <div style="display:flex;gap:8px;align-items:center"><button id="reloadChat" class="pill" style="cursor:pointer">Reload chat</button><div class="pill" id="msgCount">0</div></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button id="reloadChat" class="pill" style="cursor:pointer">Reload chat</button>
+          <div class="pill" id="msgCount">0</div>
+        </div>
       </div>
       <div id="chat" class="chat"></div>
       <div class="composer">
@@ -1404,12 +1412,28 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
         <button id="send" class="btn" disabled>Send</button>
       </div>
     </div>
+
+    <div class="card side">
+      <div>
+        <div style="font-weight:600;margin-bottom:8px">Customer Profile</div>
+        <div class="field"><label>Name</label><input id="custName" placeholder="Customer name"/></div>
+        <div class="field"><label>Phone</label><input id="custPhone" disabled/></div>
+        <div class="field"><label>Notes</label><textarea id="custNotes" placeholder="Customer notes"></textarea></div>
+        <button id="saveCustomer" class="pill" style="cursor:pointer">Save customer</button>
+      </div>
+
+      <div>
+        <div style="font-weight:600;margin-bottom:8px">Ticket Notes</div>
+        <div id="ticketNotes" class="notesList"></div>
+        <div class="field" style="margin-top:8px"><label>Add Note</label><textarea id="newNote" placeholder="Internal note"></textarea></div>
+        <button id="addNote" class="pill" style="cursor:pointer">Add note</button>
+      </div>
+    </div>
   </div>
 
-  <script src="/ui.js?v=V4.7.3.7"></script>
+  <script src="/ui.js?v=V4.7.3.8"></script>
 </body>
-</html>
-`);
+</html>`);
 });
 
 app.get("/", (req, res) => res.redirect("/ui"));
@@ -1418,7 +1442,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.7.3.7",
+    version: "V4.7.3.8",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1429,7 +1453,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.7.3.7 " + new Date().toISOString());
+  res.send("pong V4.7.3.8 " + new Date().toISOString());
 });
 
 // Optional debug key for one-off diagnostics (set Railway variable DEBUG_KEY to enable)
@@ -1490,12 +1514,12 @@ app.get("/debug/messages", async (req, res) => {
     console.error("❌ DB init failed:", e);
   }
   console.log("=================================");
-  const APP_VERSION = "V4.7.3.7";
+  const APP_VERSION = "V4.7.3.8";
 
 console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.3.7");
+  console.log("VERSION MARKER: V4.7.3.8");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
