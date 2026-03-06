@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.3.4_HOTFIX (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.3.5_HOTFIX (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -1035,7 +1035,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.3.4 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.3.5 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1171,7 +1171,7 @@ app.get("/api/messages", requireAuth, async (req, res) => {
               seen.add(key);
             }
           }
-          rows.sort((a, b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
+          rows.sort((a, b) => { const av = String(a.created_at || ""); const bv = String(b.created_at || ""); if (av !== bv) return av.localeCompare(bv); return String(a.id || "").localeCompare(String(b.id || "")); });
           mode = mode === "ticket_id" ? "ticket_id+conversation_id" : "conversation_id";
         }
       }
@@ -1405,7 +1405,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
     </div>
   </div>
 
-  <script src="/ui.js?v=V4.7.3.4"></script>
+  <script src="/ui.js?v=V4.7.3.5"></script>
 </body>
 </html>
 `);
@@ -1417,7 +1417,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.7.3.4",
+    version: "V4.7.3.5",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1428,7 +1428,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.7.3.4 " + new Date().toISOString());
+  res.send("pong V4.7.3.5 " + new Date().toISOString());
 });
 
 // Optional debug key for one-off diagnostics (set Railway variable DEBUG_KEY to enable)
@@ -1489,12 +1489,12 @@ app.get("/debug/messages", async (req, res) => {
     console.error("❌ DB init failed:", e);
   }
   console.log("=================================");
-  const APP_VERSION = "V4.7.3.4";
+  const APP_VERSION = "V4.7.3.5";
 
 console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.3.4");
+  console.log("VERSION MARKER: V4.7.3.5");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
