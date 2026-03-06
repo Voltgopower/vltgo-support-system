@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.8.0_CRM (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.8.5_CUSTOMERS_REFRESH (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -1035,7 +1035,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.8.0 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.8.5 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1332,17 +1332,27 @@ app.post("/api/ticket-notes/add", requireAuth, async (req, res) => {
 
 app.get("/api/customers", requireAuth, async (req, res) => {
   try {
-    let where = "";
+    const q = String(req.query.q || "").trim();
     let params = [];
+    let whereParts = [];
     if (STRICT_AGENT_VIEW) {
       const dept = userDept(getUser(req));
       if (dept) {
-        where = "WHERE t.dept=$1";
-        params = [dept];
+        params.push(dept);
+        whereParts.push("t.dept=$" + params.length);
       }
     }
+    if (q) {
+      params.push("%" + q + "%");
+      const p = "$" + params.length;
+      whereParts.push("(c.wa_id ILIKE " + p + " OR COALESCE(c.name,'') ILIKE " + p + " OR COALESCE(c.notes,'') ILIKE " + p + " OR COALESCE(t.last_message,'') ILIKE " + p + ")");
+    }
+    const where = whereParts.length ? ("WHERE " + whereParts.join(" AND ")) : "";
     const r = await pool.query(
-      "SELECT c.wa_id, COALESCE(c.name,'') AS name, COALESCE(c.notes,'') AS notes, MAX(t.updated_at) AS last_ticket_at, COUNT(t.id)::int AS ticket_count " +
+      "SELECT c.wa_id, COALESCE(c.name,'') AS name, COALESCE(c.notes,'') AS notes, " +
+      "MAX(t.updated_at) AS last_ticket_at, COUNT(t.id)::int AS ticket_count, " +
+      "COALESCE(SUM(COALESCE(t.unread_count,0)),0)::int AS unread_count, " +
+      "COALESCE((ARRAY_AGG(COALESCE(t.last_message,'') ORDER BY t.updated_at DESC NULLS LAST))[1],'') AS last_message " +
       "FROM customers c LEFT JOIN tickets t ON t.wa_id=c.wa_id " +
       where + " GROUP BY c.wa_id, c.name, c.notes ORDER BY MAX(t.updated_at) DESC NULLS LAST, c.wa_id ASC LIMIT 1000",
       params
@@ -1575,6 +1585,9 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
   const custNotes = $("custNotes");
   const btnSaveCustomer = $("saveCustomer");
   const btnRefreshCustomers = $("refreshCustomers");
+  const customerSearch = $("customerSearch");
+  const customerSearchBtn = $("customerSearchBtn");
+  const customerClearBtn = $("customerClearBtn");
   let customers = [];
   let active = null;
 
@@ -1602,8 +1615,10 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
     customers.forEach(c => {
       const row = document.createElement("div");
       row.className = "row" + (active && active.wa_id === c.wa_id ? " active" : "");
-      row.innerHTML = "<div><b>" + (c.name || c.wa_id) + "</b></div>" +
+      const unreadHtml = Number(c.unread_count || 0) > 0 ? " <span class='pill' style='background:#dc2626;color:#fff;border-color:#dc2626'>" + Number(c.unread_count || 0) + "</span>" : "";
+      row.innerHTML = "<div><b>" + (c.name || c.wa_id) + "</b>" + unreadHtml + "</div>" +
                       "<div class='muted'>" + c.wa_id + "</div>" +
+                      "<div class='muted'>" + ((c.last_message || "").slice(0, 60) || ((c.ticket_count || 0) + " tickets")) + "</div>" +
                       "<div class='muted'>" + (c.ticket_count || 0) + " tickets</div>";
       row.onclick = () => selectCustomer(c);
       customerList.appendChild(row);
@@ -1611,7 +1626,8 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
   }
   async function loadCustomers(){
     try{
-      const j = await api("/api/customers");
+      const q = customerSearch ? String(customerSearch.value || "").trim() : "";
+      const j = await api("/api/customers" + (q ? ("?q=" + encodeURIComponent(q)) : ""));
       customers = j.customers || j.rows || [];
       setStatus("JS: OK · customers " + customers.length, true);
       renderCustomers();
@@ -1675,6 +1691,23 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
 
   btnRefreshCustomers.onclick = loadCustomers;
   btnSaveCustomer.onclick = saveCustomer;
+  if(customerSearchBtn) customerSearchBtn.onclick = loadCustomers;
+  if(customerClearBtn){
+    customerClearBtn.onclick = ()=>{
+      if(customerSearch) customerSearch.value = "";
+      loadCustomers();
+    };
+  }
+  if(customerSearch){
+    customerSearch.addEventListener("keydown", (e)=>{
+      if(e.key === "Enter") loadCustomers();
+    });
+  }
+  try{
+    const evt = new EventSource("/sse");
+    evt.addEventListener("customers", ()=>{ loadCustomers(); if(active) loadCustomerTickets(); });
+    evt.addEventListener("tickets", ()=>{ loadCustomers(); if(active) loadCustomerTickets(); });
+  }catch(_){}
   loadCustomers();
 })();
 </script>
