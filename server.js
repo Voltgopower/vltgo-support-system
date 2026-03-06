@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.8.3_NOTIFICATIONS (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.8.0_CRM (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -1035,7 +1035,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.8.3 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.8.0 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1332,33 +1332,19 @@ app.post("/api/ticket-notes/add", requireAuth, async (req, res) => {
 
 app.get("/api/customers", requireAuth, async (req, res) => {
   try {
-    const q = String(req.query.q || "").trim();
+    let where = "";
     let params = [];
-    let whereParts = [];
-
     if (STRICT_AGENT_VIEW) {
       const dept = userDept(getUser(req));
       if (dept) {
-        params.push(dept);
-        whereParts.push("t.dept=$" + params.length);
+        where = "WHERE t.dept=$1";
+        params = [dept];
       }
     }
-
-    if (q) {
-      params.push("%" + q + "%");
-      const p = "$" + params.length;
-      whereParts.push("(c.wa_id ILIKE " + p + " OR COALESCE(c.name,'') ILIKE " + p + " OR COALESCE(c.notes,'') ILIKE " + p + " OR COALESCE(t.last_message,'') ILIKE " + p + ")");
-    }
-
-    const where = whereParts.length ? ("WHERE " + whereParts.join(" AND ")) : "";
-
     const r = await pool.query(
-      "SELECT c.wa_id, COALESCE(c.name,'') AS name, COALESCE(c.notes,'') AS notes, " +
-      "MAX(t.updated_at) AS last_ticket_at, COUNT(t.id)::int AS ticket_count, " +
-      "COALESCE((ARRAY_AGG(COALESCE(t.last_message,'') ORDER BY t.updated_at DESC NULLS LAST))[1],'') AS last_message " +
+      "SELECT c.wa_id, COALESCE(c.name,'') AS name, COALESCE(c.notes,'') AS notes, MAX(t.updated_at) AS last_ticket_at, COUNT(t.id)::int AS ticket_count " +
       "FROM customers c LEFT JOIN tickets t ON t.wa_id=c.wa_id " +
-      where + " GROUP BY c.wa_id, c.name, c.notes " +
-      "ORDER BY MAX(t.updated_at) DESC NULLS LAST, c.wa_id ASC LIMIT 1000",
+      where + " GROUP BY c.wa_id, c.name, c.notes ORDER BY MAX(t.updated_at) DESC NULLS LAST, c.wa_id ASC LIMIT 1000",
       params
     );
     res.json({ ok:true, rows:r.rows, customers:r.rows });
@@ -1449,7 +1435,6 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
       <a class="pill" href="/customers" style="text-decoration:none">Customers</a>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
-      <button id="soundToggle" class="pill" style="cursor:pointer">🔔 Sound ON</button>
       <span id="status" class="pill">JS: booting…</span>
       <a class="pill" href="/logout">Logout</a>
     </div>
@@ -1501,7 +1486,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
     </div>
   </div>
 
-  <script src="/ui.js?v=V4.8.3"></script>
+  <script src="/ui.js?v=V4.8.0"></script>
 </body>
 </html>`);
 });
@@ -1541,7 +1526,6 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
       <a class="pill" href="/customers" style="text-decoration:none">Customers</a>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
-      <button id="soundToggle" class="pill" style="cursor:pointer">🔔 Sound ON</button>
       <span id="status" class="pill">JS: booting…</span>
       <a class="pill" href="/logout">Logout</a>
     </div>
@@ -1552,6 +1536,11 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <div style="font-weight:600">Customers</div>
         <button id="refreshCustomers" class="pill" style="cursor:pointer">Refresh</button>
+      </div>
+      <div class="field" style="margin-bottom:8px;display:flex;gap:6px">
+        <input id="customerSearch" placeholder="Search customer..." style="flex:1"/>
+        <button id="customerSearchBtn" class="pill" style="cursor:pointer">Search</button>
+        <button id="customerClearBtn" class="pill" style="cursor:pointer">Clear</button>
       </div>
       <div id="customerList" class="list"></div>
     </div>
@@ -1586,9 +1575,6 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
   const custNotes = $("custNotes");
   const btnSaveCustomer = $("saveCustomer");
   const btnRefreshCustomers = $("refreshCustomers");
-  const customerSearch = $("customerSearch");
-  const customerSearchBtn = $("customerSearchBtn");
-  const customerClearBtn = $("customerClearBtn");
   let customers = [];
   let active = null;
 
@@ -1618,7 +1604,6 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
       row.className = "row" + (active && active.wa_id === c.wa_id ? " active" : "");
       row.innerHTML = "<div><b>" + (c.name || c.wa_id) + "</b></div>" +
                       "<div class='muted'>" + c.wa_id + "</div>" +
-                      "<div class='muted'>" + ((c.last_message || "").slice(0, 60) || ((c.ticket_count || 0) + " tickets")) + "</div>" +
                       "<div class='muted'>" + (c.ticket_count || 0) + " tickets</div>";
       row.onclick = () => selectCustomer(c);
       customerList.appendChild(row);
@@ -1626,8 +1611,7 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
   }
   async function loadCustomers(){
     try{
-      const q = customerSearch ? String(customerSearch.value || "").trim() : "";
-      const j = await api("/api/customers" + (q ? ("?q=" + encodeURIComponent(q)) : ""));
+      const j = await api("/api/customers");
       customers = j.customers || j.rows || [];
       setStatus("JS: OK · customers " + customers.length, true);
       renderCustomers();
@@ -1691,20 +1675,6 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
 
   btnRefreshCustomers.onclick = loadCustomers;
   btnSaveCustomer.onclick = saveCustomer;
-  if(customerSearchBtn) customerSearchBtn.onclick = loadCustomers;
-  if(customerClearBtn){
-    customerClearBtn.onclick = ()=>{
-      if(customerSearch) customerSearch.value = "";
-      loadCustomers();
-    };
-  }
-  if(customerSearch){
-    customerSearch.addEventListener("keydown", (e)=>{
-      if(e.key === "Enter"){
-        loadCustomers();
-      }
-    });
-  }
   loadCustomers();
 })();
 </script>
@@ -1719,7 +1689,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.8.3",
+    version: "V4.8.0",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1730,7 +1700,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.8.3 " + new Date().toISOString());
+  res.send("pong V4.8.0 " + new Date().toISOString());
 });
 
 // Optional debug key for one-off diagnostics (set Railway variable DEBUG_KEY to enable)
