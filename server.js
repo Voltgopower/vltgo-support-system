@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.2.7_WEBHOOK_HOTFIX (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.3.0_WEBHOOK_HOTFIX (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -1016,7 +1016,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.2.7 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.3.0 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1294,394 +1294,85 @@ app.post("/api/ticket-notes/add", requireAuth, async (req, res) => {
 });
 
 // -------- UI Dashboard --------
+
+app.get("/ui.js", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("application/javascript; charset=utf-8"); res.send('\n(() => {\n  const $ = (id) => document.getElementById(id);\n  const statusEl = $("status");\n  const listEl = $("ticketList");\n  const chatEl = $("chat");\n  const chatTitle = $("chatTitle");\n  const chatMeta = $("chatMeta");\n  const msgCount = $("msgCount");\n  const btnRefresh = $("refresh");\n  const inText = $("text");\n  const btnSend = $("send");\n\n  let tickets = [];\n  let active = null;\n\n  function setStatus(text, ok=true){\n    if(!statusEl) return;\n    statusEl.textContent = text;\n    statusEl.classList.remove("ok","err");\n    statusEl.classList.add(ok ? "ok" : "err");\n  }\n\n  async function api(url, opts){\n    const r = await fetch(url, Object.assign({ credentials:"same-origin" }, opts||{}));\n    const j = await r.json().catch(()=>({}));\n    if(!r.ok) throw new Error((j && (j.error||j.message)) || ("HTTP "+r.status));\n    return j;\n  }\n\n  function renderTickets(){\n    if(!listEl) return;\n    listEl.innerHTML = "";\n    if(!tickets.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No tickets.";\n      listEl.appendChild(d);\n      return;\n    }\n    tickets.forEach(t=>{\n      const row=document.createElement("div");\n      row.className="row" + (active && String(active.id)===String(t.id) ? " active" : "");\n      row.dataset.id=String(t.id);\n      const top=document.createElement("div");\n      top.style.display="flex";\n      top.style.justifyContent="space-between";\n      top.style.gap="8px";\n      top.innerHTML = "<div><b>#"+t.id+"</b> "+(t.wa_id||"")+"</div><div class=\'muted\'>"+(t.status||"")+"</div>";\n      const sub=document.createElement("div");\n      sub.className="muted";\n      sub.textContent = (t.last_message || "").toString().slice(0,90);\n      row.appendChild(top);\n      row.appendChild(sub);\n      row.onclick=()=>selectTicket(t);\n      listEl.appendChild(row);\n    });\n  }\n\n  function renderMessages(rows){\n    if(!chatEl) return;\n    chatEl.innerHTML="";\n    rows.forEach(m=>{\n      const wrap=document.createElement("div");\n      wrap.className="msg " + (m.direction==="outgoing" ? "outgoing" : "incoming");\n      const bubble=document.createElement("div");\n      bubble.className="bubble";\n      const txt = (m.text && String(m.text).trim()) ? m.text : (m.caption||"");\n      bubble.textContent = txt || ("["+ (m.msg_type||"") +"]");\n      const meta=document.createElement("div");\n      meta.className="muted";\n      meta.textContent = (m.created_at||"");\n      wrap.appendChild(bubble);\n      wrap.appendChild(meta);\n      chatEl.appendChild(wrap);\n    });\n    if(msgCount) msgCount.textContent = String(rows.length);\n    chatEl.scrollTop = chatEl.scrollHeight;\n  }\n\n  async function loadTickets(){\n    try{\n      const j = await api("/api/tickets");\n      tickets = j.tickets || j.rows || [];\n      setStatus("JS: OK · tickets " + tickets.length, true);\n      renderTickets();\n      if(!active && tickets.length) selectTicket(tickets[0]);\n    }catch(e){\n      setStatus("JS: /api/tickets failed", false);\n      console.error("loadTickets", e);\n    }\n  }\n\n  async function loadMessages(){\n    if(!active) return;\n    try{\n      const j = await api("/api/messages?ticket_id=" + encodeURIComponent(active.id));\n      const rows = j.messages || j.rows || [];\n      renderMessages(rows);\n      btnSend.disabled = false;\n    }catch(e){\n      console.error("loadMessages", e);\n    }\n  }\n\n  async function selectTicket(t){\n    active = t;\n    renderTickets();\n    if(chatTitle) chatTitle.textContent = "Ticket #"+t.id;\n    if(chatMeta) chatMeta.textContent = (t.dept||"") + " · " + (t.wa_id||"");\n    await loadMessages();\n  }\n\n  async function sendText(){\n    if(!active) return;\n    const text = (inText.value || "").trim();\n    if(!text) return;\n    btnSend.disabled = true;\n    try{\n      await api("/api/send", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ ticket_id: active.id, text }) });\n      inText.value = "";\n      await loadMessages();\n      await loadTickets();\n    }catch(e){\n      console.error("send", e);\n      alert("Send failed: " + e.message);\n    }finally{\n      btnSend.disabled = false;\n    }\n  }\n\n  if(btnRefresh) btnRefresh.onclick = ()=>{ loadTickets(); if(active) loadMessages(); };\n  if(btnSend) btnSend.onclick = ()=>sendText();\n  if(inText) inText.addEventListener("keydown",(ev)=>{ if(ev.key==="Enter"){ ev.preventDefault(); sendText(); } });\n\n  loadTickets();\n  setInterval(()=>{ loadTickets(); if(active) loadMessages(); }, 2000);\n})();\n'); });
+
 app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("text/html; charset=utf-8");
   const user = getUser(req);
-  res.send(`<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Voltgo Support System</title>
-<style>
-:root{--bg:#f3f4f6;--panel:#fff;--panel2:#f8fafc;--border:#e5e7eb;--text:#0f172a;--muted:#475569;--blue:#2563eb;--blue2:#1d4ed8;--green:#16a34a;--red:#dc2626;--shadow:0 12px 30px rgba(15,23,42,.08);}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;}
-a{color:var(--blue);text-decoration:none}
-.top{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:0;z-index:5}
-.brand{font-weight:900;font-size:18px;letter-spacing:.2px}.meta{color:var(--muted);font-size:12px}
-.wrap{display:grid;grid-template-columns:420px 1fr 360px;gap:12px;padding:12px}
-@media(max-width:1180px){.wrap{grid-template-columns:420px 1fr}.side{display:none}}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow);overflow:hidden}
-.card h2{margin:0;padding:12px 14px;border-bottom:1px solid var(--border);font-size:13px;display:flex;align-items:center;justify-content:space-between}
-.controls{display:flex;gap:8px;align-items:center;padding:10px 12px;border-bottom:1px solid rgba(15,23,42,.06);background:var(--panel2)}
-input,select,button,textarea{font:inherit}
-input,select,textarea{background:#fff;border:1px solid var(--border);color:var(--text);border-radius:10px;padding:8px 10px}
-button{background:var(--blue);border:0;color:#fff;border-radius:10px;padding:8px 10px;font-weight:800;cursor:pointer}
-button:hover{background:var(--blue2)}button.ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
-button.ghost:hover{background:#f1f5f9}
-.list{max-height:calc(100vh - 210px);overflow:auto}
-.row{padding:10px 12px;border-bottom:1px solid rgba(15,23,42,.06);cursor:pointer}
-.row:hover{background:#f8fafc}.row.active{background:rgba(37,99,235,.08)}
-.badge{font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid rgba(15,23,42,.14);background:#fff}
-.badge.unread{border-color:rgba(220,38,38,.35);color:var(--red)}
-.small{color:var(--muted);font-size:12px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.main{display:grid;grid-template-rows:auto 1fr auto;min-height:calc(100vh - 92px)}
-.head{display:flex;gap:10px;align-items:flex-start;justify-content:space-between;padding:12px 14px;border-bottom:1px solid var(--border)}
-.head .title{font-weight:900}.head .sub{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:720px}
-.msgs{padding:12px 14px;overflow:auto;max-height:calc(100vh - 320px)}
-.msg{margin:10px 0;display:flex}.bubble{max-width:78%;border:1px solid rgba(15,23,42,.12);background:#f8fafc;border-radius:14px;padding:10px 12px}
-.msg.outgoing{justify-content:flex-end}.msg.outgoing .bubble{background:rgba(37,99,235,.10);border-color:rgba(37,99,235,.25)}
-.meta2{color:var(--muted);font-size:11px;margin-top:6px}
-.composer{border-top:1px solid var(--border);padding:10px 12px;display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;background:var(--panel)}
-.composer textarea{flex:1;min-height:46px;max-height:140px;resize:vertical}
-.footer{padding:10px 14px;color:#64748b;font-size:12px;border-top:1px solid var(--border);background:var(--panel2)}
-.media{margin-top:8px}.media img{max-width:340px;border-radius:12px;border:1px solid rgba(15,23,42,.10)}
-.side{min-height:calc(100vh - 92px);display:flex;flex-direction:column;gap:12px}
-.panelBody{padding:12px 14px}.label{font-size:12px;color:var(--muted);margin:10px 0 6px}
-.noteItem{border:1px solid rgba(15,23,42,.10);background:#fff;border-radius:12px;padding:10px 12px;margin:8px 0}
-.noteHead{display:flex;justify-content:space-between;gap:10px;color:var(--muted);font-size:11px}
-.noteText{margin-top:6px;white-space:pre-wrap;font-size:13px}
-.notesList{max-height:340px;overflow:auto;padding-right:4px}
-.saveRow{display:flex;gap:8px;align-items:center;margin-top:10px}
-.pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted)}
-.dot{width:8px;height:8px;border-radius:999px;background:var(--green);display:inline-block}
-</style></head>
+  res.send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Voltgo Support System</title>
+  <meta http-equiv="Cache-Control" content="no-store"/>
+  <style>
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f7fb;color:#111}
+    .top{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:#fff;border-bottom:1px solid #e5e7eb;position:sticky;top:0;z-index:5}
+    .brand{font-weight:700}
+    .pill{font-size:12px;padding:3px 8px;border:1px solid #e5e7eb;border-radius:999px;background:#fff;color:#444}
+    .wrap{display:grid;grid-template-columns:320px 1fr;gap:10px;padding:10px}
+    .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+    .left{padding:10px}
+    .list{display:flex;flex-direction:column;gap:6px;max-height:calc(100vh - 120px);overflow:auto}
+    .row{padding:10px;border:1px solid #eee;border-radius:10px;cursor:pointer}
+    .row.active{border-color:#111}
+    .muted{color:#666;font-size:12px}
+    .main{display:flex;flex-direction:column}
+    .chat{padding:10px;max-height:calc(100vh - 180px);overflow:auto}
+    .msg{display:flex;flex-direction:column;gap:2px;margin:8px 0}
+    .bubble{display:inline-block;padding:8px 10px;border-radius:10px;border:1px solid #eee;max-width:72%}
+    .incoming .bubble{background:#f3f4f6}
+    .outgoing{align-items:flex-end}
+    .outgoing .bubble{background:#111;color:#fff;border-color:#111}
+    .composer{display:flex;gap:8px;padding:10px;border-top:1px solid #e5e7eb}
+    input,textarea{font:inherit}
+    .in{flex:1;padding:10px;border:1px solid #e5e7eb;border-radius:10px}
+    .btn{padding:10px 12px;border:1px solid #111;background:#111;color:#fff;border-radius:10px;cursor:pointer}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+    .err{background:#fdecec;border-color:#f0b3b3;color:#8a1f1f}
+    .ok{background:#eef7ee;border-color:#b7dfb7;color:#2b6b2b}
+  </style>
+</head>
 <body>
-<div class="top"><div><div class="brand">Voltgo Support System</div>
-<div class="meta">Logged in as <b>${esc(user)}</b> • <a href="/logout">Logout</a> • Version: <b>V4.7.2.7</b> • Light UI • Customer Profile • Ticket Notes • Media</div></div>
-<div class="meta">Strict Isolation: ${STRICT_AGENT_VIEW ? "ON" : "OFF"} <span id="jsStatus" style="margin-left:10px;padding:2px 6px;border:1px solid #ddd;border-radius:999px;font-size:12px;color:#555;">JS: booting…</span></div></div>
-
-<div class="wrap">
-  <div class="card">
-    <h2>Tickets <span class="pill"><span class="dot"></span> live</span></h2>
-    <div class="controls">
-      <input id="q" placeholder="Search wa_id / name / message" style="flex:1"/>
-      <select id="status"><option value="">all</option><option value="open">open</option><option value="pending">pending</option><option value="closed">closed</option></select>
-      <select id="dept"><option value="">all</option><option value="presales">presales</option><option value="aftersales">aftersales</option></select>
+  <div class="top">
+    <div class="brand">Voltgo Support System</div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span id="status" class="pill">JS: booting…</span>
+      <a class="pill" href="/logout">Logout</a>
     </div>
-    <div class="controls">
-      <button class="ghost" id="refresh">Refresh</button>
-      <label class="meta" style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="unreadOnly"/> Unread only</label>
-      <span class="meta" id="count"></span>
-    </div>
-    <div class="list" id="ticketList"></div>
   </div>
 
-  <div class="card main">
-    <div class="head">
-      <div class="left"><div class="title" id="tTitle">Select a ticket</div><div class="sub" id="tSub">—</div></div>
-      <div style="display:flex;gap:8px;align-items:center"><button class="ghost" id="markRead" disabled>Mark as read</button></div>
-    </div>
-    <div class="msgs" id="msgs"></div>
-    <div class="composer">
-      <input id="file" type="file" style="width:240px" disabled />
-      <textarea id="reply" placeholder="Type reply..." disabled></textarea>
-      <button id="send" disabled>Send</button>
-      <button id="sendFile" class="ghost" disabled>Send File</button>
-    </div>
-    <div class="footer">Media tips: images show thumbnail; video/audio/document show download link. Uploaded files are stored under /logs/media on server.</div>
-  </div>
-
-  <div class="side">
-    <div class="card">
-      <h2>Customer Profile</h2>
-      <div class="panelBody">
-        <div class="label">Phone (wa_id)</div><input id="cWa" disabled placeholder="—"/>
-        <div class="label">Name</div><input id="cName" placeholder="Customer name"/>
-        <div class="label">Customer Notes (internal)</div><textarea id="cNotes" rows="6" placeholder="Internal notes about this customer..."></textarea>
-        <div class="saveRow"><button id="saveCustomer" class="ghost" disabled>Save</button><span class="meta" id="saveStatus"></span></div>
+  <div class="wrap">
+    <div class="card left">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="font-weight:600">Tickets</div>
+        <button id="refresh" class="pill" style="cursor:pointer">Refresh</button>
       </div>
+      <div id="ticketList" class="list"></div>
+      <div class="muted" style="margin-top:8px">Auto refresh every 2s</div>
     </div>
 
-    <div class="card">
-      <h2>Ticket Notes (internal)</h2>
-      <div class="panelBody">
-        <div class="notesList" id="noteList"></div>
-        <div class="label">Add a note</div><textarea id="noteText" rows="3" placeholder="Internal note for this ticket..." disabled></textarea>
-        <div class="saveRow"><button id="addNote" disabled>Add Note</button><span class="meta" id="noteStatus"></span></div>
+    <div class="card main">
+      <div style="padding:10px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div style="font-weight:600" id="chatTitle">Conversation</div>
+          <div class="muted" id="chatMeta">Select a ticket</div>
+        </div>
+        <div class="pill" id="msgCount">0</div>
+      </div>
+      <div id="chat" class="chat"></div>
+      <div class="composer">
+        <input id="text" class="in" placeholder="Type a reply…"/>
+        <button id="send" class="btn" disabled>Send</button>
       </div>
     </div>
   </div>
-</div>
 
-<script>
-const el=(id)=>document.getElementById(id);
-let tickets=[];let active=null;
-
-async function api(url,opts){
-  const r=await fetch(url,opts);
-  const j=await r.json().catch(()=>({}));
-  if(!r.ok||j.ok===false) throw new Error(j.error||('HTTP '+r.status));
-  return j;
-}
-function esc2(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
-
-function renderTickets(){
-  const list=el('ticketList'); list.innerHTML='';
-  let n=0;
-  tickets.forEach(t=>{
-    n++;
-    const div=document.createElement('div');
-    div.className='row'+(active&&active.id===t.id?' active':'');
-    const unread=Number(t.unread_count||0);
-    const displayName=(t.name||'').trim()?t.name:t.wa_id;
-    div.innerHTML=\`
-      <div><b>#\${t.id}</b> <span class="badge">\${t.dept}</span> <span class="badge">\${t.status}</span> \${unread>0?'<span class="badge unread">unread '+unread+'</span>':''}</div>
-      <div class="small">\${esc2(displayName)} • \${esc2(t.last_message||'')}</div>
-    \`;
-    div.dataset.ticketId=String(t.id);
-    // click handled by delegated listener on #ticketList
-
-    list.appendChild(div);
-  });
-  el('count').textContent=n? (n+' tickets'):'0';
-}
-
-async function loadTickets(){
-  const q=el('q').value.trim();
-  const status=el('status').value;
-  const dept=el('dept').value;
-  const unread=el('unreadOnly').checked?'1':'0';
-  const params=new URLSearchParams();
-  if(q) params.set('q',q);
-  if(status) params.set('status',status);
-  if(dept) params.set('dept',dept);
-  if(unread==='1') params.set('unread','1');
-  const j=await api('/api/tickets?'+params.toString());
-  tickets=j.rows||[];
-  renderTickets();
-}
-
-function renderMedia(m){
-  const media_path=(m.media_path||'').trim();
-  const thumb_path=(m.thumb_path||'').trim();
-  if(!media_path) return '';
-  const link='<a href="'+esc2(media_path)+'" target="_blank">Download / Open</a>';
-  if(thumb_path) return '<div class="media"><img src="'+esc2(thumb_path)+'"/><div>'+link+'</div></div>';
-  return '<div class="media">'+link+'</div>';
-}
-
-async function loadMessages(){
-  try{ console.log('loadMessages start', {active}); }catch(_){}
-  if(!active) return;
-  const url='/api/messages?ticket_id='+encodeURIComponent(active.id);
-  try{ console.log('fetch', url); }catch(_){}
-  const j=await api(url);
-  try{ console.log('loadMessages got', {mode:j.mode, n:(j.messages||j.rows||[]).length}); }catch(_){}
-  const rows=(j.messages||j.rows||[]);
-  const box=el('msgs'); box.innerHTML='';
-  rows.forEach(m=>{
-    const div=document.createElement('div');
-    div.className='msg '+(m.direction==='outgoing'?'outgoing':'incoming');
-    const txt=(m.text||m.caption||'').trim();
-    const ts=m.created_at? new Date(m.created_at).toLocaleString():'';
-    div.innerHTML=\`
-      <div class="bubble">
-        <div>\${esc2(txt)}</div>
-        \${renderMedia(m)}
-        <div class="meta2">\${esc2(m.direction)} • \${esc2(m.msg_type)} • \${esc2(ts)}</div>
-      </div>
-    \`;
-    box.appendChild(div);
-  });
-  box.scrollTop=box.scrollHeight+9999;
-}
-
-async function loadCustomer(){
-  if(!active) return;
-  el('saveStatus').textContent='';
-  const j=await api('/api/customer?wa_id='+encodeURIComponent(active.wa_id));
-  const c=j.row;
-  el('cWa').value=c.wa_id||'';
-  el('cName').value=c.name||'';
-  el('cNotes').value=c.notes||'';
-  el('saveCustomer').disabled=false;
-}
-
-async function saveCustomer(){
-  if(!active) return;
-  el('saveCustomer').disabled=true;
-  el('saveStatus').textContent='Saving...';
-  try{
-    await api('/api/customer/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({wa_id:active.wa_id,name:el('cName').value,notes:el('cNotes').value})});
-    el('saveStatus').textContent='Saved';
-    await loadTickets();
-    active.name=el('cName').value.trim();
-    el('tTitle').textContent='#'+active.id+' • '+(active.name?active.name:active.wa_id);
-    setTimeout(()=>el('saveStatus').textContent='',1200);
-  }catch(e){ el('saveStatus').textContent='Failed: '+e.message; }
-  finally{ el('saveCustomer').disabled=false; }
-}
-
-function renderNotes(rows){
-  const list=el('noteList'); list.innerHTML='';
-  if(!rows.length){ list.innerHTML='<div class="meta">No notes yet.</div>'; return; }
-  rows.forEach(n=>{
-    const div=document.createElement('div');
-    div.className='noteItem';
-    const ts=n.created_at? new Date(n.created_at).toLocaleString():'';
-    div.innerHTML=\`
-      <div class="noteHead"><span>\${esc2(n.author||'')}</span><span>\${esc2(ts)}</span></div>
-      <div class="noteText">\${esc2(n.note||'')}</div>
-    \`;
-    list.appendChild(div);
-  });
-  list.scrollTop=list.scrollHeight+9999;
-}
-async function loadTicketNotes(){
-  if(!active) return;
-  el('noteStatus').textContent='';
-  const j=await api('/api/ticket-notes?ticket_id='+encodeURIComponent(active.id));
-  renderNotes(j.rows||[]);
-  el('noteText').disabled=false;
-  el('addNote').disabled=false;
-}
-async function addNote(){
-  if(!active) return;
-  const note=el('noteText').value.trim();
-  if(!note) return;
-  el('addNote').disabled=true;
-  el('noteStatus').textContent='Adding...';
-  try{
-    await api('/api/ticket-notes/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticket_id:active.id,note})});
-    el('noteText').value='';
-    el('noteStatus').textContent='Added';
-    await loadTicketNotes();
-    setTimeout(()=>el('noteStatus').textContent='',1200);
-  }catch(e){ el('noteStatus').textContent='Failed: '+e.message; }
-  finally{ el('addNote').disabled=false; }
-}
-
-async async function selectTicket(t){
-  try{ console.log('selectTicket click', t); }catch(_){}
-  active=t;
-  renderTickets();
-  const displayName=(t.name&&t.name.trim())?t.name:t.wa_id;
-  el('tTitle').textContent='#'+t.id+' • '+displayName;
-  el('tSub').textContent=t.dept+' • '+t.status+(t.assignee?' • '+t.assignee:'');
-  el('reply').disabled=false; el('send').disabled=false; el('sendFile').disabled=false; el('file').disabled=false; el('markRead').disabled=false;
-  await loadMessages(); await loadCustomer(); await loadTicketNotes();
-}
-
-async function sendReply(){
-  if(!active) return;
-  const text=el('reply').value.trim();
-  if(!text) return;
-  el('send').disabled=true;
-  try{
-    await api('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticket_id:active.id,wa_id:active.wa_id,text})});
-    el('reply').value='';
-    await loadTickets(); await loadMessages();
-  }catch(e){ alert('Send failed: '+e.message); }
-  finally{ el('send').disabled=false; }
-}
-async function sendFile(){
-  if(!active) return;
-  const f=el('file').files&&el('file').files[0];
-  if(!f){ alert('Please choose a file first'); return; }
-  const fd=new FormData();
-  fd.append('ticket_id',String(active.id));
-  fd.append('wa_id',String(active.wa_id));
-  fd.append('file',f);
-  fd.append('caption',el('reply').value.trim());
-  el('sendFile').disabled=true;
-  try{
-    const r=await fetch('/api/send-media',{method:'POST',body:fd});
-    const j=await r.json().catch(()=>({}));
-    if(!r.ok||j.ok===false) throw new Error(j.error||('HTTP '+r.status));
-    el('file').value=''; el('reply').value='';
-    await loadTickets(); await loadMessages();
-  }catch(e){ alert('Send file failed: '+e.message); }
-  finally{ el('sendFile').disabled=false; }
-}
-async function markRead(){
-  if(!active) return;
-  try{ await api('/api/tickets/mark-read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ticket_id:active.id})}); await loadTickets(); }
-  catch(e){ alert('Failed: '+e.message); }
-}
-
-el('refresh').onclick=()=>loadTickets();
-el('send').onclick=()=>sendReply();
-el('sendFile').onclick=()=>sendFile();
-el('markRead').onclick=()=>markRead();
-el('saveCustomer').onclick=()=>saveCustomer();
-el('addNote').onclick=()=>addNote();
-
-['q','status','dept','unreadOnly'].forEach(id=>{
-  el(id).addEventListener('change',()=>loadTickets());
-  el(id).addEventListener('keyup',(ev)=>{ if(id==='q'&&ev.key==='Enter') loadTickets(); });
-});
-
-// SSE (plus polling fallback if SSE is blocked by network/proxy)
-let sseOk=false;
-try{
-  const es=new EventSource('/sse');
-  es.onopen=()=>{ sseOk=true; };
-  es.onerror=()=>{ sseOk=false; };
-  es.addEventListener('tickets',()=>loadTickets());
-  es.addEventListener('message',()=>{ if(active) loadMessages(); });
-  es.addEventListener('customers',()=>{ if(active) loadCustomer(); loadTickets(); });
-  es.addEventListener('ticket_notes',(ev)=>{
-    try{
-      const data=JSON.parse(ev.data||'{}');
-      if(active && data.payload && Number(data.payload.ticket_id)===Number(active.id)) loadTicketNotes();
-    }catch(_){}
-  });
-}catch(_){ sseOk=false; }
-
-// Fallback polling every 5s when SSE isn't connected
-setInterval(()=>{
-  if(!sseOk) loadTickets();
-  if(active && !sseOk) loadMessages();
-}, 5000);
-
-document.addEventListener('DOMContentLoaded', async ()=> {
-  const setStatus=(txt, ok=true)=>{ 
-    try{ 
-      const st=el('jsStatus'); 
-      if(st){ 
-        st.textContent=txt; 
-        st.style.background= ok? '#eef7ee':'#fdecec'; 
-        st.style.borderColor= ok? '#b7dfb7':'#f0b3b3'; 
-        st.style.color= ok? '#2b6b2b':'#8a1f1f'; 
-      } 
-    }catch(_){} 
-  };
-
-  try{ setStatus('JS: running'); }catch(_){}
-
-  // Smoke test: hit /api/tickets directly so we can see if fetch is blocked
-  try{
-    const r = await fetch('/api/tickets', { credentials: 'same-origin' });
-    const j = await r.json().catch(()=>({}));
-    const n = (j.tickets || j.rows || []).length;
-    if(r.ok) setStatus('JS: OK · tickets ' + n, true);
-    else setStatus('JS: /api/tickets ' + r.status, false);
-  }catch(e){
-    setStatus('JS: fetch failed', false);
-    try{ console.error('fetch /api/tickets failed', e); }catch(_){}
-  }
-
-  try{
-    const listEl = el('ticketList');
-    if(listEl){
-      listEl.addEventListener('click',(ev)=>{
-        const row=ev.target.closest('.row');
-        if(!row) return;
-        const id=row.dataset.ticketId;
-        const t=(tickets||[]).find(x=>String(x.id)===String(id));
-        if(t) selectTicket(t);
-      });
-    }
-  }catch(e){ try{ console.error('init click bind error', e); }catch(_){} }
-
-  // initial load
-  try{ loadTickets(); }catch(e){ try{ console.error('loadTickets error', e); }catch(_){} }
-
-  // Robust polling fallback (SSE / click issues won't block updates)
-  setInterval(()=>{
-    try{ loadTickets(); }catch(_){}
-    try{ if(active) loadMessages(); }catch(_){}
-  }, 3000);
-
-});
-</script>
-</body></html`);
+  <script src="/ui.js?v=V4.7.3.0"></script>
+</body>
+</html>
+`);
 });
 
 app.get("/", (req, res) => res.redirect("/ui"));
@@ -1690,7 +1381,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.7.2.7",
+    version: "V4.7.3.0",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1701,7 +1392,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.7.2.7 " + new Date().toISOString());
+  res.send("pong V4.7.3.0 " + new Date().toISOString());
 });
 
 // Optional debug key for one-off diagnostics (set Railway variable DEBUG_KEY to enable)
@@ -1762,12 +1453,12 @@ app.get("/debug/messages", async (req, res) => {
     console.error("❌ DB init failed:", e);
   }
   console.log("=================================");
-  const APP_VERSION = "V4.7.2.7";
+  const APP_VERSION = "V4.7.3.0";
 
 console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.2.7");
+  console.log("VERSION MARKER: V4.7.3.0");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
