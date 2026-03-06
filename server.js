@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.3.6_HOTFIX (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.3.7_HOTFIX (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -1035,7 +1035,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.3.6 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.3.7 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1331,7 +1331,7 @@ app.post("/api/ticket-notes/add", requireAuth, async (req, res) => {
 
 // -------- UI Dashboard --------
 
-app.get("/ui.js", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("application/javascript; charset=utf-8"); res.send('\n(() => {\n  const $ = (id) => document.getElementById(id);\n  const statusEl = $("status");\n  const listEl = $("ticketList");\n  const chatEl = $("chat");\n  const chatTitle = $("chatTitle");\n  const chatMeta = $("chatMeta");\n  const msgCount = $("msgCount");\n  const btnRefresh = $("refresh");\n  const inText = $("text");\n  const btnSend = $("send");\n\n  let tickets = [];\n  let active = null;\n\n  function setStatus(text, ok=true){\n    if(!statusEl) return;\n    statusEl.textContent = text;\n    statusEl.classList.remove("ok","err");\n    statusEl.classList.add(ok ? "ok" : "err");\n  }\n\n  async function api(url, opts){\n    const r = await fetch(url, Object.assign({ credentials:"same-origin" }, opts||{}));\n    const j = await r.json().catch(()=>({}));\n    if(!r.ok) throw new Error((j && (j.error||j.message)) || ("HTTP "+r.status));\n    return j;\n  }\n\n  function renderTickets(){\n    if(!listEl) return;\n    listEl.innerHTML = "";\n    if(!tickets.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No tickets.";\n      listEl.appendChild(d);\n      return;\n    }\n    tickets.forEach(t=>{\n      const row=document.createElement("div");\n      row.className="row" + (active && String(active.id)===String(t.id) ? " active" : "");\n      row.dataset.id=String(t.id);\n      const top=document.createElement("div");\n      top.style.display="flex";\n      top.style.justifyContent="space-between";\n      top.style.gap="8px";\n      top.innerHTML = "<div><b>#"+t.id+"</b> "+(t.wa_id||"")+"</div><div class=\'muted\'>"+(t.status||"")+"</div>";\n      const sub=document.createElement("div");\n      sub.className="muted";\n      sub.textContent = (t.last_message || "").toString().slice(0,90);\n      row.appendChild(top);\n      row.appendChild(sub);\n      row.onclick=()=>selectTicket(t);\n      listEl.appendChild(row);\n    });\n  }\n\n  function renderMessages(rows){\n    if(!chatEl) return;\n    chatEl.innerHTML="";\n    rows.forEach(m=>{\n      const wrap=document.createElement("div");\n      wrap.className="msg " + (m.direction==="outgoing" ? "outgoing" : "incoming");\n      const bubble=document.createElement("div");\n      bubble.className="bubble";\n      const txt = (m.text && String(m.text).trim()) ? m.text : (m.caption||"");\n      bubble.textContent = txt || ("["+ (m.msg_type||"") +"]");\n      const meta=document.createElement("div");\n      meta.className="muted";\n      meta.textContent = (m.created_at||"");\n      wrap.appendChild(bubble);\n      wrap.appendChild(meta);\n      chatEl.appendChild(wrap);\n    });\n    if(msgCount) msgCount.textContent = String(rows.length);\n    chatEl.scrollTop = chatEl.scrollHeight;\n  }\n\n  async function loadTickets(){\n    try{\n      const j = await api("/api/tickets");\n      tickets = j.tickets || j.rows || [];\n      setStatus("JS: OK · tickets " + tickets.length, true);\n      renderTickets();\n      if(!active && tickets.length) selectTicket(tickets[0]);\n    }catch(e){\n      setStatus("JS: /api/tickets failed", false);\n      console.error("loadTickets", e);\n    }\n  }\n\n  async function loadMessages(){\n    if(!active) return;\n    try{\n      const j = await api("/api/messages?ticket_id=" + encodeURIComponent(active.id));\n      const rows = j.messages || j.rows || [];\n      renderMessages(rows);\n      btnSend.disabled = false;\n    }catch(e){\n      console.error("loadMessages", e);\n    }\n  }\n\n  async function selectTicket(t){\n    active = t;\n    renderTickets();\n    if(chatTitle) chatTitle.textContent = "Ticket #"+t.id;\n    if(chatMeta) chatMeta.textContent = (t.dept||"") + " · " + (t.wa_id||"");\n    await loadMessages();\n  }\n\n  async function sendText(){\n    if(!active) return;\n    const text = (inText.value || "").trim();\n    if(!text) return;\n    btnSend.disabled = true;\n    try{\n      await api("/api/send", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ ticket_id: active.id, wa_id: active.wa_id, text }) });\n      inText.value = "";\n      await loadMessages();\n      await loadTickets();\n    }catch(e){\n      console.error("send", e);\n      alert("Send failed: " + e.message);\n    }finally{\n      btnSend.disabled = false;\n    }\n  }\n\n  if(btnRefresh) btnRefresh.onclick = ()=>{ loadTickets(); if(active) loadMessages(); };\n  if(btnSend) btnSend.onclick = ()=>sendText();\n  if(inText) inText.addEventListener("keydown",(ev)=>{ if(ev.key==="Enter"){ ev.preventDefault(); sendText(); } });\n\n  loadTickets();\n  setInterval(()=>{ loadTickets(); if(active) loadMessages(); }, 2000);\n})();\n'); });
+app.get("/ui.js", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("application/javascript; charset=utf-8"); res.send('\n(() => {\n  const $ = (id) => document.getElementById(id);\n  const statusEl = $("status");\n  const listEl = $("ticketList");\n  const chatEl = $("chat");\n  const chatTitle = $("chatTitle");\n  const chatMeta = $("chatMeta");\n  const msgCount = $("msgCount");\n  const btnRefresh = $("refresh");\n  const inText = $("text");\n  const btnSend = $("send");\n\n  let tickets = [];\n  let active = null;\n\n  function setStatus(text, ok=true){\n    if(!statusEl) return;\n    statusEl.textContent = text;\n    statusEl.classList.remove("ok","err");\n    statusEl.classList.add(ok ? "ok" : "err");\n  }\n\n  async function api(url, opts){\n    const r = await fetch(url, Object.assign({ credentials:"same-origin" }, opts||{}));\n    const j = await r.json().catch(()=>({}));\n    if(!r.ok) throw new Error((j && (j.error||j.message)) || ("HTTP "+r.status));\n    return j;\n  }\n\n  function renderTickets(){\n    if(!listEl) return;\n    listEl.innerHTML = "";\n    if(!tickets.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No tickets.";\n      listEl.appendChild(d);\n      return;\n    }\n    tickets.forEach(t=>{\n      const row=document.createElement("div");\n      row.className="row" + (active && String(active.id)===String(t.id) ? " active" : "");\n      row.dataset.id=String(t.id);\n      const top=document.createElement("div");\n      top.style.display="flex";\n      top.style.justifyContent="space-between";\n      top.style.gap="8px";\n      top.innerHTML = "<div><b>#"+t.id+"</b> "+(t.wa_id||"")+"</div><div class=\'muted\'>"+(t.status||"")+"</div>";\n      const sub=document.createElement("div");\n      sub.className="muted";\n      sub.textContent = (t.last_message || "").toString().slice(0,90);\n      row.appendChild(top);\n      row.appendChild(sub);\n      row.onclick=()=>selectTicket(t);\n      listEl.appendChild(row);\n    });\n  }\n\n  function renderMessages(rows){\n    if(!chatEl) return;\n    chatEl.innerHTML="";\n    rows.forEach(m=>{\n      const wrap=document.createElement("div");\n      wrap.className="msg " + (m.direction==="outgoing" ? "outgoing" : "incoming");\n      const bubble=document.createElement("div");\n      bubble.className="bubble";\n      const txt = (m.text && String(m.text).trim()) ? m.text : (m.caption||"");\n      bubble.textContent = txt || ("["+ (m.msg_type||"") +"]");\n      const meta=document.createElement("div");\n      meta.className="muted";\n      meta.textContent = (m.created_at||"");\n      wrap.appendChild(bubble);\n      wrap.appendChild(meta);\n      chatEl.appendChild(wrap);\n    });\n    if(msgCount) msgCount.textContent = String(rows.length);\n    chatEl.scrollTop = chatEl.scrollHeight;\n  }\n\n  async function loadTickets(){\n    try{\n      const j = await api("/api/tickets");\n      tickets = j.tickets || j.rows || [];\n      setStatus("JS: OK · tickets " + tickets.length, true);\n      renderTickets();\n      if(!active && tickets.length) selectTicket(tickets[0]);\n    }catch(e){\n      setStatus("JS: /api/tickets failed", false);\n      console.error("loadTickets", e);\n    }\n  }\n\n  async function loadMessages(){\n    if(!active) return;\n    try{\n      const j = await api("/api/messages?ticket_id=" + encodeURIComponent(active.id));\n      const rows = j.messages || j.rows || [];\n      renderMessages(rows);\n      btnSend.disabled = false;\n    }catch(e){\n      console.error("loadMessages", e);\n    }\n  }\n\n  async function selectTicket(t){\n    active = t;\n    renderTickets();\n    if(chatTitle) chatTitle.textContent = "Ticket #"+t.id;\n    if(chatMeta) chatMeta.textContent = (t.dept||"") + " · " + (t.wa_id||"");\n    await loadMessages();\n  }\n\n  async function sendText(){\n    if(!active) return;\n    const text = (inText.value || "").trim();\n    if(!text) return;\n    btnSend.disabled = true;\n    try{\n      await api("/api/send", { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify({ ticket_id: active.id, wa_id: active.wa_id, text }) });\n      inText.value = "";\n      await loadMessages();\n      await loadTickets();\n    }catch(e){\n      console.error("send", e);\n      alert("Send failed: " + e.message);\n    }finally{\n      btnSend.disabled = false;\n    }\n  }\n\n  if(btnRefresh) btnRefresh.onclick = ()=>{ loadTickets(); if(active) loadMessages(); };\n  if(btnSend) btnSend.onclick = ()=>sendText();\n  if(inText) inText.addEventListener("keydown",(ev)=>{ if(ev.key==="Enter"){ ev.preventDefault(); sendText(); } });\n\n  loadTickets();\n  setInterval(()=>{ loadTickets(); }, 2000);\n})();\n'); });
 
 app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("text/html; charset=utf-8");
   const user = getUser(req);
@@ -1358,7 +1358,8 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
     .chat{padding:10px;max-height:calc(100vh - 180px);overflow:auto}
     .msg{display:flex;flex-direction:column;gap:2px;margin:8px 0}
     .bubble{display:inline-block;padding:8px 10px;border-radius:10px;border:1px solid #eee;max-width:72%}
-    .incoming .bubble{background:#f3f4f6}
+    .incoming{align-items:flex-start}
+    .incoming .bubble{background:#f3f4f6;width:fit-content;max-width:72%}
     .outgoing{align-items:flex-end}
     .outgoing .bubble{background:#111;color:#fff;border-color:#111}
     .composer{display:flex;gap:8px;padding:10px;border-top:1px solid #e5e7eb}
@@ -1386,7 +1387,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
         <button id="refresh" class="pill" style="cursor:pointer">Refresh</button>
       </div>
       <div id="ticketList" class="list"></div>
-      <div class="muted" style="margin-top:8px">Auto refresh every 2s</div>
+      <div class="muted" style="margin-top:8px">Tickets auto refresh every 2s · chat manual</div>
     </div>
 
     <div class="card main">
@@ -1395,7 +1396,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
           <div style="font-weight:600" id="chatTitle">Conversation</div>
           <div class="muted" id="chatMeta">Select a ticket</div>
         </div>
-        <div class="pill" id="msgCount">0</div>
+        <div style="display:flex;gap:8px;align-items:center"><button id="reloadChat" class="pill" style="cursor:pointer">Reload chat</button><div class="pill" id="msgCount">0</div></div>
       </div>
       <div id="chat" class="chat"></div>
       <div class="composer">
@@ -1405,7 +1406,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
     </div>
   </div>
 
-  <script src="/ui.js?v=V4.7.3.6"></script>
+  <script src="/ui.js?v=V4.7.3.7"></script>
 </body>
 </html>
 `);
@@ -1417,7 +1418,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.7.3.6",
+    version: "V4.7.3.7",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1428,7 +1429,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.7.3.6 " + new Date().toISOString());
+  res.send("pong V4.7.3.7 " + new Date().toISOString());
 });
 
 // Optional debug key for one-off diagnostics (set Railway variable DEBUG_KEY to enable)
@@ -1489,12 +1490,12 @@ app.get("/debug/messages", async (req, res) => {
     console.error("❌ DB init failed:", e);
   }
   console.log("=================================");
-  const APP_VERSION = "V4.7.3.6";
+  const APP_VERSION = "V4.7.3.7";
 
 console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.3.6");
+  console.log("VERSION MARKER: V4.7.3.7");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
