@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.8.2_SEARCH_BUTTON (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.8.3_NOTIFICATIONS (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -1036,7 +1036,49 @@ function renderLogin(errMsg) {
     "<button type='submit'>Login</button>" +
     "</form>" +
     "<p style='margin-top:14px;color:#64748b'>Version: V4.8.2 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
-    "</div></body></html>"
+    "</div>
+<script>
+(function(){
+  let unread = 0;
+  let soundEnabled = true;
+  const audio = new Audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg");
+
+  function updateTitle(){
+    const base = "Voltgo Support";
+    if(unread>0) document.title = "(" + unread + ") " + base;
+    else document.title = base;
+  }
+
+  function playSound(){
+    if(!soundEnabled) return;
+    try{ audio.currentTime = 0; audio.play(); }catch(e){}
+  }
+
+  const evt = new EventSource("/sse");
+  evt.addEventListener("message", function(e){
+    try{
+      const d = JSON.parse(e.data);
+      if(d.type === "message" && d.payload && d.payload.direction === "incoming"){
+        unread++;
+        updateTitle();
+        playSound();
+      }
+    }catch(err){}
+  });
+
+  window.addEventListener("focus", function(){
+    unread = 0;
+    updateTitle();
+  });
+
+  window.toggleSound = function(){
+    soundEnabled = !soundEnabled;
+    alert("Sound " + (soundEnabled ? "ON" : "OFF"));
+  };
+})();
+</script>
+
+</body></html>"
   );
 }
 
@@ -1501,6 +1543,48 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
   </div>
 
   <script src="/ui.js?v=V4.8.2"></script>
+
+<script>
+(function(){
+  let unread = 0;
+  let soundEnabled = true;
+  const audio = new Audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg");
+
+  function updateTitle(){
+    const base = "Voltgo Support";
+    if(unread>0) document.title = "(" + unread + ") " + base;
+    else document.title = base;
+  }
+
+  function playSound(){
+    if(!soundEnabled) return;
+    try{ audio.currentTime = 0; audio.play(); }catch(e){}
+  }
+
+  const evt = new EventSource("/sse");
+  evt.addEventListener("message", function(e){
+    try{
+      const d = JSON.parse(e.data);
+      if(d.type === "message" && d.payload && d.payload.direction === "incoming"){
+        unread++;
+        updateTitle();
+        playSound();
+      }
+    }catch(err){}
+  });
+
+  window.addEventListener("focus", function(){
+    unread = 0;
+    updateTitle();
+  });
+
+  window.toggleSound = function(){
+    soundEnabled = !soundEnabled;
+    alert("Sound " + (soundEnabled ? "ON" : "OFF"));
+  };
+})();
+</script>
+
 </body>
 </html>`);
 });
@@ -1706,6 +1790,48 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
   loadCustomers();
 })();
 </script>
+
+<script>
+(function(){
+  let unread = 0;
+  let soundEnabled = true;
+  const audio = new Audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg");
+
+  function updateTitle(){
+    const base = "Voltgo Support";
+    if(unread>0) document.title = "(" + unread + ") " + base;
+    else document.title = base;
+  }
+
+  function playSound(){
+    if(!soundEnabled) return;
+    try{ audio.currentTime = 0; audio.play(); }catch(e){}
+  }
+
+  const evt = new EventSource("/sse");
+  evt.addEventListener("message", function(e){
+    try{
+      const d = JSON.parse(e.data);
+      if(d.type === "message" && d.payload && d.payload.direction === "incoming"){
+        unread++;
+        updateTitle();
+        playSound();
+      }
+    }catch(err){}
+  });
+
+  window.addEventListener("focus", function(){
+    unread = 0;
+    updateTitle();
+  });
+
+  window.toggleSound = function(){
+    soundEnabled = !soundEnabled;
+    alert("Sound " + (soundEnabled ? "ON" : "OFF"));
+  };
+})();
+</script>
+
 </body>
 </html>`);
 });
