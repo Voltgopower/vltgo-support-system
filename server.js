@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.8.5.1_TICKET_BADGE (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.8.3_NOTIFICATIONS (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -1035,7 +1035,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.8.5.1 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.8.3 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1332,17 +1332,27 @@ app.post("/api/ticket-notes/add", requireAuth, async (req, res) => {
 
 app.get("/api/customers", requireAuth, async (req, res) => {
   try {
-    let where = "";
+    const q = String(req.query.q || "").trim();
     let params = [];
+    let whereParts = [];
     if (STRICT_AGENT_VIEW) {
       const dept = userDept(getUser(req));
       if (dept) {
-        where = "WHERE t.dept=$1";
-        params = [dept];
+        params.push(dept);
+        whereParts.push("t.dept=$" + params.length);
       }
     }
+    if (q) {
+      params.push("%" + q + "%");
+      const p = "$" + params.length;
+      whereParts.push("(c.wa_id ILIKE " + p + " OR COALESCE(c.name,'') ILIKE " + p + " OR COALESCE(c.notes,'') ILIKE " + p + " OR COALESCE(t.last_message,'') ILIKE " + p + ")");
+    }
+    const where = whereParts.length ? ("WHERE " + whereParts.join(" AND ")) : "";
     const r = await pool.query(
-      "SELECT c.wa_id, COALESCE(c.name,'') AS name, COALESCE(c.notes,'') AS notes, MAX(t.updated_at) AS last_ticket_at, COUNT(t.id)::int AS ticket_count " +
+      "SELECT c.wa_id, COALESCE(c.name,'') AS name, COALESCE(c.notes,'') AS notes, " +
+      "MAX(t.updated_at) AS last_ticket_at, COUNT(t.id)::int AS ticket_count, " +
+      "COALESCE(SUM(COALESCE(t.unread_count,0)),0)::int AS unread_count, " +
+      "COALESCE((ARRAY_AGG(COALESCE(t.last_message,'') ORDER BY t.updated_at DESC NULLS LAST))[1],'') AS last_message " +
       "FROM customers c LEFT JOIN tickets t ON t.wa_id=c.wa_id " +
       where + " GROUP BY c.wa_id, c.name, c.notes ORDER BY MAX(t.updated_at) DESC NULLS LAST, c.wa_id ASC LIMIT 1000",
       params
@@ -1382,7 +1392,7 @@ app.get("/api/customer-tickets", requireAuth, async (req, res) => {
 
 // -------- UI Dashboard --------
 
-app.get("/ui.js", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("application/javascript; charset=utf-8"); res.send('\n(() => {\n  const $ = (id) => document.getElementById(id);\n  const statusEl = $("status");\n  const listEl = $("ticketList");\n  const chatEl = $("chat");\n  const chatTitle = $("chatTitle");\n  const chatMeta = $("chatMeta");\n  const msgCount = $("msgCount");\n  const btnRefresh = $("refresh");\n  const btnReloadChat = $("reloadChat");\n  const inText = $("text");\n  const btnSend = $("send");\n  const custName = $("custName");\n  const custPhone = $("custPhone");\n  const custNotes = $("custNotes");\n  const btnSaveCustomer = $("saveCustomer");\n  const notesList = $("ticketNotes");\n  const newNote = $("newNote");\n  const btnAddNote = $("addNote");\n\n  let tickets = [];\n  let active = null;\n\n  function setStatus(text, ok=true){\n    if(!statusEl) return;\n    statusEl.textContent = text;\n    statusEl.classList.toggle("ok", !!ok);\n  }\n\n  function fmtTime(v){\n    if(!v) return "";\n    const d = new Date(v);\n    if (isNaN(d)) return String(v);\n    const mm = String(d.getMonth()+1).padStart(2, "0");\n    const dd = String(d.getDate()).padStart(2, "0");\n    const hh = String(d.getHours()).padStart(2, "0");\n    const mi = String(d.getMinutes()).padStart(2, "0");\n    return mm + "-" + dd + " " + hh + ":" + mi;\n  }\n\n  async function api(url, opts){\n    const r = await fetch(url, Object.assign({ credentials:"same-origin" }, opts||{}));\n    const j = await r.json().catch(()=>({}));\n    if(!r.ok) throw new Error((j && (j.error||j.message)) || ("HTTP " + r.status));\n    return j;\n  }\n\n  function renderTickets(){\n    if(!listEl) return;\n    listEl.innerHTML = "";\n    if(!tickets.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No tickets.";\n      listEl.appendChild(d);\n      return;\n    }\n    tickets.forEach(t=>{\n      const row=document.createElement("div");\n      row.className="row" + (active && String(active.id)===String(t.id) ? " active" : "");\n      row.dataset.id=String(t.id);\n      const top=document.createElement("div");\n      top.style.display="flex";\n      top.style.justifyContent="space-between";\n      top.style.gap="8px";\n      const title = (t.name && String(t.name).trim()) ? t.name : (t.wa_id || "");\n      const unreadHtml = Number(t.unread_count || 0) > 0 ? " <span style=\\\'display:inline-block;min-width:18px;padding:0 6px;border-radius:999px;background:#dc2626;color:#fff;font-size:12px;line-height:18px;text-align:center\\\'>" + Number(t.unread_count || 0) + "</span>" : "";\n      top.innerHTML = "<div><b>#"+t.id+"</b> " + title + unreadHtml + "</div><div class=\'muted\'>"+(t.status||"")+"</div>";\n      const sub=document.createElement("div");\n      sub.className="muted";\n      sub.textContent = (t.last_message || "").toString().slice(0,90);\n      row.appendChild(top);\n      row.appendChild(sub);\n      row.onclick=()=>selectTicket(t);\n      listEl.appendChild(row);\n    });\n  }\n\n  function renderMessages(rows){\n    if(!chatEl) return;\n    const prevTop = chatEl.scrollTop;\n    const ordered = (rows || []).slice().sort((a,b)=>{\n      const at = Date.parse(a && a.created_at ? a.created_at : "") || 0;\n      const bt = Date.parse(b && b.created_at ? b.created_at : "") || 0;\n      if (at !== bt) return at - bt;\n      return (Number(a && a.id ? a.id : 0) - Number(b && b.id ? b.id : 0));\n    });\n\n    chatEl.innerHTML="";\n    ordered.forEach(m=>{\n      const wrap=document.createElement("div");\n      wrap.className="msg " + (m.direction==="outgoing" ? "outgoing" : "incoming");\n      const bubble=document.createElement("div");\n      bubble.className="bubble";\n      const txt = (m.text && String(m.text).trim()) ? m.text : (m.caption||"");\n      bubble.textContent = txt || ("[" + (m.msg_type||"") + "]");\n      const meta=document.createElement("div");\n      meta.className="muted";\n      meta.textContent = fmtTime(m.created_at || "");\n      wrap.appendChild(bubble);\n      wrap.appendChild(meta);\n      chatEl.appendChild(wrap);\n    });\n    if(msgCount) msgCount.textContent = String(ordered.length);\n    chatEl.scrollTop = Math.min(prevTop, Math.max(0, chatEl.scrollHeight - chatEl.clientHeight));\n  }\n\n  function renderTicketNotes(rows){\n    if(!notesList) return;\n    notesList.innerHTML = "";\n    const items = rows || [];\n    if(!items.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No notes yet.";\n      notesList.appendChild(d);\n      return;\n    }\n    items.forEach(n=>{\n      const el=document.createElement("div");\n      el.className="noteItem";\n      const head=document.createElement("div");\n      head.className="muted";\n      head.textContent = (n.author || "system") + " · " + fmtTime(n.created_at);\n      const body=document.createElement("div");\n      body.textContent = n.note || "";\n      el.appendChild(head);\n      el.appendChild(body);\n      notesList.appendChild(el);\n    });\n  }\n\n  async function loadTickets(){\n    try{\n      const j = await api("/api/tickets");\n      tickets = j.tickets || j.rows || [];\n      setStatus("JS: OK · tickets " + tickets.length, true);\n      renderTickets();\n      if(!active && tickets.length) selectTicket(tickets[0]);\n      if(active){\n        const fresh = tickets.find(x => String(x.id) === String(active.id));\n        if(fresh){\n          active = fresh;\n          renderTickets();\n        }\n      }\n    }catch(e){\n      setStatus("JS: /api/tickets failed", false);\n      console.error("loadTickets", e);\n    }\n  }\n\n  async function loadMessages(){\n    if(!active) return;\n    try{\n      const j = await api("/api/messages?ticket_id=" + encodeURIComponent(active.id));\n      const rows = j.messages || j.rows || [];\n      renderMessages(rows);\n      btnSend.disabled = false;\n    }catch(e){\n      console.error("loadMessages", e);\n    }\n  }\n\n  async function loadCustomer(){\n    if(!active) return;\n    try{\n      const j = await api("/api/customer?wa_id=" + encodeURIComponent(active.wa_id));\n      const row = j.row || {};\n      if(custName) custName.value = row.name || "";\n      if(custPhone) custPhone.value = row.wa_id || active.wa_id || "";\n      if(custNotes) custNotes.value = row.notes || "";\n    }catch(e){\n      console.error("loadCustomer", e);\n    }\n  }\n\n  async function loadNotes(){\n    if(!active) return;\n    try{\n      const j = await api("/api/ticket-notes?ticket_id=" + encodeURIComponent(active.id));\n      renderTicketNotes(j.rows || []);\n    }catch(e){\n      console.error("loadNotes", e);\n    }\n  }\n\n  async function selectTicket(t){\n    active = t;\n    try{\n      await api("/api/tickets/mark-read", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({ ticket_id: t.id })\n      });\n      t.unread_count = 0;\n    }catch(e){\n      console.error("markRead", e);\n    }\n    renderTickets();\n    if(chatTitle) chatTitle.textContent = "Ticket #" + t.id;\n    if(chatMeta) chatMeta.textContent = (t.dept||"") + " · " + (t.wa_id||"");\n    await loadMessages();\n    await loadCustomer();\n    await loadNotes();\n  }\n\n  async function sendText(){\n    if(!active) return;\n    const text = (inText.value || "").trim();\n    if(!text) return;\n    btnSend.disabled = true;\n    try{\n      await api("/api/send", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({ ticket_id: active.id, wa_id: active.wa_id, text })\n      });\n      inText.value = "";\n      await loadMessages();\n      await loadTickets();\n    }catch(e){\n      console.error("send", e);\n      alert("Send failed: " + e.message);\n    }finally{\n      btnSend.disabled = false;\n    }\n  }\n\n  async function saveCustomer(){\n    if(!active) return;\n    try{\n      await api("/api/customer/update", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({\n          wa_id: active.wa_id,\n          name: custName ? custName.value : "",\n          notes: custNotes ? custNotes.value : ""\n        })\n      });\n      await loadTickets();\n      alert("Customer saved");\n    }catch(e){\n      console.error("saveCustomer", e);\n      alert("Save failed: " + e.message);\n    }\n  }\n\n  async function addTicketNote(){\n    if(!active) return;\n    const note = (newNote.value || "").trim();\n    if(!note) return;\n    try{\n      await api("/api/ticket-notes/add", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({ ticket_id: active.id, note })\n      });\n      newNote.value = "";\n      await loadNotes();\n    }catch(e){\n      console.error("addNote", e);\n      alert("Add note failed: " + e.message);\n    }\n  }\n\n  if(btnRefresh) btnRefresh.onclick = ()=>{ loadTickets(); };\n  if(btnReloadChat) btnReloadChat.onclick = ()=>{ if(active) loadMessages(); };\n  if(btnSend) btnSend.onclick = ()=>sendText();\n  if(btnSaveCustomer) btnSaveCustomer.onclick = ()=>saveCustomer();\n  if(btnAddNote) btnAddNote.onclick = ()=>addTicketNote();\n\n  if(inText){\n    inText.addEventListener("keydown", (ev)=>{\n      if(ev.key === "Enter" && !ev.shiftKey){\n        ev.preventDefault();\n        sendText();\n      }\n    });\n  }\n\n  loadTickets();\n  setInterval(()=>{ loadTickets(); }, 2000);\n})();\n'); });
+app.get("/ui.js", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("application/javascript; charset=utf-8"); res.send('\n(() => {\n  const $ = (id) => document.getElementById(id);\n  const statusEl = $("status");\n  const listEl = $("ticketList");\n  const chatEl = $("chat");\n  const chatTitle = $("chatTitle");\n  const chatMeta = $("chatMeta");\n  const msgCount = $("msgCount");\n  const btnRefresh = $("refresh");\n  const btnReloadChat = $("reloadChat");\n  const inText = $("text");\n  const btnSend = $("send");\n  const custName = $("custName");\n  const custPhone = $("custPhone");\n  const custNotes = $("custNotes");\n  const btnSaveCustomer = $("saveCustomer");\n  const notesList = $("ticketNotes");\n  const newNote = $("newNote");\n  const btnAddNote = $("addNote");\n\n  let tickets = [];\n  let active = null;\n\n  function setStatus(text, ok=true){\n    if(!statusEl) return;\n    statusEl.textContent = text;\n    statusEl.classList.toggle("ok", !!ok);\n  }\n\n  function fmtTime(v){\n    if(!v) return "";\n    const d = new Date(v);\n    if (isNaN(d)) return String(v);\n    const mm = String(d.getMonth()+1).padStart(2, "0");\n    const dd = String(d.getDate()).padStart(2, "0");\n    const hh = String(d.getHours()).padStart(2, "0");\n    const mi = String(d.getMinutes()).padStart(2, "0");\n    return mm + "-" + dd + " " + hh + ":" + mi;\n  }\n\n  async function api(url, opts){\n    const r = await fetch(url, Object.assign({ credentials:"same-origin" }, opts||{}));\n    const j = await r.json().catch(()=>({}));\n    if(!r.ok) throw new Error((j && (j.error||j.message)) || ("HTTP " + r.status));\n    return j;\n  }\n\n  function renderTickets(){\n    if(!listEl) return;\n    listEl.innerHTML = "";\n    if(!tickets.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No tickets.";\n      listEl.appendChild(d);\n      return;\n    }\n    tickets.forEach(t=>{\n      const row=document.createElement("div");\n      row.className="row" + (active && String(active.id)===String(t.id) ? " active" : "");\n      row.dataset.id=String(t.id);\n      const top=document.createElement("div");\n      top.style.display="flex";\n      top.style.justifyContent="space-between";\n      top.style.gap="8px";\n      const title = (t.name && String(t.name).trim()) ? t.name : (t.wa_id || "");\n      top.innerHTML = "<div><b>#"+t.id+"</b> " + title + "</div><div class=\'muted\'>"+(t.status||"")+"</div>";\n      const sub=document.createElement("div");\n      sub.className="muted";\n      sub.textContent = (t.last_message || "").toString().slice(0,90);\n      row.appendChild(top);\n      row.appendChild(sub);\n      row.onclick=()=>selectTicket(t);\n      listEl.appendChild(row);\n    });\n  }\n\n  function renderMessages(rows){\n    if(!chatEl) return;\n    const prevTop = chatEl.scrollTop;\n    const ordered = (rows || []).slice().sort((a,b)=>{\n      const at = Date.parse(a && a.created_at ? a.created_at : "") || 0;\n      const bt = Date.parse(b && b.created_at ? b.created_at : "") || 0;\n      if (at !== bt) return at - bt;\n      return (Number(a && a.id ? a.id : 0) - Number(b && b.id ? b.id : 0));\n    });\n\n    chatEl.innerHTML="";\n    ordered.forEach(m=>{\n      const wrap=document.createElement("div");\n      wrap.className="msg " + (m.direction==="outgoing" ? "outgoing" : "incoming");\n      const bubble=document.createElement("div");\n      bubble.className="bubble";\n      const txt = (m.text && String(m.text).trim()) ? m.text : (m.caption||"");\n      bubble.textContent = txt || ("[" + (m.msg_type||"") + "]");\n      const meta=document.createElement("div");\n      meta.className="muted";\n      meta.textContent = fmtTime(m.created_at || "");\n      wrap.appendChild(bubble);\n      wrap.appendChild(meta);\n      chatEl.appendChild(wrap);\n    });\n    if(msgCount) msgCount.textContent = String(ordered.length);\n    chatEl.scrollTop = Math.min(prevTop, Math.max(0, chatEl.scrollHeight - chatEl.clientHeight));\n  }\n\n  function renderTicketNotes(rows){\n    if(!notesList) return;\n    notesList.innerHTML = "";\n    const items = rows || [];\n    if(!items.length){\n      const d=document.createElement("div");\n      d.className="muted";\n      d.textContent="No notes yet.";\n      notesList.appendChild(d);\n      return;\n    }\n    items.forEach(n=>{\n      const el=document.createElement("div");\n      el.className="noteItem";\n      const head=document.createElement("div");\n      head.className="muted";\n      head.textContent = (n.author || "system") + " · " + fmtTime(n.created_at);\n      const body=document.createElement("div");\n      body.textContent = n.note || "";\n      el.appendChild(head);\n      el.appendChild(body);\n      notesList.appendChild(el);\n    });\n  }\n\n  async function loadTickets(){\n    try{\n      const j = await api("/api/tickets");\n      tickets = j.tickets || j.rows || [];\n      setStatus("JS: OK · tickets " + tickets.length, true);\n      renderTickets();\n      if(!active && tickets.length) selectTicket(tickets[0]);\n      if(active){\n        const fresh = tickets.find(x => String(x.id) === String(active.id));\n        if(fresh){\n          active = fresh;\n          renderTickets();\n        }\n      }\n    }catch(e){\n      setStatus("JS: /api/tickets failed", false);\n      console.error("loadTickets", e);\n    }\n  }\n\n  async function loadMessages(){\n    if(!active) return;\n    try{\n      const j = await api("/api/messages?ticket_id=" + encodeURIComponent(active.id));\n      const rows = j.messages || j.rows || [];\n      renderMessages(rows);\n      btnSend.disabled = false;\n    }catch(e){\n      console.error("loadMessages", e);\n    }\n  }\n\n  async function loadCustomer(){\n    if(!active) return;\n    try{\n      const j = await api("/api/customer?wa_id=" + encodeURIComponent(active.wa_id));\n      const row = j.row || {};\n      if(custName) custName.value = row.name || "";\n      if(custPhone) custPhone.value = row.wa_id || active.wa_id || "";\n      if(custNotes) custNotes.value = row.notes || "";\n    }catch(e){\n      console.error("loadCustomer", e);\n    }\n  }\n\n  async function loadNotes(){\n    if(!active) return;\n    try{\n      const j = await api("/api/ticket-notes?ticket_id=" + encodeURIComponent(active.id));\n      renderTicketNotes(j.rows || []);\n    }catch(e){\n      console.error("loadNotes", e);\n    }\n  }\n\n  async function selectTicket(t){\n    active = t;\n    try{\n      await api("/api/tickets/mark-read", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({ ticket_id: t.id })\n      });\n      t.unread_count = 0;\n    }catch(e){\n      console.error("markRead", e);\n    }\n    renderTickets();\n    if(chatTitle) chatTitle.textContent = "Ticket #" + t.id;\n    if(chatMeta) chatMeta.textContent = (t.dept||"") + " · " + (t.wa_id||"");\n    await loadMessages();\n    await loadCustomer();\n    await loadNotes();\n  }\n\n  async function sendText(){\n    if(!active) return;\n    const text = (inText.value || "").trim();\n    if(!text) return;\n    btnSend.disabled = true;\n    try{\n      await api("/api/send", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({ ticket_id: active.id, wa_id: active.wa_id, text })\n      });\n      inText.value = "";\n      await loadMessages();\n      await loadTickets();\n    }catch(e){\n      console.error("send", e);\n      alert("Send failed: " + e.message);\n    }finally{\n      btnSend.disabled = false;\n    }\n  }\n\n  async function saveCustomer(){\n    if(!active) return;\n    try{\n      await api("/api/customer/update", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({\n          wa_id: active.wa_id,\n          name: custName ? custName.value : "",\n          notes: custNotes ? custNotes.value : ""\n        })\n      });\n      await loadTickets();\n      alert("Customer saved");\n    }catch(e){\n      console.error("saveCustomer", e);\n      alert("Save failed: " + e.message);\n    }\n  }\n\n  async function addTicketNote(){\n    if(!active) return;\n    const note = (newNote.value || "").trim();\n    if(!note) return;\n    try{\n      await api("/api/ticket-notes/add", {\n        method:"POST",\n        headers:{ "Content-Type":"application/json" },\n        body: JSON.stringify({ ticket_id: active.id, note })\n      });\n      newNote.value = "";\n      await loadNotes();\n    }catch(e){\n      console.error("addNote", e);\n      alert("Add note failed: " + e.message);\n    }\n  }\n\n  if(btnRefresh) btnRefresh.onclick = ()=>{ loadTickets(); };\n  if(btnReloadChat) btnReloadChat.onclick = ()=>{ if(active) loadMessages(); };\n  if(btnSend) btnSend.onclick = ()=>sendText();\n  if(btnSaveCustomer) btnSaveCustomer.onclick = ()=>saveCustomer();\n  if(btnAddNote) btnAddNote.onclick = ()=>addTicketNote();\n\n  if(inText){\n    inText.addEventListener("keydown", (ev)=>{\n      if(ev.key === "Enter" && !ev.shiftKey){\n        ev.preventDefault();\n        sendText();\n      }\n    });\n  }\n\n  loadTickets();\n  setInterval(()=>{ loadTickets(); }, 2000);\n})();\n'); });
 
 app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store"); res.type("text/html; charset=utf-8");
   const user = getUser(req);
@@ -1435,6 +1445,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
       <a class="pill" href="/customers" style="text-decoration:none">Customers</a>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
+      <button id="soundToggle" class="pill" style="cursor:pointer">🔔 Sound ON</button>
       <span id="status" class="pill">JS: booting…</span>
       <a class="pill" href="/logout">Logout</a>
     </div>
@@ -1486,7 +1497,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
     </div>
   </div>
 
-  <script src="/ui.js?v=V4.8.0"></script>
+  <script src="/ui.js?v=V4.8.3"></script>
 </body>
 </html>`);
 });
@@ -1526,6 +1537,7 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
       <a class="pill" href="/customers" style="text-decoration:none">Customers</a>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
+      <button id="soundToggle" class="pill" style="cursor:pointer">🔔 Sound ON</button>
       <span id="status" class="pill">JS: booting…</span>
       <a class="pill" href="/logout">Logout</a>
     </div>
@@ -1536,11 +1548,6 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <div style="font-weight:600">Customers</div>
         <button id="refreshCustomers" class="pill" style="cursor:pointer">Refresh</button>
-      </div>
-      <div class="field" style="margin-bottom:8px;display:flex;gap:6px">
-        <input id="customerSearch" placeholder="Search customer..." style="flex:1"/>
-        <button id="customerSearchBtn" class="pill" style="cursor:pointer">Search</button>
-        <button id="customerClearBtn" class="pill" style="cursor:pointer">Clear</button>
       </div>
       <div id="customerList" class="list"></div>
     </div>
@@ -1575,6 +1582,9 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
   const custNotes = $("custNotes");
   const btnSaveCustomer = $("saveCustomer");
   const btnRefreshCustomers = $("refreshCustomers");
+  const customerSearch = $("customerSearch");
+  const customerSearchBtn = $("customerSearchBtn");
+  const customerClearBtn = $("customerClearBtn");
   let customers = [];
   let active = null;
 
@@ -1604,6 +1614,7 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
       row.className = "row" + (active && active.wa_id === c.wa_id ? " active" : "");
       row.innerHTML = "<div><b>" + (c.name || c.wa_id) + "</b></div>" +
                       "<div class='muted'>" + c.wa_id + "</div>" +
+                      "<div class='muted'>" + ((c.last_message || "").slice(0, 60) || ((c.ticket_count || 0) + " tickets")) + "</div>" +
                       "<div class='muted'>" + (c.ticket_count || 0) + " tickets</div>";
       row.onclick = () => selectCustomer(c);
       customerList.appendChild(row);
@@ -1611,7 +1622,8 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
   }
   async function loadCustomers(){
     try{
-      const j = await api("/api/customers");
+      const q = customerSearch ? String(customerSearch.value || "").trim() : "";
+      const j = await api("/api/customers" + (q ? ("?q=" + encodeURIComponent(q)) : ""));
       customers = j.customers || j.rows || [];
       setStatus("JS: OK · customers " + customers.length, true);
       renderCustomers();
@@ -1675,6 +1687,20 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
 
   btnRefreshCustomers.onclick = loadCustomers;
   btnSaveCustomer.onclick = saveCustomer;
+  if(customerSearchBtn) customerSearchBtn.onclick = loadCustomers;
+  if(customerClearBtn){
+    customerClearBtn.onclick = ()=>{
+      if(customerSearch) customerSearch.value = "";
+      loadCustomers();
+    };
+  }
+  if(customerSearch){
+    customerSearch.addEventListener("keydown", (e)=>{
+      if(e.key === "Enter"){
+        loadCustomers();
+      }
+    });
+  }
   loadCustomers();
 })();
 </script>
@@ -1686,12 +1712,11 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
 app.get("/", (req, res) => res.redirect("/ui"));
 app.get("/health", async (req, res) => { try { await dbPing(); res.json({ ok: true }); } catch { res.status(500).json({ ok: false }); } });
 app.get("/version", (req, res) => {
-  res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.8.5.1",
+    version: "V4.8.5.2",
     node: process.version,
-    railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
+    railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
     time: new Date().toISOString()
   });
@@ -1700,7 +1725,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.8.5.1 " + new Date().toISOString());
+  res.send("pong V4.8.3 " + new Date().toISOString());
 });
 
 // Optional debug key for one-off diagnostics (set Railway variable DEBUG_KEY to enable)
@@ -1761,12 +1786,12 @@ app.get("/debug/messages", async (req, res) => {
     console.error("❌ DB init failed:", e);
   }
   console.log("=================================");
-  const APP_VERSION = "V4.8.5.1";
+  const APP_VERSION = "V4.8.0";
 
 console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.8.5.1");
+  console.log("VERSION MARKER: V4.8.0");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
