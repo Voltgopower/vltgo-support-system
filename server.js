@@ -1035,50 +1035,8 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.8.2 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
-    "</div>
-<script>
-(function(){
-  let unread = 0;
-  let soundEnabled = true;
-  const audio = new Audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg");
-
-  function updateTitle(){
-    const base = "Voltgo Support";
-    if(unread>0) document.title = "(" + unread + ") " + base;
-    else document.title = base;
-  }
-
-  function playSound(){
-    if(!soundEnabled) return;
-    try{ audio.currentTime = 0; audio.play(); }catch(e){}
-  }
-
-  const evt = new EventSource("/sse");
-  evt.addEventListener("message", function(e){
-    try{
-      const d = JSON.parse(e.data);
-      if(d.type === "message" && d.payload && d.payload.direction === "incoming"){
-        unread++;
-        updateTitle();
-        playSound();
-      }
-    }catch(err){}
-  });
-
-  window.addEventListener("focus", function(){
-    unread = 0;
-    updateTitle();
-  });
-
-  window.toggleSound = function(){
-    soundEnabled = !soundEnabled;
-    alert("Sound " + (soundEnabled ? "ON" : "OFF"));
-  };
-})();
-</script>
-
-</body></html>"
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.8.3 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "</div></body></html>"
   );
 }
 
@@ -1491,6 +1449,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
       <a class="pill" href="/customers" style="text-decoration:none">Customers</a>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
+      <button id="soundToggle" class="pill" style="cursor:pointer">🔔 Sound ON</button>
       <span id="status" class="pill">JS: booting…</span>
       <a class="pill" href="/logout">Logout</a>
     </div>
@@ -1542,49 +1501,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
     </div>
   </div>
 
-  <script src="/ui.js?v=V4.8.2"></script>
-
-<script>
-(function(){
-  let unread = 0;
-  let soundEnabled = true;
-  const audio = new Audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg");
-
-  function updateTitle(){
-    const base = "Voltgo Support";
-    if(unread>0) document.title = "(" + unread + ") " + base;
-    else document.title = base;
-  }
-
-  function playSound(){
-    if(!soundEnabled) return;
-    try{ audio.currentTime = 0; audio.play(); }catch(e){}
-  }
-
-  const evt = new EventSource("/sse");
-  evt.addEventListener("message", function(e){
-    try{
-      const d = JSON.parse(e.data);
-      if(d.type === "message" && d.payload && d.payload.direction === "incoming"){
-        unread++;
-        updateTitle();
-        playSound();
-      }
-    }catch(err){}
-  });
-
-  window.addEventListener("focus", function(){
-    unread = 0;
-    updateTitle();
-  });
-
-  window.toggleSound = function(){
-    soundEnabled = !soundEnabled;
-    alert("Sound " + (soundEnabled ? "ON" : "OFF"));
-  };
-})();
-</script>
-
+  <script src="/ui.js?v=V4.8.3"></script>
 </body>
 </html>`);
 });
@@ -1624,6 +1541,7 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
       <a class="pill" href="/customers" style="text-decoration:none">Customers</a>
     </div>
     <div style="display:flex;gap:8px;align-items:center">
+      <button id="soundToggle" class="pill" style="cursor:pointer">🔔 Sound ON</button>
       <span id="status" class="pill">JS: booting…</span>
       <a class="pill" href="/logout">Logout</a>
     </div>
@@ -1790,48 +1708,6 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
   loadCustomers();
 })();
 </script>
-
-<script>
-(function(){
-  let unread = 0;
-  let soundEnabled = true;
-  const audio = new Audio("https://actions.google.com/sounds/v1/alarms/beep_short.ogg");
-
-  function updateTitle(){
-    const base = "Voltgo Support";
-    if(unread>0) document.title = "(" + unread + ") " + base;
-    else document.title = base;
-  }
-
-  function playSound(){
-    if(!soundEnabled) return;
-    try{ audio.currentTime = 0; audio.play(); }catch(e){}
-  }
-
-  const evt = new EventSource("/sse");
-  evt.addEventListener("message", function(e){
-    try{
-      const d = JSON.parse(e.data);
-      if(d.type === "message" && d.payload && d.payload.direction === "incoming"){
-        unread++;
-        updateTitle();
-        playSound();
-      }
-    }catch(err){}
-  });
-
-  window.addEventListener("focus", function(){
-    unread = 0;
-    updateTitle();
-  });
-
-  window.toggleSound = function(){
-    soundEnabled = !soundEnabled;
-    alert("Sound " + (soundEnabled ? "ON" : "OFF"));
-  };
-})();
-</script>
-
 </body>
 </html>`);
 });
@@ -1843,7 +1719,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.8.2",
+    version: "V4.8.3",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1854,7 +1730,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.8.2 " + new Date().toISOString());
+  res.send("pong V4.8.3 " + new Date().toISOString());
 });
 
 // Optional debug key for one-off diagnostics (set Railway variable DEBUG_KEY to enable)
