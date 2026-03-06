@@ -4,7 +4,8 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.8.5.1_TICKET_BADGE (2026-03-05)");
+const APP_VERSION = "V4.8.7_CUSTOMERS_SSE_BADGE";
+console.log("✅ LOADED SERVER.JS: " + APP_VERSION + " (2026-03-06)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -422,6 +423,14 @@ app.get("/sse", requireAuth, (req, res) => {
   res.write("data: " + JSON.stringify({ ok: true, user: client.user, ts: new Date().toISOString() }) + "\n\n");
   req.on("close", () => sseClients.delete(client));
 });
+function broadcastCustomersUpdate(wa_id = null) {
+  sseSend("customers", {
+    changed: true,
+    wa_id: wa_id || null,
+    version: APP_VERSION,
+    ts: Date.now()
+  });
+}
 
 // -------- WhatsApp helpers --------
 async function waGraphGet(url) {
@@ -1342,7 +1351,9 @@ app.get("/api/customers", requireAuth, async (req, res) => {
       }
     }
     const r = await pool.query(
-      "SELECT c.wa_id, COALESCE(c.name,'') AS name, COALESCE(c.notes,'') AS notes, MAX(t.updated_at) AS last_ticket_at, COUNT(t.id)::int AS ticket_count " +
+      "SELECT c.wa_id, COALESCE(c.name,'') AS name, COALESCE(c.notes,'') AS notes, " +
+      "MAX(t.updated_at) AS last_ticket_at, COUNT(t.id)::int AS ticket_count, " +
+      "COALESCE(SUM(COALESCE(t.unread_count,0)),0)::int AS unread_count " +
       "FROM customers c LEFT JOIN tickets t ON t.wa_id=c.wa_id " +
       where + " GROUP BY c.wa_id, c.name, c.notes ORDER BY MAX(t.updated_at) DESC NULLS LAST, c.wa_id ASC LIMIT 1000",
       params
@@ -1369,7 +1380,7 @@ app.get("/api/customer-tickets", requireAuth, async (req, res) => {
     }
 
     const r = await pool.query(
-      "SELECT t.id, t.wa_id, COALESCE(t.dept,'presales') AS dept, COALESCE(t.status,'open') AS status, COALESCE(t.last_message,'') AS last_message, t.updated_at " +
+      "SELECT t.id, t.wa_id, COALESCE(t.dept,'presales') AS dept, COALESCE(t.status,'open') AS status, COALESCE(t.last_message,'') AS last_message, COALESCE(t.unread_count,0) AS unread_count, t.updated_at " +
       "FROM tickets t " + where + " ORDER BY t.updated_at DESC NULLS LAST, t.id DESC LIMIT 200",
       params
     );
@@ -1486,7 +1497,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
     </div>
   </div>
 
-  <script src="/ui.js?v=V4.8.0"></script>
+  <script src="/ui.js?v=${APP_VERSION}"></script>
 </body>
 </html>`);
 });
@@ -1516,6 +1527,8 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
     .field input,.field textarea{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #e5e7eb;border-radius:10px;background:#fff}
     .field textarea{min-height:100px;resize:vertical}
     .note{padding:10px}
+    .badge{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 6px;border-radius:999px;background:#ef4444;color:#fff;font-size:11px;font-weight:700;line-height:1}
+    .rowHead{display:flex;align-items:center;justify-content:space-between;gap:8px}
   </style>
 </head>
 <body>
@@ -1602,7 +1615,9 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
     customers.forEach(c => {
       const row = document.createElement("div");
       row.className = "row" + (active && active.wa_id === c.wa_id ? " active" : "");
-      row.innerHTML = "<div><b>" + (c.name || c.wa_id) + "</b></div>" +
+      const unread = Number(c.unread_count || 0);
+      row.innerHTML = "<div class='rowHead'><div><b>" + (c.name || c.wa_id) + "</b></div>" +
+                      (unread > 0 ? "<span class='badge'>" + unread + "</span>" : "") + "</div>" +
                       "<div class='muted'>" + c.wa_id + "</div>" +
                       "<div class='muted'>" + (c.ticket_count || 0) + " tickets</div>";
       row.onclick = () => selectCustomer(c);
@@ -1645,7 +1660,9 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
     rows.forEach(t => {
       const row = document.createElement("div");
       row.className = "row";
-      row.innerHTML = "<div><b>#"+t.id+"</b> " + (t.dept || "") + " · " + (t.status || "") + "</div>" +
+      const unread = Number(t.unread_count || 0);
+      row.innerHTML = "<div class='rowHead'><div><b>#"+t.id+"</b> " + (t.dept || "") + " · " + (t.status || "") + "</div>" +
+                      (unread > 0 ? "<span class='badge'>" + unread + "</span>" : "") + "</div>" +
                       "<div class='muted'>" + (t.last_message || "").slice(0,90) + "</div>";
       row.onclick = () => { window.location.href = "/ui?ticket_id=" + encodeURIComponent(t.id); };
       custTickets.appendChild(row);
@@ -1675,7 +1692,62 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
 
   btnRefreshCustomers.onclick = loadCustomers;
   btnSaveCustomer.onclick = saveCustomer;
-  loadCustomers();
+
+  let es = null;
+  let sseRetry = null;
+
+  function connectSSE(){
+    try{ if(es) es.close(); }catch(_){}
+    es = new EventSource("/sse");
+
+    es.addEventListener("hello", () => {
+      setStatus("JS: OK · customers " + customers.length, true);
+    });
+
+    es.addEventListener("customers", async () => {
+      try{
+        const prevWa = active ? active.wa_id : null;
+        await loadCustomers();
+        if(prevWa){
+          const next = customers.find(x => x.wa_id === prevWa);
+          if(next){
+            active = next;
+            renderCustomers();
+            await loadCustomerProfile();
+            await loadCustomerTickets();
+          }
+        }
+      }catch(e){
+        console.error("customers SSE", e);
+      }
+    });
+
+    es.addEventListener("tickets", async () => {
+      try{
+        const prevWa = active ? active.wa_id : null;
+        await loadCustomers();
+        if(prevWa){
+          const next = customers.find(x => x.wa_id === prevWa);
+          if(next){
+            active = next;
+            renderCustomers();
+            await loadCustomerTickets();
+          }
+        }
+      }catch(e){
+        console.error("tickets SSE", e);
+      }
+    });
+
+    es.onerror = () => {
+      setStatus("JS: SSE reconnecting…", false);
+      try{ es.close(); }catch(_){}
+      clearTimeout(sseRetry);
+      sseRetry = setTimeout(connectSSE, 2000);
+    };
+  }
+
+  loadCustomers().then(connectSSE);
 })();
 </script>
 </body>
@@ -1689,7 +1761,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.8.5.1",
+    version: APP_VERSION,
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1700,7 +1772,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.8.5.1 " + new Date().toISOString());
+  res.send("pong " + APP_VERSION + " " + new Date().toISOString());
 });
 
 // Optional debug key for one-off diagnostics (set Railway variable DEBUG_KEY to enable)
@@ -1761,12 +1833,10 @@ app.get("/debug/messages", async (req, res) => {
     console.error("❌ DB init failed:", e);
   }
   console.log("=================================");
-  const APP_VERSION = "V4.8.5.1";
-
-console.log("🚀 Server running");
+  console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.8.5.1");
+  console.log("VERSION MARKER:", APP_VERSION);
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
