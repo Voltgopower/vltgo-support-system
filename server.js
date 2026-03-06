@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-console.log("✅ LOADED SERVER.JS: V4.7.3.2_FIXED (2026-03-05)");
+console.log("✅ LOADED SERVER.JS: V4.7.3.4_HOTFIX (2026-03-05)");
 
 const express = require("express");
 const crypto = require("crypto");
@@ -772,11 +772,33 @@ async function insertMessage({ ticket_id, wa_id, dept, direction, msg_type, text
   const wmid = (wa_message_id ?? null);
   let cid = (conversation_id ?? null);
 
-  // Prefer ticket_id storage when available because current UI reads messages by ticket_id.
   const hasTicketId = await columnExists("messages", "ticket_id").catch(()=>false);
   const hasConversationId = await columnExists("messages", "conversation_id").catch(()=>false);
 
-  if (hasTicketId && ticket_id) {
+  // If conversation_id exists, some legacy schemas require it NOT NULL.
+  if (hasConversationId && !cid) {
+    cid = await getOrCreateConversation(wa_id, dept || "");
+  }
+
+  // If BOTH columns exist, write BOTH so old/new readers both work.
+  if (hasTicketId && hasConversationId && ticket_id && cid) {
+    if (wmid && String(wmid).trim()) {
+      const r = await pool.query(
+        "INSERT INTO messages(ticket_id, conversation_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
+        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (wa_message_id) DO NOTHING RETURNING id",
+        [Number(ticket_id), Number(cid), String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, String(wmid)]
+      );
+      return r.rows[0]?.id || null;
+    }
+    const r = await pool.query(
+      "INSERT INTO messages(ticket_id, conversation_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
+      "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id",
+      [Number(ticket_id), Number(cid), String(wa_id), String(direction), String(msg_type||"text"), text ?? null, caption ?? null, media_path ?? null, thumb_path ?? null, null]
+    );
+    return r.rows[0]?.id || null;
+  }
+
+  if (hasTicketId && ticket_id && !hasConversationId) {
     if (wmid && String(wmid).trim()) {
       const r = await pool.query(
         "INSERT INTO messages(ticket_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
@@ -793,12 +815,7 @@ async function insertMessage({ ticket_id, wa_id, dept, direction, msg_type, text
     return r.rows[0]?.id || null;
   }
 
-  if (hasConversationId) {
-    if (!cid) {
-      cid = await getOrCreateConversation(wa_id, dept || "");
-    }
-    if (!cid) throw new Error("conversation_id required by DB schema but missing");
-
+  if (hasConversationId && cid) {
     if (wmid && String(wmid).trim()) {
       const r = await pool.query(
         "INSERT INTO messages(conversation_id, wa_id, direction, msg_type, text, caption, media_path, thumb_path, wa_message_id) " +
@@ -815,7 +832,7 @@ async function insertMessage({ ticket_id, wa_id, dept, direction, msg_type, text
     return r.rows[0]?.id || null;
   }
 
-  throw new Error("messages schema unsupported: no ticket_id and no conversation_id");
+  throw new Error("messages schema unsupported: cannot resolve ticket_id / conversation_id");
 }
 
 // -------- webhook verify/receive --------
@@ -1018,7 +1035,7 @@ function renderLogin(errMsg) {
     "<input name='password' type='password' placeholder='Password' autocomplete='current-password'/>" +
     "<button type='submit'>Login</button>" +
     "</form>" +
-    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.3.2 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
+    "<p style='margin-top:14px;color:#64748b'>Version: V4.7.3.4 • Light UI • Customer Profile • Ticket Notes • Media • Strict Isolation " + (STRICT_AGENT_VIEW ? "ON" : "OFF") + "</p>" +
     "</div></body></html>"
   );
 }
@@ -1388,7 +1405,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
     </div>
   </div>
 
-  <script src="/ui.js?v=V4.7.3.2"></script>
+  <script src="/ui.js?v=V4.7.3.4"></script>
 </body>
 </html>
 `);
@@ -1400,7 +1417,7 @@ app.get("/version", (req, res) => {
   res.set("Cache-Control","no-store");
   res.json({
     ok: true,
-    version: "V4.7.3.2",
+    version: "V4.7.3.4",
     node: process.version,
     railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.RAILWAY_GIT_COMMIT || null,
     railwayService: process.env.RAILWAY_SERVICE_NAME || null,
@@ -1411,7 +1428,7 @@ app.get("/version", (req, res) => {
 // Quick sanity endpoint to confirm your service is reachable
 app.get("/debug/ping", (req, res) => {
   res.set("Cache-Control","no-store");
-  res.send("pong V4.7.3.2 " + new Date().toISOString());
+  res.send("pong V4.7.3.4 " + new Date().toISOString());
 });
 
 // Optional debug key for one-off diagnostics (set Railway variable DEBUG_KEY to enable)
@@ -1472,12 +1489,12 @@ app.get("/debug/messages", async (req, res) => {
     console.error("❌ DB init failed:", e);
   }
   console.log("=================================");
-  const APP_VERSION = "V4.7.3.2";
+  const APP_VERSION = "V4.7.3.4";
 
 console.log("🚀 Server running");
   console.log("NODE VERSION:", process.version);
   console.log("PORT:", PORT);
-  console.log("VERSION MARKER: V4.7.3.2");
+  console.log("VERSION MARKER: V4.7.3.4");
   console.log("STRICT ISOLATION:", STRICT_AGENT_VIEW ? "ON" : "OFF");
   console.log("COOKIE_SECURE:", COOKIE_SECURE ? "true" : "false");
   console.log("=================================");
