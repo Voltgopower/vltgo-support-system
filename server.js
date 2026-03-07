@@ -2188,11 +2188,9 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
     };
   }
 
-=======
   if(btnSearch) btnSearch.onclick = () => renderCustomers();
   if(btnClear) btnClear.onclick = () => { if(searchInput) searchInput.value = ""; renderCustomers(); };
   if(searchInput) searchInput.addEventListener("keydown", (e) => { if(e.key === "Enter") renderCustomers(); });
->>>>>>> c905d64 (upgrade to V4.8.8 search + media UI)
   loadCustomers().then(connectSSE);
 })();
 </script>
