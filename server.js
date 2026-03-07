@@ -4,7 +4,7 @@
  * Light UI + Customer Profile + Ticket Notes + Ticket Auto-Reopen
  */
 require("dotenv").config();
-const APP_VERSION = "V4.8.7_CUSTOMERS_SSE_BADGE";
+const APP_VERSION = "V4.8.8_SEARCH_MEDIA_UI";
 console.log("✅ LOADED SERVER.JS: " + APP_VERSION + " (2026-03-06)");
 
 const express = require("express");
