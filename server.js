@@ -1892,12 +1892,7 @@ app.get("/ui", requireAuth, (req, res) => { res.set("Cache-Control","no-store");
       </div>
     </div>
   </div>
-
-<<<<<<< HEAD
-  <script src="/ui.js?v=${APP_VERSION}"></script>
-=======
   <script src="/ui.js?v=" + APP_VERSION + ""></script>
->>>>>>> c905d64 (upgrade to V4.8.8 search + media UI)
 </body>
 </html>`);
 });
@@ -2038,13 +2033,7 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
     rows.forEach(c => {
       const row = document.createElement("div");
       row.className = "row" + (active && active.wa_id === c.wa_id ? " active" : "");
-<<<<<<< HEAD
-      const unread = Number(c.unread_count || 0);
-      row.innerHTML = "<div class='rowHead'><div><b>" + (c.name || c.wa_id) + "</b></div>" +
-                      (unread > 0 ? "<span class='badge'>" + unread + "</span>" : "") + "</div>" +
-=======
       row.innerHTML = "<div style='display:flex;justify-content:space-between;gap:8px;align-items:center'><div><b>" + (c.name || c.wa_id) + "</b></div>" + badge(c.unread_count) + "</div>" +
->>>>>>> c905d64 (upgrade to V4.8.8 search + media UI)
                       "<div class='muted'>" + c.wa_id + "</div>" +
                       "<div class='muted'>" + (c.ticket_count || 0) + " tickets</div>";
       row.onclick = () => selectCustomer(c);
@@ -2093,13 +2082,9 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
     rows.forEach(t => {
       const row = document.createElement("div");
       row.className = "row";
-<<<<<<< HEAD
-      const unread = Number(t.unread_count || 0);
       row.innerHTML = "<div class='rowHead'><div><b>#"+t.id+"</b> " + (t.dept || "") + " · " + (t.status || "") + "</div>" +
                       (unread > 0 ? "<span class='badge'>" + unread + "</span>" : "") + "</div>" +
-=======
       row.innerHTML = "<div style='display:flex;justify-content:space-between;gap:8px;align-items:center'><div><b>#"+t.id+"</b> " + (t.dept || "") + " · " + (t.status || "") + "</div>" + badge(t.unread_count) + "</div>" +
->>>>>>> c905d64 (upgrade to V4.8.8 search + media UI)
                       "<div class='muted'>" + (t.last_message || "").slice(0,90) + "</div>";
       row.onclick = () => { window.location.href = "/ui?ticket_id=" + encodeURIComponent(t.id); };
       custTickets.appendChild(row);
@@ -2148,7 +2133,6 @@ app.get("/customers", requireAuth, (req, res) => { res.set("Cache-Control","no-s
 
   btnRefreshCustomers.onclick = loadCustomers;
   btnSaveCustomer.onclick = saveCustomer;
-<<<<<<< HEAD
 
   let es = null;
   let sseRetry = null;
